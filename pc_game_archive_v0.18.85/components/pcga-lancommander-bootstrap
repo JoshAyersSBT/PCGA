@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+PCGA_GAME_STACK_LOCK="${PCGA_GAME_STACK_LOCK:-/run/pcga-game-stack-start.lock}"
+pcga_acquire_game_stack_lock(){
+  [[ "${PCGA_GAME_STACK_LOCK_HELD:-0}" == 1 ]] && return 0
+  exec 9>"$PCGA_GAME_STACK_LOCK"
+  if ! flock -w "${PCGA_GAME_STACK_LOCK_TIMEOUT:-180}" 9; then
+    printf '[pcga-lock] Timed out waiting for game-stack reconciliation lock: %s\n' "$PCGA_GAME_STACK_LOCK" >&2
+    return 75
+  fi
+  export PCGA_GAME_STACK_LOCK_HELD=1
+}
+pcga_acquire_game_stack_lock || exit $?
+
+STATE_DIR=/var/lib/pc-game-archive/bootstrap
+STATE_FILE="$STATE_DIR/lancommander.state"
+CATALOG_PTR="$STATE_DIR/lancommander.catalog-db"
+SECRETS=/etc/pc-game-archive/secrets
+CREDS="$SECRETS/lancommander-bootstrap.env"
+ROOT="$(cat /etc/pc-game-archive/archive-root 2>/dev/null || echo /srv/pc-game-archive)"
+DATA="$ROOT/lancommander"
+port="${PCGA_LANCOMMANDER_PORT:-1337}"
+
+install -d -m 0755 "$STATE_DIR"
+install -d -m 0700 "$SECRETS"
+[[ -x /usr/local/sbin/pcga-appliance-credentials ]] && /usr/local/sbin/pcga-appliance-credentials
+state(){ printf '%s\n' "$1" >"$STATE_FILE"; chmod 0644 "$STATE_FILE"; }
+fail(){ state failed; printf '[pcga-lancommander-bootstrap:error] %s\n' "$*" >&2; exit 1; }
+
+probe_setup(){
+  local out url
+  out="$(mktemp)"
+  url="$(curl -LsS --max-time 5 -o "$out" -w '%{url_effective}' "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+  if grep -Eqi 'FirstTimeSetup|Create Administrator User|Initial Server Setup' "$out" || [[ "$url" == *FirstTimeSetup* ]]; then
+    rm -f "$out"; return 0
+  fi
+  rm -f "$out"; return 1
+}
+
+wait_http(){
+  local code
+  for _ in $(seq 1 60); do
+    code="$(curl -sS -L --max-time 3 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+    case "$code" in 200|301|302|303|307|308) return 0;; esac
+    sleep 2
+  done
+  return 1
+}
+
+# LANCommander 2.1.x creates its initial Identity administrator through the
+# first-time Blazor flow. PCGA's appliance deployment is intentionally pinned to
+# v2.1.16 + SQLite, so reconcile only the reserved PCGA identity while the
+# container is stopped. Existing users/admins are never deleted or repurposed.
+wait_http || fail "LANCommander did not become HTTP-ready before bootstrap"
+
+docker stop lancommander >/dev/null || fail "Unable to stop LANCommander for guarded identity reconciliation"
+restart_on_exit=1
+trap 'if [[ ${restart_on_exit:-0} -eq 1 ]]; then docker start lancommander >/dev/null 2>&1 || true; fi' EXIT
+
+db="$(python3 - "$DATA" <<'PYIDENTITY'
+from pathlib import Path
+import os, sqlite3, sys
+root=Path(sys.argv[1]).resolve(strict=False)
+pruned={'uploads','media','saves','steam','archives','files','cache','downloads'}
+suffixes={'.db','.sqlite','.sqlite3'}
+
+def is_sqlite(p):
+    try:
+        with p.open('rb') as f: return f.read(16) == b'SQLite format 3\x00'
+    except OSError: return False
+
+candidates=[]
+try:
+    for current, dirs, files in os.walk(root):
+        cur=Path(current)
+        try: depth=len(cur.relative_to(root).parts)
+        except ValueError: continue
+        dirs[:] = [d for d in dirs if d.lower() not in pruned and depth < 4]
+        if depth > 4:
+            dirs[:] = []
+            continue
+        for name in files:
+            p=cur/name
+            if p.suffix.lower() in suffixes or is_sqlite(p): candidates.append(p)
+except OSError:
+    pass
+for p in sorted(candidates, key=lambda q:(len(q.parts), str(q))):
+    try:
+        c=sqlite3.connect(f'file:{p}?mode=ro', uri=True, timeout=.5)
+        try: tables={r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally: c.close()
+    except sqlite3.Error:
+        continue
+    if {'Users','Roles','UserRoles'} <= tables:
+        print(p); break
+PYIDENTITY
+)"
+[[ -n "$db" ]] || fail "Supported LANCommander SQLite identity database was not found; existing/custom database was not modified"
+
+# appliance-admin.env is the source of truth; pcga-appliance-credentials keeps
+# this compatibility file synchronized for older components.
+# shellcheck disable=SC1090
+. "$CREDS"
+[[ -n "${PCGA_LANCOMMANDER_ADMIN_USER:-}" && -n "${PCGA_LANCOMMANDER_ADMIN_PASSWORD:-}" ]] || fail "LANCommander appliance credential is missing"
+
+stamp="$(date +%Y%m%d-%H%M%S)"
+backup="${db}.pcga-prebootstrap-${stamp}.bak"
+cp -a "$db" "$backup"
+
+set +e
+python3 - "$db" "$PCGA_LANCOMMANDER_ADMIN_USER" "$PCGA_LANCOMMANDER_ADMIN_PASSWORD" <<'PYDB'
+import base64, datetime, hashlib, hmac, os, sqlite3, struct, sys, uuid
+
+path, username, password = sys.argv[1:]
+con = sqlite3.connect(path)
+con.execute('PRAGMA foreign_keys=ON')
+con.row_factory = sqlite3.Row
+
+def columns(table):
+    return {r[1]: r for r in con.execute(f'PRAGMA table_info("{table}")')}
+
+def required_without_db_default(cols):
+    return {name for name, row in cols.items() if row[3] and row[4] is None}
+
+def identity_hash(pw):
+    # ASP.NET Core Identity V3 PasswordHasher format.
+    salt = os.urandom(16)
+    iterations = 100000
+    subkey = hashlib.pbkdf2_hmac('sha512', pw.encode(), salt, iterations, 32)
+    return base64.b64encode(b'\x01' + struct.pack('>III', 2, iterations, len(salt)) + salt + subkey).decode()
+
+def identity_verify(encoded, pw):
+    try:
+        raw = base64.b64decode(encoded)
+        if len(raw) < 13 or raw[0] != 1:
+            return False
+        prf, iterations, salt_len = struct.unpack('>III', raw[1:13])
+        if prf != 2 or iterations < 1 or salt_len < 8 or len(raw) <= 13 + salt_len:
+            return False
+        salt = raw[13:13+salt_len]
+        expected = raw[13+salt_len:]
+        actual = hashlib.pbkdf2_hmac('sha512', pw.encode(), salt, iterations, len(expected))
+        return hmac.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+def filtered(values, cols, *, include_none=False):
+    return {k: v for k, v in values.items() if k in cols and (include_none or v is not None)}
+
+def verify_required(table, cols, values, recognized):
+    req = required_without_db_default(cols)
+    unknown = sorted(req - recognized)
+    if unknown:
+        raise ValueError(f'Unsupported required {table} columns: ' + ','.join(unknown))
+    missing = sorted(name for name in req if name not in values or values[name] is None)
+    if missing:
+        raise ValueError(f'No safe bootstrap value for required {table} columns: ' + ','.join(missing))
+
+uc, rc, urc = columns('Users'), columns('Roles'), columns('UserRoles')
+required_user = {'Id','UserName','NormalizedUserName','PasswordHash','SecurityStamp','ConcurrencyStamp','Approved','ApprovedOn'}
+required_role = {'Id','Name','NormalizedName','ConcurrencyStamp'}
+required_userrole = {'UserId','RoleId'}
+if not required_user <= set(uc) or not required_role <= set(rc) or not required_userrole <= set(urc):
+    print('LANCommander identity schema differs from pinned 2.1.x contract; refusing mutation', file=sys.stderr)
+    raise SystemExit(31)
+
+known_user = required_user | {
+    'AccessFailedCount','Email','NormalizedEmail','EmailConfirmed','PhoneNumber',
+    'PhoneNumberConfirmed','TwoFactorEnabled','LockoutEnd','LockoutEnabled','Alias',
+    'RefreshToken','RefreshTokenExpiration','CreatedById','CreatedOn','UpdatedById','UpdatedOn'
+}
+known_role = required_role | {'CreatedById','CreatedOn','UpdatedById','UpdatedOn'}
+known_userrole = required_userrole | {'CreatedById','CreatedOn','UpdatedById','UpdatedOn'}
+
+now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).strftime('%Y-%m-%d %H:%M:%S.%f')
+expired_refresh = '0001-01-01 00:00:00.000000'
+normalized = username.upper()
+
+# Use the canonical Administrator role when present; create it only if absent.
+role_row = con.execute("SELECT * FROM Roles WHERE upper(COALESCE(NULLIF(NormalizedName,''),Name))=? LIMIT 1", ('ADMINISTRATOR',)).fetchone()
+rid = str(role_row['Id']) if role_row else str(uuid.uuid4())
+role_values = {
+    'Id': rid, 'Name': 'Administrator', 'NormalizedName': 'ADMINISTRATOR',
+    'ConcurrencyStamp': str(uuid.uuid4()), 'CreatedById': None, 'CreatedOn': now,
+    'UpdatedById': None, 'UpdatedOn': now,
+}
+
+# Reserved identity lookup is by normalized username only. This intentionally
+# does not borrow an arbitrary existing administrator's credential.
+user_row = con.execute("SELECT * FROM Users WHERE upper(COALESCE(NULLIF(NormalizedUserName,''),UserName))=? LIMIT 1", (normalized,)).fetchone()
+uid = str(user_row['Id']) if user_row else str(uuid.uuid4())
+
+# Avoid taking an email already owned by another account. Identity's Email is
+# nullable on the pinned schema; if it ever becomes required, schema validation
+# will fail closed instead of inventing a destructive migration.
+email = f'{username}@pcga.invalid'
+email_owner = None
+if 'NormalizedEmail' in uc:
+    email_owner = con.execute('SELECT Id FROM Users WHERE upper(COALESCE(NormalizedEmail,\'\'))=? AND Id<>? LIMIT 1', (email.upper(), uid)).fetchone()
+chosen_email = None if email_owner else email
+
+user_values = {
+    'Id': uid,
+    'UserName': username,
+    'NormalizedUserName': normalized,
+    'PasswordHash': identity_hash(password),
+    'SecurityStamp': str(uuid.uuid4()),
+    'ConcurrencyStamp': str(uuid.uuid4()),
+    'Approved': 1,
+    'ApprovedOn': now,
+    'AccessFailedCount': 0,
+    'Email': chosen_email,
+    'NormalizedEmail': chosen_email.upper() if chosen_email else None,
+    'EmailConfirmed': 0,
+    'PhoneNumber': None,
+    'PhoneNumberConfirmed': 0,
+    'TwoFactorEnabled': 0,
+    'LockoutEnd': None,
+    'LockoutEnabled': 1,
+    'Alias': 'PCGA Appliance',
+    'RefreshToken': '',
+    'RefreshTokenExpiration': expired_refresh,
+    'CreatedById': None,
+    'CreatedOn': now,
+    'UpdatedById': None,
+    'UpdatedOn': now,
+}
+userrole_values = {
+    'UserId': uid, 'RoleId': rid, 'CreatedById': None, 'CreatedOn': now,
+    'UpdatedById': None, 'UpdatedOn': now,
+}
+
+try:
+    verify_required('Users', uc, user_values, known_user)
+    verify_required('Roles', rc, role_values, known_role)
+    verify_required('UserRoles', urc, userrole_values, known_userrole)
+except ValueError as exc:
+    con.close(); print(f'LANCommander bootstrap schema validation failed: {exc}', file=sys.stderr); raise SystemExit(32)
+
+try:
+    con.execute('BEGIN IMMEDIATE')
+    if not role_row:
+        vals = filtered(role_values, rc)
+        keys = list(vals)
+        con.execute(f'INSERT INTO Roles ({",".join(keys)}) VALUES ({",".join("?" for _ in keys)})', [vals[k] for k in keys])
+    elif 'NormalizedName' in rc and not (role_row['NormalizedName'] or ''):
+        con.execute('UPDATE Roles SET NormalizedName=? WHERE Id=?', ('ADMINISTRATOR', rid))
+
+    if user_row:
+        # Reconcile only the reserved account. Preserve unrelated profile fields,
+        # but repair everything required for deterministic local authentication.
+        updates = {
+            'UserName': username,
+            'NormalizedUserName': normalized,
+            'PasswordHash': user_values['PasswordHash'],
+            'SecurityStamp': user_values['SecurityStamp'],
+            'ConcurrencyStamp': user_values['ConcurrencyStamp'],
+            'Approved': 1,
+            'ApprovedOn': user_row['ApprovedOn'] if 'ApprovedOn' in uc and user_row['ApprovedOn'] else now,
+            'AccessFailedCount': 0,
+            'LockoutEnd': None,
+            'UpdatedOn': now,
+        }
+        if 'Alias' in uc and not (user_row['Alias'] if 'Alias' in user_row.keys() else None):
+            updates['Alias'] = 'PCGA Appliance'
+        if chosen_email and 'Email' in uc and not (user_row['Email'] if 'Email' in user_row.keys() else None):
+            updates['Email'] = chosen_email
+            if 'NormalizedEmail' in uc: updates['NormalizedEmail'] = chosen_email.upper()
+        vals = filtered(updates, uc, include_none=True)
+        con.execute('UPDATE Users SET ' + ','.join(f'"{k}"=?' for k in vals) + ' WHERE Id=?', [*vals.values(), uid])
+    else:
+        vals = filtered(user_values, uc)
+        keys = list(vals)
+        con.execute(f'INSERT INTO Users ({",".join(keys)}) VALUES ({",".join("?" for _ in keys)})', [vals[k] for k in keys])
+
+    membership = con.execute('SELECT 1 FROM UserRoles WHERE UserId=? AND RoleId=? LIMIT 1', (uid, rid)).fetchone()
+    if not membership:
+        vals = filtered(userrole_values, urc)
+        keys = list(vals)
+        con.execute(f'INSERT INTO UserRoles ({",".join(keys)}) VALUES ({",".join("?" for _ in keys)})', [vals[k] for k in keys])
+    con.commit()
+except (sqlite3.Error, ValueError) as exc:
+    con.rollback(); con.close(); print(f'LANCommander bootstrap transaction failed: {exc}', file=sys.stderr); raise SystemExit(33)
+
+# Verify the exact postcondition before letting LANCommander reopen the DB.
+row = con.execute(
+    'SELECT u.PasswordHash,u.Approved FROM Users u JOIN UserRoles ur ON ur.UserId=u.Id '
+    'JOIN Roles r ON r.Id=ur.RoleId WHERE upper(u.NormalizedUserName)=? '
+    'AND upper(r.NormalizedName)=? LIMIT 1', (normalized, 'ADMINISTRATOR')
+).fetchone()
+if not row or int(row['Approved'] or 0) != 1 or not identity_verify(str(row['PasswordHash'] or ''), password):
+    con.close(); print('LANCommander reserved identity verification failed after transaction', file=sys.stderr); raise SystemExit(34)
+con.close()
+print('reconciled')
+PYDB
+rc=$?
+set -e
+
+if [[ $rc -ne 0 ]]; then
+  cp -a "$backup" "$db"
+  fail "LANCommander reserved identity reconciliation failed (exit $rc); database restored from $backup"
+fi
+
+# Restart and require both application readiness and the absence of onboarding.
+docker start lancommander >/dev/null || fail "Unable to restart LANCommander after bootstrap"
+restart_on_exit=0
+trap - EXIT
+wait_http || fail "LANCommander did not become HTTP-ready after identity reconciliation"
+if probe_setup; then
+  fail "LANCommander still reports first-time setup after PCGA identity reconciliation; backup retained at $backup"
+fi
+
+# Read-only second-pass verification catches a database path mismatch or an app
+# migration that replaced/rewrote the identity schema during startup.
+if ! python3 - "$db" "$PCGA_LANCOMMANDER_ADMIN_USER" <<'PYVERIFY'
+import sqlite3,sys
+p,u=sys.argv[1:]
+c=sqlite3.connect(f'file:{p}?mode=ro',uri=True)
+r=c.execute(
+ 'SELECT 1 FROM Users u JOIN UserRoles ur ON ur.UserId=u.Id JOIN Roles r ON r.Id=ur.RoleId '
+ 'WHERE upper(u.NormalizedUserName)=? AND upper(r.NormalizedName)=? AND u.Approved=1 LIMIT 1',
+ (u.upper(),'ADMINISTRATOR')).fetchone()
+c.close(); raise SystemExit(0 if r else 1)
+PYVERIFY
+then
+  fail "LANCommander restarted but the verified PCGA administrator identity is no longer present"
+fi
+
+# Publish the catalog DB path for the read-only portal sidecar.  Identity and
+# catalog data normally live in the same SQLite database, but discovering by
+# schema instead of filename keeps this robust across LANCommander layouts.
+# The pointer is relative to /app/Data so it remains valid in pcga-status where
+# the same host directory is mounted at /pcga/lancommander.
+catalog_rel="$(python3 - "$DATA" "$db" <<'PYCATALOG'
+from pathlib import Path
+import os, sqlite3, sys
+root=Path(sys.argv[1]).resolve(strict=False)
+identity=Path(sys.argv[2]).resolve(strict=False)
+pruned={'uploads','media','saves','steam','archives','files','cache','downloads'}
+
+def is_sqlite(p):
+    try:
+        with p.open('rb') as f:
+            return f.read(16) == b'SQLite format 3\x00'
+    except OSError:
+        return False
+
+def tables(p):
+    try:
+        c=sqlite3.connect(f'file:{p}?mode=ro', uri=True, timeout=.5)
+        try: return {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        finally: c.close()
+    except sqlite3.Error:
+        return set()
+
+candidates=[]
+if identity.is_file(): candidates.append(identity)
+try:
+    for current, dirs, files in os.walk(root):
+        cur=Path(current)
+        try: depth=len(cur.relative_to(root).parts)
+        except ValueError: continue
+        dirs[:] = [d for d in dirs if d.lower() not in pruned and depth < 4]
+        if depth > 4:
+            dirs[:] = []
+            continue
+        for name in files:
+            q=cur/name
+            if q not in candidates and (q.suffix.lower() in {'.db','.sqlite','.sqlite3'} or is_sqlite(q)):
+                candidates.append(q)
+except OSError:
+    pass
+
+best=None; best_score=-1
+for q in candidates:
+    ts=tables(q)
+    if 'Games' not in ts:
+        continue
+    score=100 + 10*('Archives' in ts) + 10*('StorageLocations' in ts) + 2*('Media' in ts) + ('Users' in ts)
+    if score > best_score:
+        best, best_score=q, score
+if best is not None:
+    try: print(best.relative_to(root).as_posix())
+    except ValueError: pass
+PYCATALOG
+)"
+if [[ -n "$catalog_rel" ]]; then
+  printf '%s\n' "$catalog_rel" >"$CATALOG_PTR"
+  chmod 0644 "$CATALOG_PTR"
+  printf '[pcga-lancommander-bootstrap] Published LANCommander catalog path: %s\n' "$catalog_rel"
+else
+  rm -f "$CATALOG_PTR"
+  printf '[pcga-lancommander-bootstrap:warn] LANCommander identity is ready but no SQLite Games catalog was discoverable yet; portal diagnostics will retry dynamically.\n' >&2
+fi
+
+state ready
+printf '[pcga-lancommander-bootstrap] LANCommander appliance identity is ready; existing users were preserved.\n'

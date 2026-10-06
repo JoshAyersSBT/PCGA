@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+name="${1#/dev/}"; dev="/dev/$name"
+allowed=/etc/pc-game-archive/media-drives
+run_dir=/run/pcga-optical-dispatch
+state_dir=/var/lib/pc-game-archive/optical-dispatch
+mkdir -p "$run_dir" "$state_dir"
+[[ -r "$allowed" ]] || exit 0
+grep -Fxq "$dev" "$allowed" || exit 0
+[[ -b "$dev" ]] || exit 0
+exec 9>"$run_dir/${name}.lock"; flock -n 9 || exit 0
+finger="$run_dir/${name}.fingerprint"
+state="$state_dir/${name}.json"
+if ! /usr/local/sbin/pcga-optical-media-present "$dev" >/dev/null 2>&1; then
+  rm -f "$finger"
+  printf '{"device":"%s","present":false,"updated_at":"%s"}\n' "$dev" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$state"
+  exit 0
+fi
+auto_rip=true
+if [[ -r /etc/pc-game-archive/appliance.json ]] && ! python3 - <<'PY_AUTORIP' >/dev/null 2>&1
+import json
+try:
+    d=json.load(open('/etc/pc-game-archive/appliance.json'))
+    raise SystemExit(0 if bool((d.get('ingest') or {}).get('auto_rip',True)) else 1)
+except Exception:
+    raise SystemExit(0)
+PY_AUTORIP
+then
+  auto_rip=false
+fi
+# Identification is a core optical capability and remains active even when
+# automatic ingest is disabled. The Control Center toggle gates only backend
+# execution, not media classification/status reporting.
+probe="$(mktemp)"; trap 'rm -f "$probe"' EXIT
+if ! /usr/local/sbin/pcga-optical-identify "$dev" >"$probe"; then
+  logger -t PCGA-OPTICAL "Could not identify inserted media in $dev"
+  exit 75
+fi
+route="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("route","unsupported"))' "$probe")"
+kind="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("kind","unknown"))' "$probe")"
+fp="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fingerprint",""))' "$probe")"
+python3 - "$probe" "$state" "$auto_rip" <<'PY'
+import json,sys,datetime
+p=json.load(open(sys.argv[1]))
+p['present']=True
+p['auto_ingest_enabled']=(sys.argv[3]=='true')
+p['dispatch_status']='identified' if p['auto_ingest_enabled'] else 'held-auto-ingest-disabled'
+p['updated_at']=datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+open(sys.argv[2],'w').write(json.dumps(p,indent=2,sort_keys=True)+'\n')
+PY
+# For PC/data media, collect a game/disc identity record before imaging begins.
+# The record is keyed by the optical fingerprint, so metadata edits can happen
+# while the rip is running and still follow the resulting preservation artifact.
+if [[ "$route" == pc-data || "$route" == pc-mixed ]]; then
+  meta_tmp="$(mktemp)"
+  if /usr/local/sbin/pcga-game-disc-metadata --record --probe "$probe" "$dev" >"$meta_tmp" 2>/dev/null; then
+    python3 - "$state" "$meta_tmp" <<'PY_META'
+import json,sys
+state=json.load(open(sys.argv[1])); meta=json.load(open(sys.argv[2]))
+state['game_metadata']={k:meta.get(k) for k in ('layout','collection_id','collection_title','game_set_id','game_set_ids','title','series','edition','disc_number','disc_count','disc_role','metadata_status','match')}
+state['game_metadata']['content_count']=len(meta.get('contents') or [])
+state['game_metadata_file']=f"/var/lib/pc-game-archive/game-intake/discs/{meta.get('fingerprint','')}.json"
+open(sys.argv[1],'w').write(json.dumps(state,indent=2,sort_keys=True)+'\n')
+PY_META
+  else
+    logger -t PCGA-OPTICAL "Game metadata collection failed for $dev; preservation may continue with optical metadata only"
+  fi
+  rm -f "$meta_tmp"
+fi
+# Movie/TV optical media uses the same pre-rip relationship model as PC games:
+# one physical disc may belong to a multi-disc title or expose several logical
+# titles. Capture the volume/title table before ARM begins and keep it separate
+# from ARM's own category guess so later review can safely correct it.
+if [[ "$route" == arm-video ]]; then
+  media_tmp="$(mktemp)"
+  if /usr/local/sbin/pcga-media-disc-metadata --record --probe "$probe" "$dev" >"$media_tmp" 2>/dev/null; then
+    python3 - "$state" "$media_tmp" <<'PY_MEDIA'
+import json,sys
+state=json.load(open(sys.argv[1])); meta=json.load(open(sys.argv[2]))
+state['media_metadata']={k:meta.get(k) for k in ('layout','kind','collection_id','collection_title','media_item_id','media_item_ids','title','disc_number','disc_count','disc_role','metadata_status','match','title_probe_status')}
+state['media_metadata']['content_count']=len(meta.get('contents') or [])
+state['media_metadata']['title_count']=len(meta.get('title_table') or [])
+state['media_metadata_file']=f"/var/lib/pc-game-archive/media-intake/discs/{meta.get('fingerprint','')}.json"
+open(sys.argv[1],'w').write(json.dumps(state,indent=2,sort_keys=True)+'\n')
+PY_MEDIA
+  else
+    logger -t PCGA-OPTICAL "Movie/TV metadata collection failed for $dev; ARM ingest may continue with optical metadata only"
+  fi
+  rm -f "$media_tmp"
+fi
+if [[ "$auto_rip" != true ]]; then
+  logger -t PCGA-OPTICAL "Identified $kind in $dev as route=$route; automatic ingest is disabled, so no backend was started"
+  exit 0
+fi
+if [[ -n "$fp" && -r "$finger" && "$(cat "$finger" 2>/dev/null)" == "$fp" ]]; then exit 0; fi
+[[ -n "$fp" ]] && printf '%s\n' "$fp" > "$finger"
+case "$route" in
+  arm-video|arm-audio)
+    logger -t PCGA-OPTICAL "Detected $kind in $dev; dispatching to ARM"
+    systemctl --no-block start "pcga-arm-rip@${name}.service"
+    ;;
+  pc-data|pc-mixed)
+    logger -t PCGA-OPTICAL "Detected $kind in $dev; dispatching to PC/data-disc preservation"
+    systemctl --no-block start "pcga-pc-disc-rip@${name}.service"
+    ;;
+  *)
+    logger -t PCGA-OPTICAL "Inserted media in $dev is $kind; no unattended backend selected"
+    ;;
+esac

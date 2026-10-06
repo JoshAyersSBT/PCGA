@@ -1,0 +1,8 @@
+[Unit]
+Description=PC Game Archive appliance service authentication reconciliation
+After=docker.service network-online.target pcga-game-stack.service
+Wants=docker.service network-online.target pcga-game-stack.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-service-auth

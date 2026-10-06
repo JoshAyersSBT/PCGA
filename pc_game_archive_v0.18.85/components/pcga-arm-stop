@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+name="${1#/dev/}"
+[[ -n "$name" ]] || { echo "Usage: pcga-arm-stop srN" >&2; exit 64; }
+dev="/dev/$name"
+[[ "$(docker inspect -f '{{.State.Running}}' arm-rippers 2>/dev/null || true)" == true ]] || exit 0
+exec 8>"/run/pcga-arm-stop-${name}.lock"
+flock -w 15 8 || { echo "Timed out waiting for $dev stop lock" >&2; exit 75; }
+
+docker exec -i --user arm --workdir /opt/arm arm-rippers python3 - "$dev" "$name" <<'PY'
+import sys
+import time
+import psutil
+from arm.ui import app
+from arm.models.system_drives import SystemDrives
+
+dev,name=sys.argv[1],sys.argv[2]
+recorded_pid=None
+job_id=None
+with app.app_context():
+    drive=SystemDrives.query.filter_by(mount=dev).first()
+    job=drive.job_current if drive is not None else None
+    if job is not None:
+        try: recorded_pid=int(getattr(job,'pid',0) or 0) or None
+        except Exception: recorded_pid=None
+        job_id=getattr(job,'job_id',getattr(drive,'job_id_current',None))
+
+def cmdline(p):
+    try: return p.cmdline()
+    except (psutil.NoSuchProcess,psutil.ZombieProcess,psutil.AccessDenied): return []
+
+def is_target_main(p):
+    cmd=cmdline(p)
+    joined=' '.join(cmd)
+    if '/opt/arm/arm/ripper/main.py' not in joined:
+        return False
+    for i,a in enumerate(cmd[:-1]):
+        if a == '-d' and cmd[i+1] in {name,dev}:
+            return True
+    return False
+
+def is_target_direct_child(p):
+    cmd=cmdline(p)
+    joined=' '.join(cmd)
+    if 'makemkvcon' in joined and f'dev:{dev}' in joined:
+        return True
+    return False
+
+targets=[]
+seen=set()
+if recorded_pid:
+    try:
+        p=psutil.Process(recorded_pid)
+        if is_target_main(p):
+            targets.append(p); seen.add(p.pid)
+        else:
+            print(f'{dev}: DB PID {recorded_pid} no longer matches this drive; using process scan fallback')
+    except (psutil.NoSuchProcess,psutil.ZombieProcess,psutil.AccessDenied):
+        pass
+
+# Critical fallback: the DB can release job_current before the Python ripper has
+# actually exited. Find exact `main.py -d srN` processes so ExecStop can still
+# reap an orphan waiting on pipe_read after its MakeMKV child disappears.
+for p in psutil.process_iter(['pid']):
+    try:
+        if p.pid not in seen and is_target_main(p):
+            targets.append(p); seen.add(p.pid)
+    except Exception:
+        pass
+
+# Also catch a device-path MakeMKV process if the ARM parent vanished first.
+for p in psutil.process_iter(['pid']):
+    try:
+        if p.pid not in seen and is_target_direct_child(p):
+            targets.append(p); seen.add(p.pid)
+    except Exception:
+        pass
+
+if not targets:
+    print(f'{dev}: no matching ARM/MakeMKV process remains')
+    raise SystemExit(0)
+
+all_procs=[]
+for parent in targets:
+    try:
+        children=parent.children(recursive=True)
+    except (psutil.NoSuchProcess,psutil.AccessDenied):
+        children=[]
+    all_procs.extend(children)
+    all_procs.append(parent)
+
+# De-duplicate, children first.
+unique={}
+for p in all_procs:
+    unique[p.pid]=p
+procs=list(unique.values())
+procs.sort(key=lambda p: len(getattr(p,'parents',lambda:[])()), reverse=True)
+print(f'{dev}: stopping {len(procs)} process(es)' + (f' for ARM job {job_id}' if job_id else ''))
+for p in procs:
+    try:
+        print('TERM',p.pid,' '.join(cmdline(p))[:180])
+        p.terminate()
+    except (psutil.NoSuchProcess,psutil.AccessDenied):
+        pass
+_,alive=psutil.wait_procs(procs,timeout=8)
+for p in alive:
+    try:
+        print('KILL',p.pid,' '.join(cmdline(p))[:180])
+        p.kill()
+    except (psutil.NoSuchProcess,psutil.AccessDenied):
+        pass
+_,alive=psutil.wait_procs(alive,timeout=5)
+if alive:
+    print(f'{dev}: warning: {len(alive)} process(es) still present after SIGKILL',file=sys.stderr)
+    for p in alive:
+        print(f'  pid={p.pid} status={getattr(p,"status",lambda:"?")()} cmd={" ".join(cmdline(p))[:180]}',file=sys.stderr)
+    raise SystemExit(75)
+print(f'{dev}: ARM process tree stopped')
+PY
+
+sleep 1
+set +e
+/usr/local/sbin/pcga-arm-reconcile "$name"
+rc=$?
+set -e
+if [[ $rc -eq 75 ]]; then
+  sleep 2
+  /usr/local/sbin/pcga-arm-reconcile "$name" || true
+elif [[ $rc -ne 0 ]]; then
+  exit "$rc"
+fi

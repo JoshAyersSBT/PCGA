@@ -1,0 +1,18 @@
+[Unit]
+Description=PC Game Archive content intake and public media importer
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=PCGA_ARCHIVE_ROOT=__ARCHIVE_ROOT__
+ExecStart=/usr/local/sbin/pcga-public-media serve --root __ARCHIVE_ROOT__ --bind __PUBLIC_MEDIA_BIND__ --port 8099
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=__ARCHIVE_ROOT__ /var/lib/pc-game-archive/public-media
+
+[Install]
+WantedBy=multi-user.target

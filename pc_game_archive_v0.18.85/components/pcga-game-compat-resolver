@@ -1,0 +1,846 @@
+#!/usr/bin/env python3
+"""Resolve PCGA PC-game candidates against public compatibility knowledge.
+
+The resolver intentionally treats external sources as evidence rather than code.
+It never executes PlayOnLinux installer scripts or ProtonDB report text.  It
+extracts a small allow-listed set of declarative facts into a provider-neutral
+compatibility profile that the PCGA Wine runtime may consume safely.
+"""
+from __future__ import annotations
+
+import argparse
+import collections
+import datetime as dt
+import difflib
+import html
+from html.parser import HTMLParser
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.18.85"
+SETS = Path("/var/lib/pc-game-archive/game-intake/sets")
+COMPAT_ROOT = Path("/var/lib/pc-game-archive/game-compat")
+CACHE_ROOT = Path("/var/cache/pc-game-archive/game-compat")
+METADATA_ENV = Path("/etc/pc-game-archive/game-metadata.env")
+
+PROTONDB_SUMMARY = "https://www.protondb.com/api/v1/reports/summaries/{appid}.json"
+PROTONDB_REPORTS_DEFAULT = "https://protondb.max-p.me/games/{appid}/reports/"
+POL_GAMES_CATALOG = "https://www.playonlinux.com/en/supported_apps-1-0.html"
+POL_ORIGIN = "https://www.playonlinux.com"
+
+# Only declarative Winetricks verbs with reasonably bounded behavior are ever
+# auto-applied from PlayOnLinux evidence. Unknown POL_Call functions are kept as
+# evidence but cannot reach the runtime command line.
+SAFE_WINETRICKS = {
+    "corefonts", "directplay", "mdac28", "physx", "quartz",
+    "vcrun2005", "vcrun2008", "vcrun2010", "vcrun2012", "vcrun2013",
+    "vcrun2015", "vcrun2019", "xact", "xact_jun2010", "xinput", "xinput1_3",
+    "d3dx9", "d3dcompiler_43", "d3dcompiler_47",
+}
+SAFE_WINETRICKS.update({f"d3dx9_{n}" for n in range(24, 44)})
+SAFE_WINETRICKS.update({f"d3dx10_{n}" for n in (33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43)})
+SAFE_WINETRICKS.update({f"d3dx11_{n}" for n in (42, 43)})
+
+# These Proton variables are sufficiently specific to identify a reported tweak,
+# but PCGA's current GOW runtime is Wine/Lutris rather than a selectable Proton
+# runner.  They are therefore recorded as recommendations, not blindly applied.
+SAFE_PROTON_ENV = {
+    "PROTON_USE_WINED3D", "PROTON_NO_ESYNC", "PROTON_NO_FSYNC",
+    "PROTON_ENABLE_NVAPI", "PROTON_HIDE_NVIDIA_GPU", "PROTON_LOG",
+    "DXVK_ASYNC", "DXVK_FRAME_RATE", "WINE_FULLSCREEN_FSR",
+    # These are Wine/OpenGL-driver variables rather than Proton-only knobs.  They
+    # are useful to PCGA's current GOW Wine runtime and may be auto-applied when
+    # an exact/strong provider match has repeated evidence.
+    "MESA_EXTENSION_MAX_YEAR", "__GL_ExtensionStringVersion",
+}
+
+AUTO_WINE_ENV = {
+    "MESA_EXTENSION_MAX_YEAR",
+    "__GL_ExtensionStringVersion",
+}
+
+EDITION_WORDS = {
+    "edition", "enhanced", "remaster", "remastered", "definitive", "anniversary",
+    "hd", "gold", "complete", "collection", "game", "windows", "pc", "steam",
+    "gog", "com", "dvd", "cd", "retail",
+}
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def load_json(path: Path) -> dict:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
+def load_env(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return out
+
+
+def as_bool(value: object, default: bool = True) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def provider_settings(env: dict[str, str]) -> dict:
+    """Return the provider policy that makes a cached profile semantically valid."""
+    return {
+        "protondb": as_bool(env.get("PCGA_PROTONDB_ENABLED"), True),
+        "protondb_community_reports": as_bool(env.get("PCGA_PROTONDB_COMMUNITY_REPORTS"), True),
+        "protondb_reports_url": env.get("PCGA_PROTONDB_REPORTS_URL") or PROTONDB_REPORTS_DEFAULT,
+        "playonlinux": as_bool(env.get("PCGA_PLAYONLINUX_ENABLED"), True),
+    }
+
+
+def norm(value: object) -> str:
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).split())
+
+
+def core(value: object) -> str:
+    words = [w for w in norm(value).split() if w not in EDITION_WORDS]
+    return " ".join(words)
+
+
+def title_score(wanted: str, candidate: str) -> float:
+    raw_a, raw_b = norm(wanted), norm(candidate)
+    a, b = core(wanted), core(candidate)
+    if not a or not b:
+        return 0.0
+    # Preserve exact edition identity before stripping packaging/channel words.
+    # This prevents a shorter generic recipe from tying an exact Gold/GOG/Steam
+    # entry merely because both collapse to the same core title.
+    if raw_a == raw_b:
+        return 1.0
+    if a == b:
+        base = 0.93
+    else:
+        aset, bset = set(a.split()), set(b.split())
+        jac = len(aset & bset) / max(1, len(aset | bset))
+        contain = 1.0 if (aset.issubset(bset) or bset.issubset(aset)) else 0.0
+        seq = difflib.SequenceMatcher(None, a, b).ratio()
+        base = max(0.68 * jac + 0.32 * seq, 0.78 * seq, 0.82 if contain and jac >= 0.60 else 0.0)
+    # Edition/channel markers can identify materially different installers. A
+    # mismatched variant remains visible as evidence but falls below the default
+    # 0.86 automatic-application threshold when the core title is otherwise tied.
+    wa, wb = set(raw_a.split()), set(raw_b.split())
+    for marker in {"demo", "patch", "steam", "gog", "gold", "complete", "collection",
+                   "enhanced", "remaster", "remastered", "definitive", "anniversary"}:
+        if (marker in wa) != (marker in wb):
+            base -= 0.09
+    return max(0.0, min(1.0, base))
+
+
+def http_bytes(url: str, *, timeout: float = 10.0, max_bytes: int = 6 * 1024 * 1024, accept: str = "*/*") -> tuple[bytes, dict[str, str]]:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": f"PCGameArchive/{VERSION} (+local compatibility resolver; cached)",
+        "Accept": accept,
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f"response exceeds {max_bytes} bytes")
+        headers = {str(k): str(v) for k, v in resp.headers.items()}
+        return data, headers
+
+
+def http_json(url: str, *, timeout: float = 10.0, max_bytes: int = 4 * 1024 * 1024) -> object:
+    raw, _ = http_bytes(url, timeout=timeout, max_bytes=max_bytes, accept="application/json")
+    return json.loads(raw.decode("utf-8", "replace") or "null")
+
+
+class _LinkTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.links: list[tuple[str, str]] = []
+        self._href: str | None = None
+        self._text: list[str] = []
+        self.all_text: list[str] = []
+        self.code_chunks: list[str] = []
+        self._code_depth = 0
+        self._code_buf: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        attrs_d = dict(attrs)
+        if tag == "a":
+            self._href = str(attrs_d.get("href") or "")
+            self._text = []
+        if tag in {"pre", "code"}:
+            self._code_depth += 1
+            if self._code_depth == 1:
+                self._code_buf = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self._href is not None:
+            text = " ".join("".join(self._text).split())
+            self.links.append((self._href, text))
+            self._href = None
+            self._text = []
+        if tag in {"pre", "code"} and self._code_depth:
+            self._code_depth -= 1
+            if self._code_depth == 0:
+                chunk = "".join(self._code_buf).strip()
+                if chunk:
+                    self.code_chunks.append(chunk)
+                self._code_buf = []
+
+    def handle_data(self, data: str) -> None:
+        self.all_text.append(data)
+        if self._href is not None:
+            self._text.append(data)
+        if self._code_depth:
+            self._code_buf.append(data)
+
+
+def parse_html(raw: bytes) -> _LinkTextParser:
+    parser = _LinkTextParser()
+    parser.feed(raw.decode("utf-8", "replace"))
+    return parser
+
+
+def cache_fresh(path: Path, ttl: dt.timedelta) -> bool:
+    try:
+        stamp = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
+        return dt.datetime.now(dt.timezone.utc) - stamp < ttl
+    except OSError:
+        return False
+
+
+def fetch_pol_catalog(*, force: bool = False) -> list[dict]:
+    cache = CACHE_ROOT / "playonlinux-games.json"
+    if not force and cache_fresh(cache, dt.timedelta(days=7)):
+        data = load_json(cache)
+        rows = data.get("games") if isinstance(data.get("games"), list) else []
+        if rows:
+            return [x for x in rows if isinstance(x, dict)]
+    raw, _ = http_bytes(POL_GAMES_CATALOG, timeout=14, max_bytes=8 * 1024 * 1024, accept="text/html")
+    parser = parse_html(raw)
+    out, seen = [], set()
+    rx = re.compile(r"(?:^|/)(?:en/)?app-(\d+)-[^\s\"'#?]+\.html$")
+    for href, text in parser.links:
+        parsed = urllib.parse.urlparse(href)
+        # Catalog links are data, not navigation authority: never follow a
+        # look-alike /en/app-* URL on a third-party host.
+        if parsed.scheme or parsed.netloc:
+            if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").lower() not in {"playonlinux.com", "www.playonlinux.com"}:
+                continue
+            path = parsed.path
+        else:
+            path = href.split("?", 1)[0].split("#", 1)[0]
+        m = rx.search(path)
+        if not m or not text:
+            continue
+        app_id = m.group(1)
+        if app_id in seen:
+            continue
+        seen.add(app_id)
+        url = urllib.parse.urljoin(POL_ORIGIN + "/", path.lstrip("/"))
+        if path.startswith("/en/"):
+            url = urllib.parse.urljoin(POL_ORIGIN, path)
+        elif not path.startswith("/en/"):
+            url = urllib.parse.urljoin(POL_ORIGIN + "/en/", path.lstrip("/"))
+        out.append({"id": app_id, "title": text.strip(), "url": url})
+    save_json(cache, {"schema": 1, "source": POL_GAMES_CATALOG, "fetched_at": now(), "games": out})
+    return out
+
+
+def pol_candidate(title: str, *, force: bool = False) -> tuple[dict | None, float, list[dict]]:
+    rows = fetch_pol_catalog(force=force)
+    scored = []
+    for row in rows:
+        score = title_score(title, str(row.get("title") or ""))
+        if score >= 0.64:
+            scored.append((score, row))
+    scored.sort(key=lambda x: (-x[0], len(norm(x[1].get("title"))), str(x[1].get("title") or "").casefold()))
+    candidates = [{"id": x[1].get("id"), "title": x[1].get("title"), "score": round(x[0], 3)} for x in scored[:5]]
+    if not scored:
+        return None, 0.0, candidates
+    best_score, best = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    # Do not auto-attach an ambiguous script to the wrong edition.
+    if best_score < 0.80 or (best_score - second < 0.035 and core(best.get("title")) != core(title)):
+        return None, best_score, candidates
+    return best, best_score, candidates
+
+
+def _pol_component(call: str) -> str | None:
+    name = str(call).strip()
+    name = re.sub(r"^POL_Install_", "", name, flags=re.I).lower()
+    aliases = {
+        "d3dx9_36": "d3dx9_36",
+        "d3dx9": "d3dx9",
+        "corefonts": "corefonts",
+        "mdac28": "mdac28",
+        "directplay": "directplay",
+    }
+    name = aliases.get(name, name)
+    return name if name in SAFE_WINETRICKS else None
+
+
+def fetch_pol_profile(entry: dict, score: float, *, force: bool = False) -> dict:
+    app_id = str(entry.get("id") or "")
+    cache = CACHE_ROOT / "playonlinux" / f"{app_id}.json"
+    if not force and cache_fresh(cache, dt.timedelta(days=30)):
+        cached = load_json(cache)
+        if cached:
+            cached["match_score"] = round(score, 3)
+            return cached
+    raw, _ = http_bytes(str(entry["url"]), timeout=12, max_bytes=4 * 1024 * 1024, accept="text/html")
+    parser = parse_html(raw)
+    text = html.unescape("\n".join(parser.all_text))
+    approved = "This installer has been approved by the team" in text
+    # The first warning/reply starts proposed, unapproved revisions. Restrict
+    # automatic extraction to the approved page body before that boundary.
+    approved_text = text.split("Warning", 1)[0] if approved else text
+    code_candidates = [x for x in parser.code_chunks if "POL_" in x or "WINE_VERSION" in x]
+    # An approved page may contain later user-proposed revisions. Automatic
+    # extraction is restricted to the first approved script block; unapproved
+    # pages may be parsed more broadly for evidence but can never auto-apply.
+    script = (code_candidates[0] if approved and code_candidates else "\n".join(code_candidates[:4]))
+    if approved and "Warning" in script:
+        script = script.split("Warning", 1)[0]
+    if not script:
+        script = approved_text
+
+    wine_versions = []
+    for pat in (
+        r'\bWINE_VERSION\s*=\s*["\']([^"\']+)["\']',
+        r'POL_Wine_PrefixCreate\s+["\']([^"\']+)["\']',
+    ):
+        for value in re.findall(pat, script):
+            value = value.strip()
+            if not value or value.startswith("$"):
+                continue
+            if value not in wine_versions:
+                wine_versions.append(value)
+    if not wine_versions:
+        m = re.search(r"\bWine\s*:\s*([^\n\r]+)", approved_text, re.I)
+        if m:
+            value = m.group(1).strip().split()[0]
+            if value and value not in {"-", "?"}:
+                wine_versions.append(value)
+
+    arch = None
+    m = re.search(r'POL_System_SetArch\s+["\'](x86|amd64|win32|win64)["\']', script, re.I)
+    if m:
+        arch = "win32" if m.group(1).lower() in {"x86", "win32"} else "win64"
+    windows_version = None
+    m = re.search(r'Set_OS\s+["\']?(win(?:xp|7|8|81|10|11|2000|2003|vista))["\']?', script, re.I)
+    if m:
+        windows_version = m.group(1).lower()
+
+    raw_calls = []
+    safe_components = []
+    for call in re.findall(r"\bPOL_Call\s+(POL_Install_[A-Za-z0-9_]+)", script):
+        if call not in raw_calls:
+            raw_calls.append(call)
+        comp = _pol_component(call)
+        if comp and comp not in safe_components:
+            safe_components.append(comp)
+
+    executables = []
+    for exe in re.findall(r'POL_Shortcut\s+["\']([^"\']+?\.exe)["\']', script, re.I):
+        exe = Path(exe.replace("\\", "/")).name
+        if exe and exe.casefold() not in {x.casefold() for x in executables}:
+            executables.append(exe)
+
+    install_methods = []
+    for methods in re.findall(r'POL_SetupWindow_InstallMethod\s+["\']([^"\']+)["\']', script, re.I):
+        for method in re.split(r"[,| ]+", methods):
+            method = method.strip().upper()
+            if method and method not in install_methods:
+                install_methods.append(method)
+
+    profile = {
+        "provider": "playonlinux",
+        "status": "matched",
+        "id": app_id,
+        "title": str(entry.get("title") or ""),
+        "url": str(entry.get("url") or ""),
+        "approved": bool(approved),
+        "match_score": round(score, 3),
+        "wine_versions": wine_versions[:4],
+        "wine_arch": arch,
+        "windows_version": windows_version,
+        "winetricks_components": safe_components,
+        "unsupported_component_calls": [x for x in raw_calls if _pol_component(x) is None][:24],
+        "executables": executables[:12],
+        "install_methods": install_methods[:12],
+        "fetched_at": now(),
+    }
+    save_json(cache, profile)
+    return profile
+
+
+def protondb_profile(appid: str, env: dict[str, str]) -> dict:
+    result: dict = {
+        "provider": "protondb",
+        "appid": str(appid),
+        "url": f"https://www.protondb.com/app/{appid}",
+        "checked_at": now(),
+    }
+    try:
+        summary = http_json(PROTONDB_SUMMARY.format(appid=urllib.parse.quote(str(appid), safe="")), timeout=9, max_bytes=1024 * 1024)
+        if isinstance(summary, dict):
+            keep = ("tier", "provisionalTier", "bestReportedTier", "trendingTier", "confidence", "score", "total")
+            result["summary"] = {k: summary.get(k) for k in keep if k in summary}
+            result["summary_status"] = "matched"
+        else:
+            result["summary_status"] = "invalid-response"
+    except urllib.error.HTTPError as exc:
+        result["summary_status"] = "no-reports" if exc.code == 404 else f"http-{exc.code}"
+    except Exception as exc:
+        result["summary_status"] = "error-" + type(exc).__name__
+
+    if not as_bool(env.get("PCGA_PROTONDB_COMMUNITY_REPORTS"), True):
+        result["reports_status"] = "disabled"
+        return result
+    template = env.get("PCGA_PROTONDB_REPORTS_URL") or PROTONDB_REPORTS_DEFAULT
+    try:
+        url = template.format(appid=urllib.parse.quote(str(appid), safe=""))
+        rows_obj = http_json(url, timeout=10, max_bytes=3 * 1024 * 1024)
+        rows = rows_obj if isinstance(rows_obj, list) else (rows_obj.get("reports") if isinstance(rows_obj, dict) else [])
+        rows = [x for x in rows if isinstance(x, dict)][:80]
+        versions = collections.Counter()
+        ratings = collections.Counter()
+        env_hits = collections.Counter()
+        newest = None
+        for row in rows:
+            version = str(row.get("protonVersion") or row.get("proton_version") or "").strip()
+            rating = str(row.get("rating") or "").strip().lower()
+            notes = str(row.get("notes") or "")
+            if version:
+                versions[version] += 1
+            if rating:
+                ratings[rating] += 1
+            ts = row.get("timestamp")
+            try:
+                ts_i = int(ts)
+                newest = max(newest or ts_i, ts_i)
+            except Exception:
+                pass
+            for key, value in re.findall(r"\b([A-Z][A-Z0-9_]{2,40})=([^\s;,'\"]+)", notes):
+                if key in SAFE_PROTON_ENV:
+                    env_hits[f"{key}={value}"] += 1
+        result["reports_status"] = "matched" if rows else "empty"
+        result["reports_considered"] = len(rows)
+        result["proton_versions"] = [{"version": k, "reports": v} for k, v in versions.most_common(6)]
+        result["ratings"] = dict(ratings.most_common())
+        result["environment_recommendations"] = [{"value": k, "reports": v} for k, v in env_hits.most_common(8)]
+        if newest:
+            result["newest_report_at"] = dt.datetime.fromtimestamp(newest, tz=dt.timezone.utc).isoformat(timespec="seconds")
+    except Exception as exc:
+        result["reports_status"] = "error-" + type(exc).__name__
+    return result
+
+
+def pcga_known_good_profile(title: str, steam_appid: str) -> dict:
+    """Return appliance-owned, narrowly scoped compatibility facts.
+
+    These rules exist for failures that are both well understood and safe to
+    express declaratively.  They are not executable provider scripts.  An exact
+    Steam AppID is preferred; canonical-title fallback is intentionally narrow so
+    retail optical editions without a Steam identity still benefit.
+    """
+    title_norm = norm(title)
+    appid = str(steam_appid or "").strip()
+
+    cod2 = appid == "2630" or title_norm in {"call of duty 2", "cod2"}
+    if cod2:
+        # Retail COD2's campaign binary is 32-bit and invokes SafeDisc 4.60's
+        # SecDrv path.  A win64/WoW64 prefix can reproduce the observed
+        # ZwLoadDriver(SecDrv)=c0000142 failure before the SP window maps.  Keep
+        # this as an appliance-owned declarative rule: it changes only the
+        # mutable Wine prefix and never patches or replaces the preserved game
+        # executable or optical media.
+        return {
+            "provider": "pcga-known-good",
+            "status": "matched",
+            "rule": "cod2-retail-safedisc-win32-prefix",
+            "title": "Call of Duty 2",
+            "match_basis": "steam-appid" if appid == "2630" else "canonical-title",
+            "confidence": 1.0 if appid == "2630" else 0.98,
+            "runner": "portable-wow64",
+            "runner_version": "11.19",
+            "runner_version_policy": "pinned-isolated-runtime",
+            "wine_arch": "win32",
+            "legacy_drm": "safedisc-4.60-secdrv",
+            "expected_volume_label": "COD2CD1",
+            "preferred_executables": ["CoD2SP_s.exe", "CoD2MP_s.exe"],
+            "detail": "Uses a genuine 32-bit Wine prefix with an isolated portable Wine 11.19 WoW64 runtime for the retail campaign SafeDisc/SecDrv startup path while preserving original media and binaries.",
+        }
+
+    outcast = appid == "6030" or title_norm in {"jedioutcast", "jedi outcast"} or (
+        "jedi" in title_norm and "outcast" in title_norm and
+        ("knight ii" in title_norm or "jedi knight 2" in title_norm or "jedi knight ii" in title_norm)
+    )
+    academy = appid == "6020" or (
+        "jedi" in title_norm and "academy" in title_norm and "knight" in title_norm
+    )
+    if not (outcast or academy):
+        return {}
+
+    # The original id Tech 3 renderer can overflow/fail while consuming modern
+    # OpenGL extension strings. Mesa and NVIDIA expose bounded compatibility
+    # variables for this exact class of legacy title. Setting both is portable:
+    # each vendor ignores the variable it does not implement.
+    name = "Jedi Knight II: Jedi Outcast" if outcast else "Jedi Knight: Jedi Academy"
+    return {
+        "provider": "pcga-known-good",
+        "status": "matched",
+        "rule": "idtech3-legacy-opengl-extension-string",
+        "title": name,
+        "match_basis": "steam-appid" if appid in {"6030", "6020"} else "canonical-title",
+        "confidence": 1.0 if appid in {"6030", "6020"} else 0.96,
+        "runtime_environment": {
+            "MESA_EXTENSION_MAX_YEAR": "2003",
+            "__GL_ExtensionStringVersion": "17700",
+        },
+        "launch_arguments": [
+            "+set", "r_fullscreen", "0",
+            "+set", "r_mode", "-1",
+            "+set", "r_customwidth", "1920",
+            "+set", "r_customheight", "1080",
+        ],
+        # Order matters: the real game binary is preferred over the retail
+        # JediOutcast.exe launcher shell. Launching jk2sp.exe directly avoids
+        # re-entering the installer/launcher workflow on subsequent sessions.
+        "preferred_executables": (["jk2sp.exe", "JediOutcast.exe"] if outcast else ["jasp.exe", "jasp_s.exe"]),
+        # Jedi Outcast's retail single-player check is not sector DRM: it scans
+        # CD-ROM drives for volume label JEDIOUTCAST and verifies this sentinel
+        # path. PCGA can therefore present a faithful Wine virtual CD view backed
+        # by the user's preserved media without patching the game executable.
+        "virtual_cd": ({
+            "drive_letter": "d",
+            "drive_type": "cdrom",
+            "label": "JEDIOUTCAST",
+            "required_paths": ["gamedata/gamedata/jk2sp.exe", "gamedata/gamedata/jk2sp"],
+            "source_policy": "preserved-media",
+        } if outcast else None),
+        "detail": "Bounds the legacy OpenGL extension string, prefers the direct game executable, and presents the preserved retail media through Wine's CD-ROM API.",
+    }
+
+
+def profile_due(existing: dict, game: dict, *, force: bool = False) -> bool:
+    if force or not existing:
+        return True
+    if str(existing.get("resolver_version") or "") != VERSION:
+        return True
+    if existing.get("provider_settings") != provider_settings(load_env(METADATA_ENV)):
+        return True
+    if str(existing.get("title_norm") or "") != norm(game.get("title")):
+        return True
+    if str(existing.get("steam_appid") or "") != str((game.get("external_ids") or {}).get("steam") or ""):
+        return True
+    raw = str(existing.get("resolved_at") or "")
+    try:
+        checked = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=dt.timezone.utc)
+        # Successful profiles are intentionally long-lived. Provider errors and
+        # ambiguous/no-match results retry much sooner so a temporary network or
+        # catalog problem does not stick to a newly ingested title for a month.
+        ttl = dt.timedelta(days=30) if str(existing.get("status") or "") == "matched" else dt.timedelta(hours=6)
+        return dt.datetime.now(dt.timezone.utc) - checked >= ttl
+    except Exception:
+        return True
+
+
+def build_profile(game: dict, *, force: bool = False, offline: bool = False) -> dict:
+    title = str(game.get("title") or "").strip()
+    env = load_env(METADATA_ENV)
+    provider_policy = provider_settings(env)
+    steam = str((game.get("external_ids") or {}).get("steam") or "").strip()
+    matches: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    if offline:
+        # Appliance-owned rules do not depend on network/provider evidence and
+        # must remain available during local repair/upgrade passes.
+        known = pcga_known_good_profile(title, steam)
+        if known and known.get("status") == "matched":
+            profile = {
+                "runner": str(known.get("runner") or "wine"),
+                "runner_version": str(known.get("runner_version") or "") or None,
+                "runner_version_policy": str(known.get("runner_version_policy") or "appliance-managed"),
+                "wine_arch": known.get("wine_arch") if known.get("wine_arch") in {"win32", "win64"} else None,
+                "windows_version": None,
+                "winetricks_components": [],
+                "preferred_executables": [Path(str(x)).name for x in known.get("preferred_executables") or [] if str(x).lower().endswith(".exe")][:12],
+                "recommended_runner_versions": [],
+                "recommended_environment": [],
+                "runtime_environment": dict(known.get("runtime_environment") or {}),
+                "launch_arguments": [str(x) for x in known.get("launch_arguments") or []][:24],
+                "virtual_cd": known.get("virtual_cd") if isinstance(known.get("virtual_cd"), dict) else None,
+                "legacy_drm": known.get("legacy_drm"),
+                "expected_volume_label": known.get("expected_volume_label"),
+                "auto_apply": True,
+                "source": ["pcga-known-good"],
+            }
+            return {
+                "schema": 1, "resolver_version": VERSION, "resolved_at": now(),
+                "title": title, "title_norm": norm(title), "steam_appid": steam or None,
+                "provider_settings": provider_policy,
+                "status": "matched", "confidence": round(float(known.get("confidence") or 0), 3),
+                "matches": {"pcga_known_good": known}, "profile": profile,
+                "warnings": ["Network compatibility lookup was disabled; appliance-owned compatibility rules were still applied."],
+                "policy": {
+                    "execute_provider_scripts": False,
+                    "auto_apply_requires": "approved PlayOnLinux + title score >= 0.86 + allow-listed declarative settings, or an appliance-owned known-good rule",
+                    "protondb_report_text_execution": False,
+                },
+            }
+        return {
+            "schema": 1, "resolver_version": VERSION, "resolved_at": now(),
+            "title_norm": norm(title), "steam_appid": steam or None,
+            "provider_settings": provider_policy,
+            "status": "offline-no-cache", "matches": {},
+            "profile": {"auto_apply": False, "winetricks_components": [], "preferred_executables": []},
+            "warnings": ["Compatibility network lookup was disabled for this pass."],
+        }
+
+    if steam and provider_policy["protondb"]:
+        matches["protondb"] = protondb_profile(steam, env)
+
+    if title and provider_policy["playonlinux"]:
+        try:
+            entry, score, candidates = pol_candidate(title, force=force)
+            if entry:
+                pol = fetch_pol_profile(entry, score, force=force)
+                pol["candidates"] = candidates
+                matches["playonlinux"] = pol
+            else:
+                matches["playonlinux"] = {
+                    "provider": "playonlinux", "status": "ambiguous-or-no-match",
+                    "match_score": round(score, 3), "candidates": candidates,
+                    "catalog_url": POL_GAMES_CATALOG,
+                }
+        except Exception as exc:
+            matches["playonlinux"] = {"provider": "playonlinux", "status": "error-" + type(exc).__name__, "detail": str(exc)[:240]}
+
+    known_good = pcga_known_good_profile(title, steam)
+    if known_good:
+        matches["pcga_known_good"] = known_good
+
+    applied = {
+        "runner": "wine",
+        "runner_version": None,
+        "runner_version_policy": "appliance-managed",
+        "wine_arch": None,
+        "windows_version": None,
+        "winetricks_components": [],
+        "preferred_executables": [],
+        "recommended_runner_versions": [],
+        "recommended_environment": [],
+        "runtime_environment": {},
+        "launch_arguments": [],
+        "virtual_cd": None,
+        "legacy_drm": None,
+        "expected_volume_label": None,
+        "auto_apply": False,
+        "source": [],
+    }
+    confidence = 0.0
+    pol = matches.get("playonlinux") if isinstance(matches.get("playonlinux"), dict) else {}
+    if pol and pol.get("approved") and float(pol.get("match_score") or 0) >= 0.86:
+        applied["wine_arch"] = pol.get("wine_arch") if pol.get("wine_arch") in {"win32", "win64"} else None
+        winver = str(pol.get("windows_version") or "")
+        applied["windows_version"] = winver if winver in {"win2000", "winxp", "win2003", "vista", "win7", "win8", "win81", "win10", "win11"} else None
+        applied["winetricks_components"] = [x for x in pol.get("winetricks_components") or [] if x in SAFE_WINETRICKS]
+        applied["preferred_executables"] = [Path(str(x)).name for x in pol.get("executables") or [] if str(x).lower().endswith(".exe")][:12]
+        applied["recommended_runner_versions"] = list(pol.get("wine_versions") or [])[:4]
+        applied["auto_apply"] = bool(applied["wine_arch"] or applied["windows_version"] or applied["winetricks_components"] or applied["preferred_executables"])
+        applied["source"].append("playonlinux-approved")
+        confidence = max(confidence, float(pol.get("match_score") or 0) * 0.96)
+        if pol.get("unsupported_component_calls"):
+            warnings.append("PlayOnLinux contains unsupported component calls; PCGA ignored them rather than executing the script.")
+    elif pol and pol.get("match_score"):
+        warnings.append("PlayOnLinux match was not approved/high-confidence enough for automatic runtime changes.")
+
+    pdb = matches.get("protondb") if isinstance(matches.get("protondb"), dict) else {}
+    if pdb:
+        # The Steam AppID is an exact provider identity, but only count it as a
+        # compatibility match when ProtonDB itself returned a summary. This avoids
+        # displaying 99% confidence for a provider outage or an unknown AppID.
+        if steam and pdb.get("summary_status") == "matched":
+            confidence = max(confidence, 0.99)
+        for row in pdb.get("proton_versions") or []:
+            ver = str((row or {}).get("version") or "").strip()
+            if ver and ver not in applied["recommended_runner_versions"]:
+                applied["recommended_runner_versions"].append(ver)
+        applied["recommended_runner_versions"] = applied["recommended_runner_versions"][:8]
+        applied["recommended_environment"] = [str((x or {}).get("value") or "") for x in pdb.get("environment_recommendations") or [] if (x or {}).get("value")][:8]
+        if pdb.get("summary_status") == "matched":
+            applied["source"].append("protondb-steam-appid")
+        if applied["recommended_environment"]:
+            unapplied = [x for x in applied["recommended_environment"] if x.split("=", 1)[0] not in AUTO_WINE_ENV]
+            if unapplied:
+                warnings.append("ProtonDB Proton-specific launch-environment hints are advisory; only allow-listed Wine/OpenGL environment fixes with repeated evidence are auto-applied.")
+
+    known = matches.get("pcga_known_good") if isinstance(matches.get("pcga_known_good"), dict) else {}
+    if known and known.get("status") == "matched":
+        known_runner = str(known.get("runner") or "").strip()
+        known_runner_version = str(known.get("runner_version") or "").strip()
+        known_runner_policy = str(known.get("runner_version_policy") or "").strip()
+        if known_runner in {"wine", "winehq-devel", "portable-wow64"}:
+            applied["runner"] = known_runner
+        if known_runner_version and re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", known_runner_version):
+            applied["runner_version"] = known_runner_version
+        if known_runner_policy in {"appliance-managed", "pinned-isolated-runtime"}:
+            applied["runner_version_policy"] = known_runner_policy
+        known_arch = str(known.get("wine_arch") or "")
+        if known_arch in {"win32", "win64"}:
+            # Appliance-owned rules are authoritative over provider heuristics.
+            # This is required for COD2 retail where the preserved 32-bit SP
+            # binary must be installed into a true win32 prefix.
+            applied["wine_arch"] = known_arch
+        legacy_drm = str(known.get("legacy_drm") or "").strip()
+        if legacy_drm and re.fullmatch(r"[a-z0-9_.+-]{1,64}", legacy_drm):
+            applied["legacy_drm"] = legacy_drm
+        expected_label = str(known.get("expected_volume_label") or "").strip()
+        if expected_label and re.fullmatch(r"[A-Za-z0-9_. +()-]{1,64}", expected_label):
+            applied["expected_volume_label"] = expected_label
+        for key, value in (known.get("runtime_environment") or {}).items():
+            if key in AUTO_WINE_ENV and re.fullmatch(r"[A-Za-z0-9_.:+-]{1,80}", str(value or "")):
+                applied["runtime_environment"][key] = str(value)
+        applied["launch_arguments"] = [str(x) for x in known.get("launch_arguments") or [] if 0 < len(str(x)) <= 96][:24]
+        # Appliance-owned preferred executable order is authoritative for an
+        # exact known-good rule. Preserve it ahead of provider-derived fallbacks.
+        known_execs=[]
+        for exe in known.get("preferred_executables") or []:
+            exe = Path(str(exe)).name
+            if exe.lower().endswith(".exe") and exe not in known_execs:
+                known_execs.append(exe)
+        if known_execs:
+            applied["preferred_executables"] = known_execs + [x for x in applied["preferred_executables"] if x not in known_execs]
+        virtual_cd = known.get("virtual_cd") if isinstance(known.get("virtual_cd"), dict) else None
+        if virtual_cd:
+            letter=str(virtual_cd.get("drive_letter") or "d").lower()
+            label=str(virtual_cd.get("label") or "").strip()
+            req=[]
+            for item in virtual_cd.get("required_paths") or []:
+                value=str(item or "").replace("\\", "/").strip("/")
+                if value and ".." not in value.split("/") and re.fullmatch(r"[A-Za-z0-9_. +()'/-]{1,180}", value):
+                    req.append(value)
+            if re.fullmatch(r"[d-k]", letter) and re.fullmatch(r"[A-Za-z0-9_. +()-]{1,64}", label) and req:
+                applied["virtual_cd"] = {
+                    "drive_letter": letter, "drive_type": "cdrom", "label": label,
+                    "required_paths": req[:8], "source_policy": "preserved-media",
+                }
+        applied["source"].append("pcga-known-good")
+        applied["auto_apply"] = True
+        confidence = max(confidence, float(known.get("confidence") or 0))
+
+    # A provider-reported OpenGL compatibility variable can be safely consumed by
+    # the Wine runtime when at least two independent reports agree.  Other Proton
+    # variables remain advisory because this appliance is not executing Proton.
+    for row in pdb.get("environment_recommendations") or []:
+        raw = str((row or {}).get("value") or "")
+        reports = int((row or {}).get("reports") or 0)
+        if "=" not in raw or reports < 2:
+            continue
+        key, value = raw.split("=", 1)
+        if key in AUTO_WINE_ENV and re.fullmatch(r"[A-Za-z0-9_.:+-]{1,80}", value):
+            applied["runtime_environment"].setdefault(key, value)
+            applied["auto_apply"] = True
+            if "protondb-safe-wine-env" not in applied["source"]:
+                applied["source"].append("protondb-safe-wine-env")
+
+    provider_match = bool(
+        (pdb and pdb.get("summary_status") == "matched")
+        or (pol and pol.get("status") == "matched")
+        or (known and known.get("status") == "matched")
+    )
+    status = "matched" if provider_match else ("no-confident-match" if matches else "no-provider-match")
+    return {
+        "schema": 1,
+        "resolver_version": VERSION,
+        "resolved_at": now(),
+        "title": title,
+        "title_norm": norm(title),
+        "steam_appid": steam or None,
+        "provider_settings": provider_policy,
+        "status": status,
+        "confidence": round(confidence, 3),
+        "matches": matches,
+        "profile": applied,
+        "warnings": warnings,
+        "policy": {
+            "execute_provider_scripts": False,
+            "auto_apply_requires": "approved PlayOnLinux + title score >= 0.86 + allow-listed declarative settings",
+            "protondb_report_text_execution": False,
+        },
+    }
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Resolve a PCGA game against ProtonDB and PlayOnLinux compatibility knowledge")
+    ap.add_argument("--set-id", required=True)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--print", dest="print_json", action="store_true")
+    ns = ap.parse_args()
+    if not re.fullmatch(r"[0-9A-Za-z._-]{8,80}", ns.set_id):
+        raise SystemExit("invalid game set id")
+    set_path = SETS / f"{ns.set_id}.json"
+    game = load_json(set_path)
+    if not game:
+        raise SystemExit("game set not found")
+    existing = game.get("compatibility") if isinstance(game.get("compatibility"), dict) else {}
+    if not profile_due(existing, game, force=ns.force):
+        profile = existing
+    elif ns.offline and existing:
+        profile = existing
+    else:
+        profile = build_profile(game, force=ns.force, offline=ns.offline)
+        game["compatibility"] = profile
+        game["updated_at"] = now()
+        save_json(set_path, game)
+        save_json(COMPAT_ROOT / f"{ns.set_id}.json", profile)
+    if ns.print_json:
+        print(json.dumps(profile, indent=2, sort_keys=True))
+    else:
+        p = profile.get("profile") if isinstance(profile.get("profile"), dict) else {}
+        sources = ",".join(p.get("source") or []) or "none"
+        print(f"[pcga-compat] {game.get('title') or ns.set_id}: {profile.get('status','unknown')} sources={sources} auto_apply={bool(p.get('auto_apply'))}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
