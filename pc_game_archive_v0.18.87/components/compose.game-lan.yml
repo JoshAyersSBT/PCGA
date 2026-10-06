@@ -1,0 +1,18 @@
+# PCGA shared virtual LAN for streamed Wine desktops.
+#
+# Wolf-created game containers join this external bridge directly through their
+# Docker runner NetworkMode.  LANCommander is dual-homed: it retains the normal
+# Compose default network for portal/control-plane access and also participates
+# in the game LAN for TCP/UDP discovery plus its optional IPX relay.
+services:
+  lancommander:
+    networks:
+      default: {}
+      legacy-games:
+        aliases:
+          - lancommander
+
+networks:
+  legacy-games:
+    external: true
+    name: ${PCGA_GAME_LAN_NETWORK:-legacy-games}

@@ -1,0 +1,503 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+STACK_DIR=/opt/pc-game-archive
+CREDS=/etc/pc-game-archive/secrets/appliance-admin.env
+STATE_DIR=/var/lib/pc-game-archive/bootstrap
+LANE_COUNT="${PCGA_MOONLIGHT_WEB_LANES:-4}"
+BASE_PORT="${PCGA_MOONLIGHT_WEB_PORT:-8101}"
+CA_CERT="${PCGA_TLS_CA_FILE:-/etc/pc-game-archive/tls/pcga-ca.crt}"
+STACK_ENV="$STACK_DIR/.env"
+
+[[ $EUID -eq 0 ]] || exec sudo -E bash "$0" "$@"
+
+# The outer invocation reconciles every independent Moonlight identity. Each
+# lane has its own persistent certificate/host pairing, allowing one physical
+# PCGA portal client to hold multiple concurrent Wolf sessions without forcing
+# all streams through a single GameStream client identity.
+if [[ -z "${PCGA_MOONLIGHT_LANE:-}" ]]; then
+  install -d -m 0755 "$STATE_DIR"
+  ok=1
+  for lane in $(seq 1 "$LANE_COUNT"); do
+    if ! PCGA_MOONLIGHT_LANE="$lane" PCGA_MOONLIGHT_WEB_LANES="$LANE_COUNT" PCGA_MOONLIGHT_WEB_PORT="$BASE_PORT" bash "$0" "$@"; then
+      ok=0
+    fi
+  done
+  python3 - "$STATE_DIR" "$LANE_COUNT" <<'PY_POOL'
+import json,os,sys,time
+from pathlib import Path
+root=Path(sys.argv[1]); count=int(sys.argv[2]); lanes=[]
+for lane in range(1,count+1):
+    p=root/f'moonlight-web-lane-{lane}.json'
+    try: d=json.loads(p.read_text())
+    except Exception: d={'lane':lane,'state':'missing','paired':False,'web_port':8100+lane}
+    d['lane']=lane; lanes.append(d)
+primary=dict(lanes[0]) if lanes else {}
+out={**primary,'version':'0.18.87','state':'ready' if lanes and all(x.get('state')=='ready' for x in lanes) else 'degraded','paired':bool(lanes) and all(bool(x.get('paired')) for x in lanes),'lane_count':count,'lanes':lanes,'updated_at':int(time.time())}
+p=root/'moonlight-web.json'; tmp=p.with_suffix('.json.tmp'); tmp.write_text(json.dumps(out,indent=2,sort_keys=True)+'\n'); os.chmod(tmp,0o644); os.replace(tmp,p)
+PY_POOL
+  [[ "$ok" -eq 1 ]] || exit 1
+  exit 0
+fi
+
+LANE="${PCGA_MOONLIGHT_LANE}"
+[[ "$LANE" =~ ^[1-9][0-9]*$ ]] || { echo "[pcga-moonlight-web:error] Invalid lane: $LANE" >&2; exit 1; }
+lane_port_var="PCGA_MOONLIGHT_WEB_PORT_${LANE}"
+if [[ "$LANE" -eq 1 ]]; then
+  PORT="$BASE_PORT"
+  CONTAINER=pcga-moonlight-web
+else
+  PORT="${!lane_port_var:-$((BASE_PORT + LANE - 1))}"
+  CONTAINER="pcga-moonlight-web-${LANE}"
+fi
+STATE_FILE="$STATE_DIR/moonlight-web-lane-${LANE}.json"
+BASE="https://127.0.0.1:${PORT}"
+ENV_LAN_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+if [[ -z "$ENV_LAN_IP" ]]; then
+  ENV_LAN_IP="$(awk -F= '$1=="PCGA_LAN_IP"{print $2; exit}' "$STACK_ENV" 2>/dev/null || true)"
+fi
+WOLF_ADDRESS="${PCGA_MOONLIGHT_WOLF_ADDRESS:-${ENV_LAN_IP:-127.0.0.1}}"
+WOLF_HTTP_PORT="${PCGA_MOONLIGHT_WOLF_PORT:-47989}"
+WOLF_SOCKET="${PCGA_WOLF_SOCKET:-/var/run/wolf/wolf.sock}"
+WOLF_PAIR_URL="${PCGA_WOLF_PAIR_URL:-http://127.0.0.1:${WOLF_HTTP_PORT}/pin/}"
+PAIR_LOCK="/run/lock/pcga-moonlight-web-pair.lock"
+
+log(){ printf '[pcga-moonlight-web] %s\n' "$*"; }
+fail(){ printf '[pcga-moonlight-web:error] %s\n' "$*" >&2; exit 1; }
+
+[[ -r "$CA_CERT" ]] || fail "Missing PCGA local CA certificate: $CA_CERT"
+export CURL_CA_BUNDLE="$CA_CERT"
+install -d -m 0755 "$STATE_DIR"
+[[ -r "$CREDS" ]] || fail "Missing appliance credentials: $CREDS"
+# shellcheck disable=SC1090
+. "$CREDS"
+[[ -n "${PCGA_APPLIANCE_ADMIN_USER:-}" && -n "${PCGA_APPLIANCE_ADMIN_PASSWORD:-}" ]] || fail "Incomplete appliance credentials"
+
+docker inspect "$CONTAINER" >/dev/null 2>&1 || fail "$CONTAINER is not installed"
+if [[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null || true)" != true ]]; then
+  docker start "$CONTAINER" >/dev/null || fail "Unable to start $CONTAINER"
+fi
+network_mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' "$CONTAINER" 2>/dev/null || true)"
+[[ "$network_mode" == host ]] || fail "Moonlight Web lane must use host networking (found: ${network_mode:-unknown}); recreate the stack with compose.moonlight-web.yml"
+
+wait_http(){
+  local url="$1" tries="${2:-60}"
+  for _ in $(seq 1 "$tries"); do
+    curl -fsS --max-time 2 "$url" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+wait_http "$BASE/" 90 || fail "Moonlight Web did not become HTTPS-ready on port $PORT"
+
+cookie="$(mktemp)"; trap 'rm -f "$cookie"' EXIT
+payload="$(python3 - "$PCGA_APPLIANCE_ADMIN_USER" "$PCGA_APPLIANCE_ADMIN_PASSWORD" <<'PY'
+import json,sys
+print(json.dumps({'name':sys.argv[1],'password':sys.argv[2]},separators=(',',':')))
+PY
+)"
+code="$(curl -sS --max-time 12 -c "$cookie" -b "$cookie" -o /tmp/pcga-moonlight-login.$$ -w '%{http_code}' \
+  -H 'Content-Type: application/json' -d "$payload" "$BASE/api/login" || true)"
+if [[ "$code" != 200 && "$code" != 201 ]]; then
+  detail="$(cat /tmp/pcga-moonlight-login.$$ 2>/dev/null || true)"; rm -f /tmp/pcga-moonlight-login.$$
+  fail "Moonlight Web appliance login/bootstrap failed (HTTP $code): ${detail:0:400}"
+fi
+rm -f /tmp/pcga-moonlight-login.$$
+
+user_json="$(curl -fsS --max-time 10 -c "$cookie" -b "$cookie" "$BASE/api/user")" || fail "Unable to query Moonlight Web appliance user"
+user_id="$(python3 - "$user_json" <<'PY'
+import json,sys
+try: d=json.loads(sys.argv[1])
+except Exception: print(''); raise SystemExit
+for k in ('id','user_id','userId'):
+    if isinstance(d,dict) and d.get(k) is not None:
+        print(d[k]); break
+else:
+    print('')
+PY
+)"
+[[ "$user_id" =~ ^[0-9]+$ ]] || fail "Moonlight Web did not return a numeric appliance user id"
+
+# Moonlight Web v3 moved the zero-login default-user selector from config.json
+# into data.json and removed the old default_settings field. Stop the service
+# while editing its persistent files so an in-memory v2/v3 data snapshot cannot
+# overwrite the migration during graceful shutdown.
+server_store="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/moonlight-web/server"}}{{.Source}}{{end}}{{end}}' "$CONTAINER" 2>/dev/null || true)"
+[[ -n "$server_store" && -d "$server_store" ]] || fail "Unable to locate Moonlight Web persistent server storage"
+docker stop -t 10 "$CONTAINER" >/dev/null || fail "Unable to stop Moonlight Web for v3 data migration"
+
+python3 - "$user_id" "$server_store" <<'PY_V3_MIGRATE'
+import json,os,sys
+from pathlib import Path
+uid=int(sys.argv[1]); root=Path(sys.argv[2])
+
+def load(path):
+    try:
+        value=json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value,dict) else {}
+    except Exception:
+        return {}
+
+def save(path,data):
+    existed=path.exists()
+    st=path.stat() if existed else None
+    path.write_text(json.dumps(data,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+    if st is not None:
+        os.chown(path,st.st_uid,st.st_gid); os.chmod(path,st.st_mode & 0o777)
+    else:
+        rst=root.stat()
+        os.chown(path,rst.st_uid,rst.st_gid); os.chmod(path,0o600)
+
+cfg_path=root/'config.json'
+if cfg_path.exists():
+    cfg=load(cfg_path)
+    cfg.pop('default_settings',None)
+    web=cfg.get('web_server')
+    if isinstance(web,dict):
+        web.pop('default_user_id',None); web.pop('default_role_id',None)
+        cfg['web_server']=web
+    webrtc=cfg.get('webrtc')
+    if isinstance(webrtc,dict):
+        webrtc.pop('network_types',None); cfg['webrtc']=webrtc
+    save(cfg_path,cfg)
+
+data_path=root/'data.json'
+data=load(data_path)
+data['default_user_id']=uid
+save(data_path,data)
+PY_V3_MIGRATE
+
+docker start "$CONTAINER" >/dev/null || fail "Unable to restart Moonlight Web after v3 data migration"
+wait_http "$BASE/" 60 || fail "Moonlight Web did not return over HTTPS after v3 migration"
+# No cookie here: verify that the browser-facing zero-login path survived the
+# v2 -> v3 persistent-data conversion.
+curl -fsS --max-time 8 "$BASE/api/authenticate" >/dev/null || fail "Moonlight Web v3 default appliance user is not active"
+
+# Recover a previously published host id first.
+host_id=""
+if [[ -r "$STATE_FILE" ]]; then
+  host_id="$(python3 - "$STATE_FILE" <<'PY'
+import json,sys
+try: d=json.load(open(sys.argv[1]))
+except Exception: d={}
+print(d.get('host_id') or '')
+PY
+)"
+fi
+if [[ -n "$host_id" ]]; then
+  host_probe="$(curl -fsS --max-time 8 "$BASE/api/host?host_id=$host_id" 2>/dev/null || true)"
+  if [[ -z "$host_probe" ]] || ! python3 - "$WOLF_ADDRESS" "$host_probe" <<'PY_HOST_MATCH'
+import json,sys
+wanted=sys.argv[1]
+try: data=json.loads(sys.argv[2])
+except Exception: raise SystemExit(1)
+def walk(x):
+    if isinstance(x,dict):
+        for k in ('address','host','hostname'):
+            if str(x.get(k) or '') == wanted:
+                return True
+        return any(walk(v) for v in x.values())
+    if isinstance(x,list):
+        return any(walk(v) for v in x)
+    return False
+raise SystemExit(0 if walk(data) else 1)
+PY_HOST_MATCH
+  then
+    log "Stored Moonlight host $host_id no longer points at Wolf via $WOLF_ADDRESS; selecting a matching host"
+    host_id=""
+  fi
+fi
+
+# If state was lost but Moonlight Web retained its volume, try to recover the
+# existing Wolf host before adding a duplicate. Streamed host-list responses can
+# contain more than one JSON object, so use conservative textual extraction.
+if [[ -z "$host_id" ]]; then
+  hosts="$(curl -sS --max-time 12 "$BASE/api/hosts" 2>/dev/null || true)"
+  host_id="$(python3 - "$WOLF_ADDRESS" "$hosts" <<'PY'
+import json,re,sys
+text=sys.argv[2]; wanted={sys.argv[1]}
+# Normal JSON response first.
+try:
+    d=json.loads(text)
+    def walk(x):
+        if isinstance(x,dict):
+            if str(x.get('address') or '') in wanted:
+                for k in ('id','host_id','hostId'):
+                    if x.get(k) is not None: return str(x[k])
+            for v in x.values():
+                r=walk(v)
+                if r: return r
+        elif isinstance(x,list):
+            for v in x:
+                r=walk(v)
+                if r: return r
+        return ''
+    r=walk(d)
+    if r: print(r); raise SystemExit
+except Exception:
+    pass
+# Response-stream fallback: find a nearby numeric id in an object mentioning address.
+for m in re.finditer(r'\{[^{}]{0,1200}\}', text, re.S):
+    s=m.group(0)
+    if not any(addr in s for addr in wanted): continue
+    q=re.search(r'"(?:host_id|hostId|id)"\s*:\s*(\d+)',s)
+    if q: print(q.group(1)); raise SystemExit
+print('')
+PY
+)"
+fi
+
+if [[ -z "$host_id" ]]; then
+  host_payload="$(python3 - "$WOLF_ADDRESS" "$WOLF_HTTP_PORT" <<'PY'
+import json,sys
+print(json.dumps({'address':sys.argv[1],'http_port':int(sys.argv[2])},separators=(',',':')))
+PY
+)"
+  host_json="$(curl -fsS --max-time 15 -H 'Content-Type: application/json' -d "$host_payload" "$BASE/api/host")" \
+    || fail "Unable to add Wolf as the Moonlight Web streaming host"
+  host_id="$(python3 - "$host_json" <<'PY'
+import json,sys
+d=json.loads(sys.argv[1])
+def walk(x):
+    if isinstance(x,dict):
+        for k in ('host_id','hostId','id'):
+            if isinstance(x.get(k),int): return str(x[k])
+        for v in x.values():
+            r=walk(v)
+            if r: return r
+    elif isinstance(x,list):
+        for v in x:
+            r=walk(v)
+            if r: return r
+    return ''
+print(walk(d))
+PY
+)"
+fi
+[[ "$host_id" =~ ^[0-9]+$ ]] || fail "Moonlight Web Wolf host id could not be determined"
+
+# Pair the appliance-owned Moonlight Web identity with the appliance-owned Wolf
+# server without exposing Wolf's privileged REST API over TCP.  Wolf's API stays
+# on its host-mounted UNIX socket.  We snapshot pending secrets before starting
+# the Moonlight request and only approve the newly-created request, preventing us
+# from accepting an unrelated Moonlight client that happens to be waiting.
+auto_pair_wolf(){
+  local before now pair_out pair_err approve_out pair_pid pin secret payload code body container_ip apps_probe
+  [[ -S "$WOLF_SOCKET" ]] || { log "Wolf API socket is unavailable at $WOLF_SOCKET"; return 1; }
+  install -d -m 0755 "$(dirname "$PAIR_LOCK")"
+  exec 9>"$PAIR_LOCK"
+  if ! flock -w 30 9; then
+    log "Timed out waiting for another Moonlight/Wolf pairing reconciliation"
+    exec 9>&-
+    return 1
+  fi
+
+  # Another PCGA reconciler may have completed pairing while we waited.
+  code="$(curl -sS --max-time 6 -o /dev/null -w '%{http_code}' "$BASE/api/apps?host_id=$host_id" 2>/dev/null || true)"
+  if [[ "$code" == 200 ]]; then
+    flock -u 9 || true; exec 9>&-
+    return 0
+  fi
+
+  before="$(mktemp)"; now="$(mktemp)"; pair_out="$(mktemp)"; pair_err="$(mktemp)"; approve_out="$(mktemp)"
+  if ! curl -fsS --max-time 5 --unix-socket "$WOLF_SOCKET" http://localhost/api/v1/pair/pending >"$before" 2>/dev/null; then
+    printf '{"success":true,"requests":[]}\n' >"$before"
+  fi
+  container_ip="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" 2>/dev/null | awk 'NF{print;exit}' || true)"
+
+  payload="$(python3 - "$host_id" <<'PY_PAIR_PAYLOAD'
+import json,sys
+print(json.dumps({'host_id':int(sys.argv[1])},separators=(',',':')))
+PY_PAIR_PAYLOAD
+)"
+  curl -sS -N --max-time 60 -H 'Content-Type: application/json' -d "$payload" "$BASE/api/pair" >"$pair_out" 2>"$pair_err" &
+  pair_pid=$!
+
+  pin=""
+  for _ in $(seq 1 80); do
+    pin="$(python3 - "$pair_out" <<'PY_PAIR_PIN'
+import json,sys
+try: lines=open(sys.argv[1],encoding='utf-8',errors='replace').read().splitlines()
+except OSError: lines=[]
+for line in lines:
+    try: obj=json.loads(line)
+    except Exception: continue
+    if isinstance(obj,dict) and isinstance(obj.get('Pin'),str):
+        print(obj['Pin']); break
+PY_PAIR_PIN
+)"
+    [[ "$pin" =~ ^[0-9]{4}$ ]] && break
+    kill -0 "$pair_pid" 2>/dev/null || break
+    sleep .25
+  done
+  if [[ ! "$pin" =~ ^[0-9]{4}$ ]]; then
+    kill "$pair_pid" 2>/dev/null || true; wait "$pair_pid" 2>/dev/null || true
+    log "Moonlight Web did not publish a pairing PIN: $(tr '\n' ' ' <"$pair_err" | head -c 300)"
+    rm -f "$before" "$now" "$pair_out" "$pair_err" "$approve_out"
+    flock -u 9 || true; exec 9>&-
+    return 1
+  fi
+
+  secret=""
+  for _ in $(seq 1 80); do
+    if curl -fsS --max-time 5 --unix-socket "$WOLF_SOCKET" http://localhost/api/v1/pair/pending >"$now" 2>/dev/null; then
+      secret="$(python3 - "$before" "$now" "$container_ip" <<'PY_PAIR_SECRET'
+import json,sys
+
+def load(path):
+    try:
+        d=json.load(open(path,encoding='utf-8'))
+    except Exception:
+        return []
+    req=d.get('requests',[]) if isinstance(d,dict) else []
+    return [r for r in req if isinstance(r,dict) and r.get('pair_secret')]
+old={str(x['pair_secret']) for x in load(sys.argv[1])}
+new=[x for x in load(sys.argv[2]) if str(x['pair_secret']) not in old]
+ip=(sys.argv[3] or '').strip()
+matched=[x for x in new if ip and str(x.get('pin') or '')==ip]
+candidates=matched if matched else new
+# Never guess among multiple unrelated requests.  If there is a single delta it
+# is necessarily the request we just initiated from the serialized PCGA client.
+if len(candidates)==1:
+    print(candidates[0]['pair_secret'])
+PY_PAIR_SECRET
+)"
+    fi
+    [[ -n "$secret" ]] && break
+    kill -0 "$pair_pid" 2>/dev/null || break
+    sleep .25
+  done
+  if [[ -z "$secret" ]]; then
+    kill "$pair_pid" 2>/dev/null || true; wait "$pair_pid" 2>/dev/null || true
+    log "Wolf did not expose a unique new pending request for the PCGA Moonlight client"
+    rm -f "$before" "$now" "$pair_out" "$pair_err" "$approve_out"
+    flock -u 9 || true; exec 9>&-
+    return 1
+  fi
+
+  payload="$(python3 - "$pin" "$secret" <<'PY_WOLF_APPROVE'
+import json,sys
+print(json.dumps({'pin':sys.argv[1],'secret':sys.argv[2]},separators=(',',':')))
+PY_WOLF_APPROVE
+)"
+  code="$(curl -sS --max-time 8 -o "$approve_out" -w '%{http_code}' -H 'Content-Type: application/json' -d "$payload" "$WOLF_PAIR_URL" 2>/dev/null || true)"
+  body="$(cat "$approve_out" 2>/dev/null || true)"
+  if [[ "$code" != 200 || "$body" != *OK* ]]; then
+    kill "$pair_pid" 2>/dev/null || true; wait "$pair_pid" 2>/dev/null || true
+    log "Wolf rejected PCGA's local pairing approval (HTTP $code): ${body:0:240}"
+    rm -f "$before" "$now" "$pair_out" "$pair_err" "$approve_out"
+    flock -u 9 || true; exec 9>&-
+    return 1
+  fi
+
+  # Let Moonlight complete phases 2-5, then verify the authenticated app list.
+  for _ in $(seq 1 80); do
+    kill -0 "$pair_pid" 2>/dev/null || break
+    sleep .25
+  done
+  if kill -0 "$pair_pid" 2>/dev/null; then
+    kill "$pair_pid" 2>/dev/null || true
+  fi
+  wait "$pair_pid" 2>/dev/null || true
+
+  apps_probe=""
+  for _ in $(seq 1 30); do
+    code="$(curl -sS --max-time 6 -o "$now" -w '%{http_code}' "$BASE/api/apps?host_id=$host_id" 2>/dev/null || true)"
+    if [[ "$code" == 200 ]]; then apps_probe=ok; break; fi
+    sleep .5
+  done
+  rm -f "$before" "$now" "$pair_out" "$pair_err" "$approve_out"
+  flock -u 9 || true; exec 9>&-
+  [[ "$apps_probe" == ok ]]
+}
+
+paired=false
+apps_count=0
+apps_json="$(curl -sS --max-time 12 -w $'\n%{http_code}' "$BASE/api/apps?host_id=$host_id" 2>/dev/null || true)"
+apps_code="${apps_json##*$'\n'}"; apps_body="${apps_json%$'\n'*}"
+if [[ "$apps_code" == 200 ]]; then
+  paired=true
+  apps_count="$(python3 - "$apps_body" <<'PY'
+import json,sys
+try:
+    d=json.loads(sys.argv[1])
+except Exception:
+    print(0); raise SystemExit
+if isinstance(d,list):
+    print(len(d))
+elif isinstance(d,dict):
+    apps=d.get('apps')
+    if isinstance(apps,list):
+        print(len(apps))
+    else:
+        def find(x):
+            if isinstance(x,dict):
+                for k,v in x.items():
+                    if k=='apps' and isinstance(v,list): return len(v)
+                    r=find(v)
+                    if r is not None: return r
+            elif isinstance(x,list):
+                for v in x:
+                    r=find(v)
+                    if r is not None: return r
+            return None
+        print(find(d) or 0)
+else:
+    print(0)
+PY
+)"
+fi
+
+# The browser client is an appliance-internal identity.  Automatically establish
+# trust with Wolf instead of making every portal user type the pairing PIN.
+if [[ "$paired" != true ]]; then
+  log "Moonlight Web is not paired with Wolf; attempting appliance-local zero-touch pairing"
+  if auto_pair_wolf; then
+    apps_json="$(curl -sS --max-time 12 -w $'\n%{http_code}' "$BASE/api/apps?host_id=$host_id" 2>/dev/null || true)"
+    apps_code="${apps_json##*$'\n'}"; apps_body="${apps_json%$'\n'*}"
+    if [[ "$apps_code" == 200 ]]; then
+      paired=true
+      apps_count="$(python3 - "$apps_body" <<'PY_PAIR_APPS'
+import json,sys
+try: d=json.loads(sys.argv[1])
+except Exception: print(0); raise SystemExit
+if isinstance(d,list): print(len(d))
+elif isinstance(d,dict) and isinstance(d.get('apps'),list): print(len(d['apps']))
+else:
+    def find(x):
+        if isinstance(x,dict):
+            if isinstance(x.get('apps'),list): return len(x['apps'])
+            for v in x.values():
+                r=find(v)
+                if r is not None: return r
+        elif isinstance(x,list):
+            for v in x:
+                r=find(v)
+                if r is not None: return r
+        return None
+    print(find(d) or 0)
+PY_PAIR_APPS
+)"
+    fi
+  fi
+fi
+
+python3 - "$STATE_FILE" "$host_id" "$paired" "$apps_count" "$PORT" "$WOLF_ADDRESS" "$LANE" <<'PY'
+import json,sys,time,os
+p,host_id,paired,count,port,wolf_address,lane=sys.argv[1:]
+data={
+  'version':'0.18.87','lane':int(lane),'state':'ready' if paired=='true' else 'pairing-failed',
+  'host_id':int(host_id),'paired':paired=='true','apps_count':int(count),
+  'web_port':int(port),'wolf_address':wolf_address,'wolf_internal_ip':wolf_address,'wolf_http_port':47989,
+  'network_mode':'host','transport_mode':'websocket','transport_fallback':'webrtc','web_scheme':'https','secure_context':True,'webrtc_port_range':f'{40000+(int(lane)-1)*100}-{40099+(int(lane)-1)*100}','moonlight_version':'v3.0.0-prerelease.6','websocket_endpoint':'/api/host/stream/web_socket',
+  'updated_at':int(time.time())
+}
+tmp=p+'.tmp'; open(tmp,'w').write(json.dumps(data,indent=2,sort_keys=True)+'\n'); os.chmod(tmp,0o644); os.replace(tmp,p)
+PY
+
+if [[ "$paired" == true ]]; then
+  log "Moonlight Web lane $LANE on port $PORT is authenticated, TLS-enabled, paired with Wolf, and exposes $apps_count app(s)."
+else
+  log "Moonlight Web is appliance-authenticated but automatic Wolf pairing did not complete; background reconciliation will retry."
+fi

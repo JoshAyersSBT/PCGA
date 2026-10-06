@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+name="${1#/dev/}"
+[[ -n "$name" ]] || { echo "Usage: pcga-makemkv-sdf-sync srN [SDF_ID]" >&2; exit 64; }
+dev="/dev/$name"
+explicit="${2:-}"
+ROOT_FILE=/etc/pc-game-archive/archive-root
+[[ -r "$ROOT_FILE" ]] || { echo "missing $ROOT_FILE" >&2; exit 1; }
+ROOT="$(cat "$ROOT_FILE")"
+SETTINGS="$ROOT/media/arm/home/.MakeMKV/settings.conf"
+[[ -b "$dev" ]] || { echo "$dev is not a block device" >&2; exit 1; }
+[[ "$(docker inspect -f '{{.State.Running}}' arm-rippers 2>/dev/null || true)" == true ]] || {
+  echo "ARM container is not running" >&2; exit 75;
+}
+
+serial="$(udevadm info --query=property --name="$dev" 2>/dev/null | sed -n 's/^ID_SERIAL_SHORT=//p' | head -n1)"
+model="$(udevadm info --query=property --name="$dev" 2>/dev/null | sed -n 's/^ID_MODEL=//p' | head -n1)"
+
+ident="$explicit"
+if [[ -z "$ident" ]]; then
+  ident="$(docker exec --user arm arm-rippers python3 - "$serial" "$model" <<'PY'
+from pathlib import Path
+import re, sys
+serial=(sys.argv[1] or '').strip()
+model=(sys.argv[2] or '').strip().replace(' ','_')
+p=Path('/home/arm/MakeMKV_log.txt')
+try:
+    lines=p.read_text(errors='replace').splitlines()
+except OSError:
+    lines=[]
+rx=re.compile(r'(?:No\s+)?SDF(?:\s+(?:auto|id))?\s+v[^:]*:\s*(\S+)\s*$', re.I)
+candidates=[]
+for line in lines:
+    m=rx.search(line.strip())
+    if m:
+        candidates.append(m.group(1))
+if serial:
+    hits=[x for x in candidates if serial in x]
+    if hits:
+        print(hits[-1]); raise SystemExit(0)
+if model:
+    hits=[x for x in candidates if model.lower() in x.lower()]
+    if len(set(hits)) == 1:
+        print(hits[-1]); raise SystemExit(0)
+raise SystemExit(1)
+PY
+  )" || true
+fi
+
+if [[ -z "$ident" ]]; then
+  echo "No unambiguous MakeMKV SDF identifier found for $dev" >&2
+  exit 69
+fi
+
+install -d -m 0755 "$(dirname "$SETTINGS")"
+touch "$SETTINGS"
+python3 - "$SETTINGS" "$ident" <<'PY'
+from pathlib import Path
+import re, shutil, sys, time
+p=Path(sys.argv[1]); ident=sys.argv[2].strip()
+s=p.read_text(errors='replace') if p.exists() else ''
+pat=re.compile(r'(?m)^\s*sdf_Stop\s*=\s*"([^"]*)"\s*$')
+m=pat.search(s)
+existing=m.group(1).split() if m else []
+merged=[]
+for x in existing+[ident]:
+    if x and x not in merged:
+        merged.append(x)
+line='sdf_Stop = "'+' '.join(merged)+'"'
+if m and m.group(0).strip()==line:
+    print(line)
+    raise SystemExit(0)
+if p.exists() and p.stat().st_size:
+    backup=p.with_name(p.name+'.pre-pcga-sdf.'+time.strftime('%Y%m%d-%H%M%S'))
+    shutil.copy2(p, backup)
+if m:
+    s=s[:m.start()]+line+s[m.end():]
+else:
+    s=(s.rstrip()+"\n" if s.strip() else '')+line+"\n"
+p.write_text(s)
+print(line)
+PY
+owner="$(stat -c '%u:%g' "$ROOT/media/arm/home" 2>/dev/null || true)"
+[[ -n "$owner" ]] && chown "$owner" "$SETTINGS" || true
+chmod 0600 "$SETTINGS" 2>/dev/null || true
+echo "PCGA_SDF_ID=$ident"

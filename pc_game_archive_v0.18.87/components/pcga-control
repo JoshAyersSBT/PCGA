@@ -1,0 +1,3767 @@
+#!/usr/bin/env python3
+"""PCGA privileged appliance control plane.
+
+This daemon is intentionally host-bound to the Docker host-gateway address and
+requires a bearer token supplied only by the read-only pcga-status proxy.  The
+browser never receives this token.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import shutil
+import shlex
+import subprocess
+import tempfile
+import zipfile
+import hashlib
+import hmac
+import base64
+import time
+import difflib
+import threading
+import html as html_lib
+import uuid
+from datetime import datetime, timezone
+import socket
+import ipaddress
+import urllib.error
+import urllib.request
+from urllib.parse import urlencode, urlparse, parse_qs, quote
+import xml.etree.ElementTree as ET
+from copy import deepcopy
+from contextlib import contextmanager
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION = "0.18.87"
+ETC = Path("/etc/pc-game-archive")
+CONFIG_PATH = ETC / "appliance.json"
+TOKEN_PATH = ETC / "control-token"
+ROOT_FILE = ETC / "archive-root"
+STACK_DIR = Path("/opt/pc-game-archive")
+ROMM_ENV = ETC / "romm.env"
+GAME_METADATA_ENV = ETC / "game-metadata.env"
+RUNTIME_ENV = ETC / "game-runtime.env"
+DEDUPE_CONF = ETC / "dedupe.conf"
+ARM_CONFIG = None
+GAME_STACK_LOCK = Path("/run/pcga-game-stack-start.lock")
+PATCH_ROOT = Path("/var/lib/pc-game-archive/patches")
+PATCH_MAX_BYTES = 128 * 1024 * 1024
+NAS_CREDS = ETC / "secrets/nas.credentials"
+NAS_HELPER = Path("/usr/local/sbin/pcga-nas-storage")
+AUDIO_STATE_PATH = Path("/var/lib/pc-game-archive/audio/state.json")
+AUDIO_CACHE_ROOT = Path("/var/lib/pc-game-archive/audio/cache")
+AUDIO_STATE_LOCK = threading.RLock()
+AUDIO_API_LOCK = threading.RLock()
+GAME_ACTIVITY_PATH = Path("/var/lib/pc-game-archive/activity/games.json")
+GAME_ACTIVITY_LOCK = threading.RLock()
+PC_GAME_STATE_ROOT = Path("/var/lib/pc-game-archive/game-installs")
+PC_GAME_INTAKE_ROOT = Path("/var/lib/pc-game-archive/game-intake")
+PC_GAME_SESSION_OWNER_PATH = Path("/var/lib/pc-game-archive/game-runtime/session-owners.json")
+PC_GAME_SESSION_OWNER_LOCK = threading.RLock()
+PC_GAME_SESSION_LANES = 4
+AUDIO_SEARCH_CACHE: dict[str, tuple[float, object]] = {}
+LIBRIVOX_API_LAST = 0.0
+PODCAST_SEARCH_URL = "https://gpodder.net/search.json"
+LIBRIVOX_API_URL = "https://librivox.org/api/feed/audiobooks/"
+AUDIO_USER_AGENT = f"PCGameArchive/{VERSION} (+local media appliance)"
+
+DEFAULTS = {
+    "schema": 2,
+    "version": VERSION,
+    "libraries": {
+        "movies": "/media/library/movies",
+        "tv": "/media/library/tv",
+        "music": "/media/library/music",
+        "audio": "/media/library/audio",
+        "photos": "/media/library/photos",
+        "pc_games": "/ingest/inbox/pc-games",
+        "console_games": "/media/library/console-games",
+    },
+    "ingest": {
+        "auto_rip": True,
+        "keep_raw": False,
+    },
+    "review": {
+        "auto_classify": True,
+        "auto_threshold": 0.90,
+    },
+    "games": {
+        "romm_enabled": True,
+        "filesystem_watch": True,
+        "watch_debounce_seconds": 300,
+        "scheduled_rescan": "25 3 * * *",
+        "metadata_hasheous": True,
+        "metadata_playmatch": True,
+        "compat_protondb": True,
+        "compat_playonlinux": True,
+        "graphics_backend": "auto",
+    },
+    "photos": {
+        "immich_enabled": True,
+        "shared_library": "/media/library/photos",
+    },
+    "media": {
+        "jellyfin_enabled": True,
+        "background_video_max_width": 1920,
+        "background_video_max_height": 1080,
+        "background_video_bitrate": 8000000,
+    },
+    "automation": {
+        "sorter_enabled": True,
+        "classifier_enabled": True,
+        "dedupe_enabled": True,
+    },
+    "remote_access": {
+        "tailscale_enabled": False,
+    },
+    "nas": {
+        "enabled": False,
+        "protocol": "smb",
+        "host": "",
+        "share": "",
+        "username": "",
+        "domain": "",
+        "base_dir": "PCGA",
+        "mode": "mirror",
+        "libraries": ["movies", "tv", "music", "home-videos", "photos"],
+        "local_reserve_gib": 100,
+        "min_age_days": 30,
+        "schedule_enabled": True,
+    },
+}
+
+SERVICE_UNITS = {
+    "optical-watch": "pcga-optical-watch.service",
+    "sorter-path": "pcga-media-sort.path",
+    "sorter-timer": "pcga-media-sort.timer",
+    "classifier-path": "pcga-metadata-classify.path",
+    "classifier-timer": "pcga-metadata-classify.timer",
+    "dedupe-timer": "pcga-dedupe.timer",
+    "public-media": "pcga-public-media.service",
+    "thin-client-bootstrap": "pcga-thin-client-bootstrap.service",
+    "nas-mount": "pcga-nas-mount.service",
+    "nas-sync-timer": "pcga-nas-sync.timer",
+}
+
+DOCKER_SERVICES = {
+    "jellyfin": "jellyfin",
+    "immich": "immich_server",
+    "romm": "romm",
+    "lancommander": "lancommander",
+    "wolf": "wolf",
+}
+
+
+def run(cmd: list[str], *, check: bool = False, timeout: int = 30, env: dict|None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, timeout=timeout, env=env)
+
+
+def read_root() -> Path:
+    root = Path(ROOT_FILE.read_text(encoding="utf-8").strip())
+    if not root.is_absolute():
+        raise RuntimeError("invalid archive root")
+    return root
+
+
+def merge(base, override):
+    out = deepcopy(base)
+    if isinstance(out, dict) and isinstance(override, dict):
+        for k, v in override.items():
+            if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+                out[k] = merge(out[k], v)
+            elif k in out:
+                out[k] = v
+    return out
+
+
+def load_config() -> dict:
+    try:
+        raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception:
+        raw = {}
+    cfg = merge(DEFAULTS, raw)
+    cfg["version"] = VERSION
+    return validate_config(cfg)
+
+
+def load_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+
+def atomic_json(path: Path, value: dict, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=2, sort_keys=True)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def clamp_int(value, lo, hi, default):
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+
+def _audio_default_state() -> dict:
+    return {"schema": 2, "version": VERSION, "podcast_subscriptions": {}, "audiobooks": {}, "progress": {}, "jobs": {}, "gpodder": {"counter": 0, "devices": {}, "subscription_events": [], "episode_actions": []}}
+
+
+def audio_state() -> dict:
+    with AUDIO_STATE_LOCK:
+        raw = load_json(AUDIO_STATE_PATH)
+        out = _audio_default_state()
+        for key in ("podcast_subscriptions", "audiobooks", "progress", "jobs", "gpodder"):
+            if isinstance(raw.get(key), dict):
+                out[key] = raw[key]
+        out["version"] = VERSION
+        # A service restart interrupts an in-process collector. Make this explicit
+        # instead of leaving the portal showing an eternal "downloading" state.
+        changed = False
+        for job in out["jobs"].values():
+            if isinstance(job, dict) and job.get("state") == "downloading":
+                job["state"] = "interrupted"
+                job["detail"] = "Collection was interrupted by a PCGA service restart; select Collect locally to resume."
+                changed = True
+        if changed:
+            atomic_json(AUDIO_STATE_PATH, out)
+        return out
+
+
+def save_audio_state(value: dict) -> None:
+    with AUDIO_STATE_LOCK:
+        value["version"] = VERSION
+        atomic_json(AUDIO_STATE_PATH, value)
+
+
+def _audio_update(mutator):
+    with AUDIO_STATE_LOCK:
+        state = audio_state()
+        result = mutator(state)
+        save_audio_state(state)
+        return result
+
+
+
+def _game_activity_default() -> dict:
+    return {"schema": 1, "version": VERSION, "items": {}}
+
+
+def game_activity_state() -> dict:
+    with GAME_ACTIVITY_LOCK:
+        raw = load_json(GAME_ACTIVITY_PATH)
+        out = _game_activity_default()
+        if isinstance(raw.get("items"), dict):
+            out["items"] = raw["items"]
+        out["version"] = VERSION
+        return out
+
+
+def _game_activity_key(kind: str, game_id: str) -> str:
+    kind = str(kind or "").strip().lower()
+    game_id = str(game_id or "").strip()
+    if kind not in {"console-game", "pc-game"}:
+        raise ValueError("invalid game activity kind")
+    if not game_id or len(game_id) > 240 or any(ord(c) < 32 for c in game_id):
+        raise ValueError("invalid game activity id")
+    return kind + ":" + game_id
+
+
+def game_activity_record(payload: dict) -> dict:
+    kind = str(payload.get("kind") or "").strip().lower()
+    game_id = str(payload.get("id") or "").strip()
+    key = _game_activity_key(kind, game_id)
+    now = time.time()
+    title = str(payload.get("title") or payload.get("name") or ("Console Game" if kind == "console-game" else "PC Game"))[:240]
+    subtitle = str(payload.get("subtitle") or payload.get("platform") or ("Console Game" if kind == "console-game" else "PC Game"))[:320]
+    art_url = str(payload.get("art_url") or payload.get("cover_url") or "")[:4096]
+    platform = str(payload.get("platform") or "")[:160]
+    platform_slug = str(payload.get("platform_slug") or "")[:160]
+    stream_id = str(payload.get("stream_id") or "")[:240]
+    with GAME_ACTIVITY_LOCK:
+        state = game_activity_state()
+        previous = state["items"].get(key, {}) if isinstance(state["items"].get(key), dict) else {}
+        row = {
+            "key": key,
+            "kind": kind,
+            "id": game_id,
+            "title": title,
+            "subtitle": subtitle,
+            "art_url": art_url or None,
+            "platform": platform or None,
+            "platform_slug": platform_slug or None,
+            "stream_id": stream_id or None,
+            "launched_at": now,
+            "launch_count": max(0, int(previous.get("launch_count") or 0)) + 1,
+            "first_launched_at": float(previous.get("first_launched_at") or now),
+        }
+        state["items"][key] = row
+        # Keep bounded history. The newest 300 unique games is more than enough
+        # for the home shelves while preventing an unbounded operational file.
+        ordered = sorted(
+            (x for x in state["items"].values() if isinstance(x, dict)),
+            key=lambda x: float(x.get("launched_at") or 0), reverse=True,
+        )[:300]
+        state["items"] = {str(x.get("key") or _game_activity_key(x.get("kind"), x.get("id"))): x for x in ordered}
+        state["version"] = VERSION
+        atomic_json(GAME_ACTIVITY_PATH, state)
+        return {"ok": True, "activity": row}
+
+
+def game_activity_recent(limit: int = 48) -> dict:
+    limit = max(1, min(300, int(limit or 48)))
+    state = game_activity_state()
+    rows = sorted(
+        (dict(x) for x in state.get("items", {}).values() if isinstance(x, dict)),
+        key=lambda x: float(x.get("launched_at") or 0), reverse=True,
+    )[:limit]
+    return {"ok": True, "items": rows, "count": len(rows)}
+
+
+def _strip_markup(value, limit=6000) -> str:
+    text = str(value or "")
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def _safe_slug(value: str, fallback="item") -> str:
+    value = re.sub(r"[^A-Za-z0-9._ -]+", "", str(value or "")).strip().replace(" ", "-")
+    value = re.sub(r"-+", "-", value).strip("-._")
+    return (value[:100] or fallback)
+
+
+def _public_remote_url(url: str) -> str:
+    url = str(url or "").strip()
+    if len(url) > 4096:
+        raise ValueError("remote URL is too long")
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("remote URL must use http or https")
+    if parsed.username or parsed.password:
+        raise ValueError("remote URL credentials are not permitted")
+    if parsed.port not in {None, 80, 443}:
+        raise ValueError("remote media must use port 80 or 443")
+    host = parsed.hostname.rstrip(".").lower()
+    if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+        raise ValueError("local-network URLs are not permitted for public audio providers")
+    try:
+        infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"remote host could not be resolved: {host}") from exc
+    for info in infos:
+        addr = ipaddress.ip_address(info[4][0].split("%", 1)[0])
+        if not addr.is_global:
+            raise ValueError("private, loopback, link-local, or reserved remote addresses are not permitted")
+    return url
+
+
+def _fetch_remote(url: str, *, max_bytes: int = 8 * 1024 * 1024, timeout: int = 20) -> tuple[bytes, str]:
+    url = _public_remote_url(url)
+    req = urllib.request.Request(url, headers={"User-Agent": AUDIO_USER_AGENT, "Accept": "application/json, application/rss+xml, application/atom+xml, application/xml, text/xml, */*"})
+    class SafeRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            _public_remote_url(newurl)
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+    with urllib.request.build_opener(SafeRedirect()).open(req, timeout=timeout) as response:
+        final = _public_remote_url(response.geturl())
+        length = response.headers.get("Content-Length")
+        if length and int(length) > max_bytes:
+            raise ValueError("remote response is too large")
+        data = response.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError("remote response is too large")
+        return data, final
+
+
+def _media_proxy_url(url: str) -> str:
+    url = _public_remote_url(url)
+    token = TOKEN_PATH.read_text(encoding="utf-8").strip().encode()
+    encoded = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    sig = hmac.new(token, encoded.encode(), hashlib.sha256).hexdigest()
+    return f"/api/audio/remote?u={quote(encoded, safe='')}&sig={sig}"
+
+
+def _audio_progress(key: str) -> dict:
+    value = audio_state().get("progress", {}).get(str(key), {})
+    return value if isinstance(value, dict) else {}
+
+
+def audio_set_progress(payload: dict) -> dict:
+    key = str(payload.get("key") or "")[:240]
+    if not key or not re.fullmatch(r"[A-Za-z0-9:_\-.]{1,240}", key):
+        raise ValueError("invalid audio progress key")
+    try:
+        seconds = max(0.0, float(payload.get("seconds") or 0))
+        duration = max(0.0, float(payload.get("duration") or 0))
+    except (TypeError, ValueError):
+        raise ValueError("invalid playback progress")
+    feed_url = str(payload.get("feed_url") or "").strip()
+    episode_url = str(payload.get("episode_url") or "").strip()
+    def mutate(state):
+        state["progress"][key] = {"seconds": round(seconds, 2), "duration": round(duration, 2), "updated": int(time.time())}
+        if feed_url and episode_url:
+            try:
+                purl=_public_remote_url(feed_url); eurl=_public_remote_url(episode_url)
+                _gpodder_record_episode(state,{"podcast":purl,"episode":eurl,"device":"pcga-portal","action":"play","timestamp":_iso_now(),"started":0,"position":int(seconds),"total":int(duration)})
+            except ValueError:
+                pass
+        return state["progress"][key]
+    return {"ok": True, "progress": _audio_update(mutate)}
+
+
+def _cached_json(key: str, ttl: int, loader):
+    now = time.time()
+    with AUDIO_API_LOCK:
+        cached = AUDIO_SEARCH_CACHE.get(key)
+        if cached and now - cached[0] < ttl:
+            return cached[1]
+    value = loader()
+    with AUDIO_API_LOCK:
+        AUDIO_SEARCH_CACHE[key] = (time.time(), value)
+    return value
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _open_podcast_guid(feed_url: str, feed_guid: str = "") -> str:
+    feed_guid = str(feed_guid or "").strip()
+    try:
+        return str(uuid.UUID(feed_guid)) if feed_guid else str(uuid.uuid5(uuid.NAMESPACE_URL, feed_url))
+    except ValueError:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, feed_url + "#" + feed_guid))
+
+
+def _gpodder_state(state: dict) -> dict:
+    gp = state.setdefault("gpodder", {})
+    if not isinstance(gp, dict):
+        gp = {}; state["gpodder"] = gp
+    gp.setdefault("counter", 0)
+    gp.setdefault("devices", {})
+    gp.setdefault("subscription_events", [])
+    gp.setdefault("episode_actions", [])
+    if not isinstance(gp["devices"], dict): gp["devices"] = {}
+    if not isinstance(gp["subscription_events"], list): gp["subscription_events"] = []
+    if not isinstance(gp["episode_actions"], list): gp["episode_actions"] = []
+    return gp
+
+
+def _gpodder_next(gp: dict) -> int:
+    now = int(time.time() * 1000)
+    gp["counter"] = max(int(gp.get("counter") or 0) + 1, now)
+    return int(gp["counter"])
+
+
+def _gpodder_record_subscription(state: dict, feed_url: str, added: bool, device: str = "pcga-portal") -> int:
+    gp = _gpodder_state(state); stamp = _gpodder_next(gp)
+    gp["subscription_events"].append({"id": stamp, "url": feed_url, "added": bool(added), "device": device})
+    if len(gp["subscription_events"]) > 5000:
+        gp["subscription_events"] = gp["subscription_events"][-5000:]
+    return stamp
+
+
+def _gpodder_record_episode(state: dict, action: dict) -> int:
+    gp = _gpodder_state(state); stamp = _gpodder_next(gp)
+    row = dict(action); row["_id"] = stamp
+    gp["episode_actions"].append(row)
+    if len(gp["episode_actions"]) > 10000:
+        gp["episode_actions"] = gp["episode_actions"][-10000:]
+    return stamp
+
+
+def gpodder_devices() -> list:
+    def mutate(state):
+        gp = _gpodder_state(state)
+        gp["devices"].setdefault("pcga-portal", {"caption": "PCGA Portal", "type": "server"})
+        count = sum(1 for x in state.get("podcast_subscriptions", {}).values() if isinstance(x, dict) and x.get("is_subscribed", True) and not x.get("deleted"))
+        return [{"id": did, "caption": str(v.get("caption") or ""), "type": str(v.get("type") or "other"), "subscriptions": count} for did, v in sorted(gp["devices"].items())]
+    return _audio_update(mutate)
+
+
+def gpodder_update_device(device: str, payload: dict) -> dict:
+    if not re.fullmatch(r"[\w.-]{1,120}", device or ""):
+        raise ValueError("invalid gPodder device id")
+    def mutate(state):
+        gp = _gpodder_state(state); cur = gp["devices"].setdefault(device, {})
+        if "caption" in payload: cur["caption"] = str(payload.get("caption") or "")[:160]
+        if "type" in payload:
+            typ = str(payload.get("type") or "other")
+            cur["type"] = typ if typ in {"desktop","laptop","mobile","server","other"} else "other"
+        cur.setdefault("caption", device); cur.setdefault("type", "other")
+        return {}
+    return _audio_update(mutate)
+
+
+def gpodder_subscription_changes(device: str, since: int) -> dict:
+    since = max(0, int(since or 0))
+    def mutate(state):
+        gp = _gpodder_state(state)
+        gp["devices"].setdefault(device, {"caption": device, "type": "mobile"})
+        if int(gp.get("counter") or 0) <= 0: _gpodder_next(gp)
+        if since == 0:
+            add = [str(x.get("feed_url")) for x in state.get("podcast_subscriptions", {}).values() if isinstance(x, dict) and x.get("feed_url") and x.get("is_subscribed", True) and not x.get("deleted")]
+            return {"add": sorted(set(add)), "remove": [], "timestamp": int(gp["counter"])}
+        add=[]; remove=[]
+        for ev in gp.get("subscription_events", []):
+            if int(ev.get("id") or 0) <= since: continue
+            url=str(ev.get("url") or "")
+            if not url: continue
+            (add if ev.get("added") else remove).append(url)
+        return {"add": list(dict.fromkeys(add)), "remove": list(dict.fromkeys(remove)), "timestamp": int(gp["counter"])}
+    return _audio_update(mutate)
+
+
+def gpodder_update_subscriptions(device: str, payload: dict) -> dict:
+    adds = payload.get("add") or []; removes = payload.get("remove") or []
+    if not isinstance(adds, list) or not isinstance(removes, list): raise ValueError("gPodder subscription payload requires add/remove arrays")
+    overlap = set(map(str, adds)) & set(map(str, removes))
+    if overlap: raise ValueError("the same feed cannot be added and removed")
+    for feed in adds[:200]: podcast_subscribe({"feed_url": str(feed), "_gpodder_device": device})
+    for feed in removes[:200]: podcast_unsubscribe({"feed_url": str(feed), "_gpodder_device": device})
+    state=audio_state(); gp=_gpodder_state(state)
+    return {"timestamp": int(gp.get("counter") or 0), "update_urls": []}
+
+
+def gpodder_episode_actions(query: dict) -> dict:
+    try: since=max(0,int((query.get("since") or ["0"])[0] or 0))
+    except ValueError: since=0
+    podcast=str((query.get("podcast") or [""])[0] or "")
+    device=str((query.get("device") or [""])[0] or "")
+    state=audio_state(); gp=_gpodder_state(state); rows=[]
+    device_feeds=None
+    if device:
+        # The gPodder device form means actions for podcasts subscribed by that device.
+        # PCGA currently has one shared subscription set, so all active feeds apply.
+        device_feeds={str(x.get("feed_url")) for x in state.get("podcast_subscriptions",{}).values() if isinstance(x,dict) and x.get("feed_url") and x.get("is_subscribed",True) and not x.get("deleted")}
+    for raw in gp.get("episode_actions", []):
+        if int(raw.get("_id") or 0) <= since: continue
+        if podcast and str(raw.get("podcast") or "") != podcast: continue
+        if device_feeds is not None and str(raw.get("podcast") or "") not in device_feeds: continue
+        rows.append({k:v for k,v in raw.items() if k != "_id"})
+    aggregated=str((query.get("aggregated") or ["false"])[0]).lower() in {"1","true","yes"}
+    if aggregated:
+        latest={}
+        for row in rows: latest[(str(row.get("podcast") or ""),str(row.get("episode") or ""))]=row
+        rows=list(latest.values())
+    return {"actions": rows[-5000:], "timestamp": int(gp.get("counter") or 0)}
+
+
+def gpodder_update_episode_actions(actions) -> dict:
+    if not isinstance(actions, list): raise ValueError("gPodder episode action payload must be an array")
+    def mutate(state):
+        last=0
+        for raw in actions[:1000]:
+            if not isinstance(raw, dict): continue
+            podcast=str(raw.get("podcast") or "").strip(); episode=str(raw.get("episode") or "").strip(); action=str(raw.get("action") or "").strip()
+            if action not in {"download","play","delete","new"} or not podcast or not episode: continue
+            try: podcast=_public_remote_url(podcast); episode=_public_remote_url(episode)
+            except ValueError: continue
+            row={"podcast":podcast,"episode":episode,"action":action}
+            for key in ("device","timestamp"):
+                if raw.get(key) is not None: row[key]=str(raw.get(key))[:200]
+            for key in ("started","position","total"):
+                if raw.get(key) is not None:
+                    try: row[key]=int(float(raw.get(key)))
+                    except (TypeError,ValueError): pass
+            last=_gpodder_record_episode(state,row)
+            if action=="play" and "position" in row:
+                key="podcast-url:"+hashlib.sha1(episode.encode()).hexdigest()
+                state["progress"][key]={"seconds":float(row.get("position") or 0),"duration":float(row.get("total") or 0),"updated":int(time.time())}
+        gp=_gpodder_state(state)
+        return {"timestamp": int(gp.get("counter") or last or 0), "update_urls": []}
+    return _audio_update(mutate)
+
+
+def podcast_search(query: str, limit: int = 24) -> dict:
+    """Search an open podcast directory without depending on Apple.
+
+    PCGA uses gPodder's public directory endpoint only to discover RSS/Atom
+    feed URLs. Subscription and listening state are exposed through a local
+    gPodder-compatible sync API so AntennaPod can use PCGA as its sync server.
+    Playback always comes from the publisher feed.
+    """
+    query = str(query or "").strip()[:140]
+    if not query:
+        return {"ok": True, "provider": "gPodder directory + AntennaPod sync + publisher RSS", "items": []}
+    limit = max(1, min(40, int(limit or 24)))
+    def load():
+        raw, _ = _fetch_remote(PODCAST_SEARCH_URL + "?" + urlencode({"q": query, "scale_logo": "256"}), max_bytes=4 * 1024 * 1024)
+        data = json.loads(raw.decode("utf-8", "replace") or "[]")
+        rows = data if isinstance(data, list) else (data.get("podcasts") or data.get("results") or []) if isinstance(data, dict) else []
+        items = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            feed_value = row.get("url") or row.get("feed_url") or row.get("feedUrl")
+            if not feed_value:
+                continue
+            try:
+                feed = _public_remote_url(str(feed_value))
+            except ValueError:
+                continue
+            artwork = str(row.get("scaled_logo_url") or row.get("logo_url") or row.get("image") or row.get("artwork") or "")
+            try: artwork_proxy = _media_proxy_url(artwork) if artwork else None
+            except Exception: artwork_proxy = None
+            items.append({
+                "id": hashlib.sha1(feed.encode()).hexdigest()[:20],
+                "title": str(row.get("title") or "Untitled podcast"),
+                "author": str(row.get("author") or row.get("publisher") or row.get("owner") or ""),
+                "description": _strip_markup(row.get("description"), 1200),
+                "feed_url": feed,
+                "art_url": artwork_proxy,
+                "website": str(row.get("website") or row.get("link") or ""),
+                "subscribers": int(row.get("subscribers") or 0) if str(row.get("subscribers") or "0").isdigit() else 0,
+            })
+            if len(items) >= limit:
+                break
+        return items
+    items = _cached_json("podcast-search:gpodder:" + query.lower(), 15 * 60, load)
+    return {"ok": True, "provider": "gPodder directory + AntennaPod sync + publisher RSS", "query": query, "items": items}
+
+def _xml_local(tag: str) -> str:
+    return str(tag).rsplit("}", 1)[-1].split(":")[-1].lower()
+
+
+def _xml_child_text(node, names: set[str]) -> str:
+    for child in list(node):
+        if _xml_local(child.tag) in names and (child.text or "").strip():
+            return (child.text or "").strip()
+    return ""
+
+
+def _podcast_duration(value: str) -> float:
+    value = str(value or "").strip()
+    if not value: return 0.0
+    try:
+        if ":" not in value: return float(value)
+        parts = [float(x) for x in value.split(":")]
+        if len(parts) == 2: return parts[0] * 60 + parts[1]
+        if len(parts) == 3: return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    except ValueError:
+        return 0.0
+    return 0.0
+
+
+def podcast_feed(feed_url: str, limit: int = 100) -> dict:
+    feed_url = _public_remote_url(feed_url)
+    limit = max(1, min(200, int(limit or 100)))
+    def load():
+        raw, final_url = _fetch_remote(feed_url, max_bytes=6 * 1024 * 1024)
+        try: root = ET.fromstring(raw)
+        except ET.ParseError as exc: raise ValueError("podcast feed is not valid RSS/Atom XML") from exc
+        is_atom = _xml_local(root.tag) == "feed"
+        channel = root if is_atom else next((x for x in list(root) if _xml_local(x.tag) == "channel"), root)
+        title = _xml_child_text(channel, {"title"}) or "Podcast"
+        description = _strip_markup(_xml_child_text(channel, {"description", "subtitle", "summary"}), 2500)
+        author = _xml_child_text(channel, {"author", "managingeditor", "owner"})
+        art = ""
+        for node in channel.iter():
+            lname = _xml_local(node.tag)
+            if lname == "image":
+                href = node.attrib.get("href") or _xml_child_text(node, {"url"})
+                if href: art = href; break
+        entries = [x for x in list(channel) if _xml_local(x.tag) in ({"entry"} if is_atom else {"item"})]
+        episodes = []
+        for entry in entries[:limit]:
+            enclosure = ""; mime = ""
+            for child in list(entry):
+                lname = _xml_local(child.tag)
+                if lname == "enclosure":
+                    enclosure = child.attrib.get("url") or ""; mime = child.attrib.get("type") or ""; break
+                if is_atom and lname == "link" and child.attrib.get("rel") == "enclosure":
+                    enclosure = child.attrib.get("href") or ""; mime = child.attrib.get("type") or ""; break
+            if not enclosure:
+                continue
+            try:
+                stream = _media_proxy_url(enclosure)
+            except Exception:
+                continue
+            guid = _xml_child_text(entry, {"guid", "id"}) or enclosure
+            legacy_key = "podcast:" + hashlib.sha1(guid.encode("utf-8", "replace")).hexdigest()
+            key = "podcast-url:" + hashlib.sha1(enclosure.encode("utf-8", "replace")).hexdigest()
+            ep_art = ""
+            for node in entry.iter():
+                if _xml_local(node.tag) == "image" and node.attrib.get("href"):
+                    ep_art = node.attrib.get("href") or ""; break
+            try: ep_art_proxy = _media_proxy_url(ep_art) if ep_art else None
+            except Exception: ep_art_proxy = None
+            episodes.append({
+                "id": hashlib.sha1(guid.encode("utf-8", "replace")).hexdigest()[:20],
+                "key": key,
+                "title": _xml_child_text(entry, {"title"}) or "Untitled episode",
+                "description": _strip_markup(_xml_child_text(entry, {"description", "summary", "content"}), 3000),
+                "published": _xml_child_text(entry, {"pubdate", "published", "updated"}),
+                "duration_seconds": _podcast_duration(_xml_child_text(entry, {"duration"})),
+                "stream_url": stream,
+                "source_url": enclosure,
+                "feed_url": final_url,
+                "mime_type": mime,
+                "art_url": ep_art_proxy,
+                "resume_seconds": float((_audio_progress(key) or _audio_progress(legacy_key)).get("seconds") or 0),
+            })
+        try: art_proxy = _media_proxy_url(art) if art else None
+        except Exception: art_proxy = None
+        feed_guid = _xml_child_text(channel, {"guid"})
+        return {"feed_url": final_url, "feed_guid": feed_guid, "title": title, "description": description, "author": author, "art_url": art_proxy, "episodes": episodes}
+    data = _cached_json("podcast-feed:" + hashlib.sha1(feed_url.encode()).hexdigest(), 10 * 60, load)
+    # Resume positions change much more frequently than feed metadata. Refresh
+    # them after cache lookup instead of making RSS caching stale the player UI.
+    data = dict(data)
+    data["episodes"] = [dict(x) for x in (data.get("episodes") or [])]
+    for episode in data["episodes"]:
+        if episode.get("key"):
+            episode["resume_seconds"] = float(_audio_progress(str(episode["key"])).get("seconds") or 0)
+    state = audio_state(); canonical = str(data.get("feed_url") or feed_url); sid = hashlib.sha1(canonical.encode()).hexdigest()
+    return {"ok": True, **data, "subscribed": sid in state.get("podcast_subscriptions", {})}
+
+
+def _podcast_entry_by_guid(state: dict, guid: str):
+    for key, value in state.get("podcast_subscriptions", {}).items():
+        if isinstance(value, dict) and str(value.get("guid") or "") == str(guid):
+            return key, value
+    return None, None
+
+
+def _podcast_entry_by_feed(state: dict, feed_url: str):
+    for key, value in state.get("podcast_subscriptions", {}).items():
+        if isinstance(value, dict) and str(value.get("feed_url") or "") == str(feed_url):
+            return key, value
+    return None, None
+
+
+def podcast_subscribe(payload: dict) -> dict:
+    feed_url = _public_remote_url(str(payload.get("feed_url") or ""))
+    detail = podcast_feed(feed_url, 12)
+    canonical = _public_remote_url(str(detail.get("feed_url") or feed_url))
+    requested_guid = str(payload.get("guid") or "").strip()
+    guid = _open_podcast_guid(canonical, requested_guid or str(detail.get("feed_guid") or ""))
+    sid = hashlib.sha1(canonical.encode()).hexdigest()
+    now = _iso_now()
+    entry = {
+        "id": sid,
+        "feed_url": canonical,
+        "guid": guid,
+        "is_subscribed": True,
+        "subscription_changed": now,
+        "guid_changed": now,
+        "new_guid": None,
+        "deleted": None,
+        "title": detail.get("title") or "Podcast",
+        "author": detail.get("author") or "",
+        "description": detail.get("description") or "",
+        "art_url": detail.get("art_url"),
+        "subscribed": int(time.time()),
+    }
+    def mutate(state):
+        old_key, old = _podcast_entry_by_feed(state, canonical)
+        if old_key and isinstance(old, dict):
+            # Preserve the established Open Podcast API GUID unless the caller
+            # supplied an authoritative feed GUID.
+            if not requested_guid and old.get("guid"):
+                entry["guid"] = str(old["guid"])
+                entry["guid_changed"] = old.get("guid_changed") or now
+            state["podcast_subscriptions"].pop(old_key, None)
+        state["podcast_subscriptions"][sid] = entry
+        _gpodder_record_subscription(state, canonical, True, str(payload.get("_gpodder_device") or "pcga-portal"))
+        return entry
+    return {"ok": True, "subscription": _audio_update(mutate)}
+
+
+def podcast_unsubscribe(payload: dict) -> dict:
+    feed_url = str(payload.get("feed_url") or "").strip()
+    guid = str(payload.get("guid") or "").strip()
+    sid = str(payload.get("id") or (hashlib.sha1(feed_url.encode()).hexdigest() if feed_url else ""))
+    now = _iso_now()
+    def mutate(state):
+        key = sid if sid in state["podcast_subscriptions"] else None
+        entry = state["podcast_subscriptions"].get(key) if key else None
+        if entry is None and guid:
+            key, entry = _podcast_entry_by_guid(state, guid)
+        if not isinstance(entry, dict):
+            return False
+        entry["is_subscribed"] = False
+        entry["subscription_changed"] = now
+        entry["deleted"] = now
+        if entry.get("feed_url"):
+            _gpodder_record_subscription(state, str(entry.get("feed_url")), False, str(payload.get("_gpodder_device") or "pcga-portal"))
+        return True
+    return {"ok": True, "removed": _audio_update(mutate)}
+
+
+def podcast_subscriptions() -> dict:
+    rows = [dict(x) for x in audio_state().get("podcast_subscriptions", {}).values() if isinstance(x, dict) and x.get("is_subscribed", True) and not x.get("deleted")]
+    rows.sort(key=lambda x: str(x.get("title") or "").lower())
+    return {"ok": True, "items": rows}
+
+
+def open_podcast_subscriptions(query: dict) -> dict:
+    """Open Podcast API v1-compatible subscription collection view.
+
+    PCGA is currently a single-user appliance, so the authenticated-user
+    concept maps to the PCGA portal/control-plane identity.
+    """
+    page = max(1, int((query.get("page") or ["1"])[0] or 1))
+    per_page = max(1, min(100, int((query.get("per_page") or ["50"])[0] or 50)))
+    since = str((query.get("since") or [""])[0] or "").strip()
+    rows = []
+    for entry in audio_state().get("podcast_subscriptions", {}).values():
+        if not isinstance(entry, dict):
+            continue
+        row = {k: entry.get(k) for k in ("feed_url", "guid", "is_subscribed", "subscription_changed", "guid_changed", "new_guid", "deleted")}
+        if not row.get("guid"):
+            row["guid"] = _open_podcast_guid(str(row.get("feed_url") or ""))
+        row["is_subscribed"] = bool(row.get("is_subscribed", True))
+        if since:
+            stamps = [str(row.get(k) or "") for k in ("subscription_changed", "guid_changed", "deleted")]
+            if not any(x and x > since for x in stamps):
+                continue
+        rows.append(row)
+    rows.sort(key=lambda x: str(x.get("subscription_changed") or ""), reverse=True)
+    total = len(rows); start = (page - 1) * per_page; items = rows[start:start + per_page]
+    result = {"total": total, "page": page, "per_page": per_page, "subscriptions": items}
+    if start + per_page < total: result["next"] = f"/api/open-podcast/v1/subscriptions?page={page+1}&per_page={per_page}"
+    if page > 1: result["previous"] = f"/api/open-podcast/v1/subscriptions?page={page-1}&per_page={per_page}"
+    return result
+
+
+def open_podcast_add(payload: dict) -> dict:
+    rows = payload.get("subscriptions")
+    if not isinstance(rows, list):
+        raise ValueError("subscriptions array required")
+    success=[]; failure=[]
+    for row in rows[:100]:
+        if not isinstance(row, dict):
+            continue
+        feed = str(row.get("feed_url") or "")
+        try:
+            result = podcast_subscribe({"feed_url": feed, "guid": row.get("guid")})["subscription"]
+            success.append({k: result.get(k) for k in ("feed_url", "guid", "is_subscribed", "subscription_changed")})
+        except Exception as exc:
+            failure.append({"feed_url": feed, "message": str(exc)[:240]})
+    return {"success": success, "failure": failure}
+
+
+def open_podcast_get_one(guid: str) -> dict:
+    try: guid = str(uuid.UUID(str(guid)))
+    except ValueError: raise ValueError("invalid subscription guid")
+    _, entry = _podcast_entry_by_guid(audio_state(), guid)
+    if not isinstance(entry, dict): raise FileNotFoundError("subscription not found")
+    return {k: entry.get(k) for k in ("feed_url", "guid", "is_subscribed", "subscription_changed", "guid_changed", "new_guid", "deleted")}
+
+
+def open_podcast_delete(guid: str) -> dict:
+    try: guid = str(uuid.UUID(str(guid)))
+    except ValueError: raise ValueError("invalid subscription guid")
+    _, entry = _podcast_entry_by_guid(audio_state(), guid)
+    if not isinstance(entry, dict): raise FileNotFoundError("subscription not found")
+    podcast_unsubscribe({"guid": guid})
+    return {"deletion_id": int(time.time() * 1000), "message": "Deletion request was received and processed"}
+
+def _librivox_api(params: dict, ttl: int = 1800):
+    """Call the current LibriVox API with a canonical trailing-slash URL.
+
+    LibriVox documents both query-string and path-style forms.  Some front-end
+    combinations return a 404 for the non-canonical ``/audiobooks?`` form, so
+    PCGA uses ``/audiobooks/?`` first and retries one search selector in the
+    documented path-style form before surfacing an upstream error.
+    """
+    global LIBRIVOX_API_LAST
+    clean = {str(k): str(v) for k, v in params.items() if v is not None and str(v) != ""}
+    clean.setdefault("format", "json")
+    key = "librivox:" + urlencode(sorted(clean.items()))
+
+    def fetch_url(url: str) -> bytes:
+        global LIBRIVOX_API_LAST
+        with AUDIO_API_LOCK:
+            delay = 3.0 - (time.monotonic() - LIBRIVOX_API_LAST)
+            if delay > 0:
+                time.sleep(delay)
+            try:
+                raw, _ = _fetch_remote(url, max_bytes=12 * 1024 * 1024, timeout=30)
+            finally:
+                LIBRIVOX_API_LAST = time.monotonic()
+        return raw
+
+    def load():
+        query_url = LIBRIVOX_API_URL + "?" + urlencode(clean)
+        try:
+            raw = fetch_url(query_url)
+        except urllib.error.HTTPError as exc:
+            # LibriVox's API docs also support /audiobooks/title/foo and
+            # /audiobooks/id/52.  Retry that shape for the selector itself,
+            # keeping output controls in the query string.
+            if exc.code not in {400, 404}:
+                raise
+            selector = next((name for name in ("id", "title", "author", "genre") if clean.get(name)), None)
+            if not selector:
+                raise
+            tail = {k: v for k, v in clean.items() if k != selector}
+            path_url = LIBRIVOX_API_URL + quote(selector, safe="") + "/" + quote(clean[selector], safe="")
+            if tail:
+                path_url += "?" + urlencode(tail)
+            raw = fetch_url(path_url)
+        data = json.loads(raw.decode("utf-8", "replace") or "{}")
+        if not isinstance(data, dict):
+            raise ValueError("LibriVox returned an unexpected response")
+        return data
+
+    return _cached_json(key, ttl, load)
+
+
+def _librivox_author(book: dict) -> str:
+    names=[]
+    for a in book.get("authors") or []:
+        if not isinstance(a, dict): continue
+        name=" ".join(x for x in [str(a.get("first_name") or "").strip(), str(a.get("last_name") or "").strip()] if x)
+        if name: names.append(name)
+    return ", ".join(names)
+
+
+def _librivox_book(book: dict, detail=False) -> dict:
+    bid = str(book.get("id") or "")
+    art = str(book.get("coverart_jpg") or book.get("coverart_thumbnail") or "")
+    try: art_proxy = _media_proxy_url(art) if art else None
+    except Exception: art_proxy = None
+    out = {"id": bid, "title": str(book.get("title") or "Untitled audiobook"), "author": _librivox_author(book), "description": _strip_markup(book.get("description"), 6000), "language": str(book.get("language") or ""), "copyright_year": str(book.get("copyright_year") or ""), "total_time": str(book.get("totaltime") or ""), "total_seconds": int(book.get("totaltimesecs") or 0), "num_sections": int(book.get("num_sections") or 0), "art_url": art_proxy, "librivox_url": str(book.get("url_librivox") or book.get("url_project") or ""), "genres": [str((g.get("name") if isinstance(g, dict) else g) or "") for g in (book.get("genres") or []) if g][:12]}
+    if detail:
+        state = audio_state(); collection = state.get("audiobooks", {}).get(bid, {}) if bid else {}; local_files = collection.get("section_files", {}) if isinstance(collection, dict) else {}
+        sections=[]
+        for sec in book.get("sections") or []:
+            if not isinstance(sec, dict) or not sec.get("listen_url"): continue
+            sid=str(sec.get("id") or sec.get("section_number") or len(sections)+1); key=f"librivox:{bid}:{sid}"
+            local_rel=str(local_files.get(sid) or "")
+            if local_rel:
+                stream="/api/audio/local?path="+quote(local_rel, safe="")
+            else:
+                try: stream=_media_proxy_url(str(sec.get("listen_url") or ""))
+                except Exception: continue
+            readers=[]
+            for r in sec.get("readers") or []:
+                if isinstance(r, dict) and r.get("display_name"): readers.append(str(r.get("display_name")))
+            sections.append({"id":sid,"key":key,"number":int(sec.get("section_number") or len(sections)+1),"title":str(sec.get("title") or f"Section {len(sections)+1}"),"duration_seconds":int(float(sec.get("playtime") or 0)),"language":str(sec.get("language") or out["language"]),"readers":readers,"stream_url":stream,"source_url":str(sec.get("listen_url") or ""),"resume_seconds":float(_audio_progress(key).get("seconds") or 0),"local":bool(local_rel)})
+        out["sections"]=sections; out["collected"]=bool(collection); out["collection_state"]=str(collection.get("state") or "") if isinstance(collection,dict) else ""
+    return out
+
+
+def librivox_search(query: str, field: str = "title", limit: int = 24) -> dict:
+    query=str(query or "").strip()[:140]; field=field if field in {"title","author","genre"} else "title"; limit=max(1,min(50,int(limit or 24)))
+    if not query: return {"ok":True,"provider":"LibriVox","items":[]}
+    data=_librivox_api({field:query,"coverart":"1","limit":str(limit),"offset":"0"}, ttl=30*60)
+    items=[_librivox_book(x) for x in (data.get("books") or []) if isinstance(x,dict)]
+    return {"ok":True,"provider":"LibriVox","query":query,"field":field,"items":items}
+
+
+def librivox_detail(book_id: str) -> dict:
+    if not str(book_id).isdigit(): raise ValueError("invalid LibriVox book id")
+    data=_librivox_api({"id":str(book_id),"extended":"1","coverart":"1"}, ttl=6*3600)
+    books=[x for x in (data.get("books") or []) if isinstance(x,dict)]
+    if not books: raise FileNotFoundError("LibriVox book not found")
+    return {"ok":True,"book":_librivox_book(books[0],detail=True)}
+
+
+def librivox_collection() -> dict:
+    state=audio_state(); items=[]
+    for bid,entry in state.get("audiobooks",{}).items():
+        if not isinstance(entry,dict): continue
+        item=dict(entry); item["id"]=str(bid); items.append(item)
+    items.sort(key=lambda x:str(x.get("title") or "").lower())
+    return {"ok":True,"items":items,"jobs":state.get("jobs",{})}
+
+
+def _download_file(url: str, dest: Path, job_id: str, section_index: int, section_total: int) -> None:
+    url=_public_remote_url(url); dest.parent.mkdir(parents=True,exist_ok=True); tmp=dest.with_name(dest.name+".part")
+    class SafeRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return super().redirect_request(req, fp, code, msg, headers, _public_remote_url(newurl))
+    req=urllib.request.Request(url,headers={"User-Agent":AUDIO_USER_AGENT,"Accept":"audio/*,application/octet-stream,*/*"})
+    opener=urllib.request.build_opener(SafeRedirect())
+    with opener.open(req,timeout=45) as response, tmp.open("wb") as out:
+        total=int(response.headers.get("Content-Length") or 0); done=0
+        while True:
+            chunk=response.read(1024*1024)
+            if not chunk: break
+            out.write(chunk); done+=len(chunk)
+            if total and (done==total or done%(8*1024*1024)<len(chunk)):
+                def mutate(state):
+                    job=state["jobs"].setdefault(job_id,{})
+                    job.update({"state":"downloading","section":section_index,"sections":section_total,"bytes":done,"section_bytes":total,"updated":int(time.time())})
+                _audio_update(mutate)
+        out.flush(); os.fsync(out.fileno())
+    os.replace(tmp,dest)
+
+
+def _collect_librivox_worker(book_id: str):
+    job_id=f"librivox-{book_id}"
+    try:
+        data=_librivox_api({"id":book_id,"extended":"1","coverart":"1"},ttl=0); books=[x for x in (data.get("books") or []) if isinstance(x,dict)]
+        if not books: raise RuntimeError("LibriVox book not found")
+        book=books[0]; title=str(book.get("title") or f"LibriVox {book_id}"); root=read_root()/"media/library/audio/audiobooks/librivox"/(book_id+"-"+_safe_slug(title,"book")); root.mkdir(parents=True,exist_ok=True)
+        sections=[x for x in (book.get("sections") or []) if isinstance(x,dict) and x.get("listen_url")]
+        files={}
+        for idx,sec in enumerate(sections,1):
+            sid=str(sec.get("id") or idx); src=str(sec.get("listen_url") or ""); ext=Path(urlparse(src).path).suffix.lower(); ext=ext if ext in {".mp3",".m4a",".ogg",".opus",".flac",".wav",".m4b"} else ".mp3"
+            name=f"{idx:03d}-{_safe_slug(str(sec.get('title') or f'Section-{idx}'),'section')}{ext}"; dest=root/name
+            if not dest.is_file() or dest.stat().st_size==0: _download_file(src,dest,job_id,idx,len(sections))
+            files[sid]=str(dest.relative_to(read_root()/"media/library"))
+        cover=str(book.get("coverart_jpg") or "")
+        if cover:
+            try:
+                ext=Path(urlparse(cover).path).suffix.lower(); ext=ext if ext in {".jpg",".jpeg",".png",".webp"} else ".jpg"; c=root/("cover"+ext)
+                if not c.exists(): _download_file(cover,c,job_id,len(sections),len(sections))
+            except Exception: pass
+        normalized=_librivox_book(book); normalized.update({"state":"complete","path":str(root.relative_to(read_root()/"media/library")),"section_files":files,"collected_at":int(time.time())})
+        atomic_json(root/"metadata.json",normalized)
+        def done(state): state["audiobooks"][book_id]=normalized; state["jobs"][job_id]={"state":"complete","sections":len(sections),"updated":int(time.time()),"detail":"Audiobook collected locally."}
+        _audio_update(done)
+    except Exception as exc:
+        def failed(state): state["jobs"][job_id]={"state":"failed","updated":int(time.time()),"detail":f"{type(exc).__name__}: {str(exc)[:320]}"}
+        _audio_update(failed)
+
+
+def librivox_collect(payload: dict) -> dict:
+    book_id=str(payload.get("id") or "")
+    if not book_id.isdigit(): raise ValueError("invalid LibriVox book id")
+    job_id=f"librivox-{book_id}"
+    def start(state):
+        existing=state["jobs"].get(job_id,{})
+        if isinstance(existing,dict) and existing.get("state")=="downloading": return False
+        state["jobs"][job_id]={"state":"downloading","section":0,"sections":0,"bytes":0,"updated":int(time.time()),"detail":"Preparing LibriVox collection…"}; return True
+    created=_audio_update(start)
+    if created: threading.Thread(target=_collect_librivox_worker,args=(book_id,),daemon=True,name=f"pcga-librivox-{book_id}").start()
+    return {"ok":True,"job_id":job_id,"state":"downloading" if created else "already-running"}
+
+
+def librivox_remove(payload: dict) -> dict:
+    book_id=str(payload.get("id") or "")
+    if not book_id.isdigit(): raise ValueError("invalid LibriVox book id")
+    state=audio_state(); entry=state.get("audiobooks",{}).get(book_id,{})
+    rel=str(entry.get("path") or "") if isinstance(entry,dict) else ""
+    if rel:
+        base=(read_root()/"media/library").resolve(); target=(base/rel).resolve()
+        if target==base or base not in target.parents: raise ValueError("invalid collected audiobook path")
+        shutil.rmtree(target,ignore_errors=True)
+    def remove(st): st["audiobooks"].pop(book_id,None); st["jobs"].pop(f"librivox-{book_id}",None)
+    _audio_update(remove)
+    return {"ok":True,"removed":book_id}
+
+
+def audio_get(path: str, query: dict) -> dict:
+    if path == "/audio/state":
+        state=audio_state(); return {"ok":True,"podcast_subscriptions":list(state.get("podcast_subscriptions",{}).values()),"audiobooks":list(state.get("audiobooks",{}).values()),"jobs":state.get("jobs",{})}
+    if path == "/audio/gpodder/devices": return gpodder_devices()
+    if path == "/audio/gpodder/subscriptions": return gpodder_subscription_changes((query.get("device") or ["pcga-portal"])[0], int((query.get("since") or ["0"])[0] or 0))
+    if path == "/audio/gpodder/episodes": return gpodder_episode_actions(query)
+    if path == "/audio/podcasts/search": return podcast_search((query.get("q") or [""])[0], int((query.get("limit") or ["24"])[0]))
+    if path == "/audio/open-podcast/v1/subscriptions": return open_podcast_subscriptions(query)
+    if path.startswith("/audio/open-podcast/v1/subscriptions/"): return open_podcast_get_one(path.rsplit("/", 1)[-1])
+    if path == "/audio/podcasts/subscriptions": return podcast_subscriptions()
+    if path == "/audio/podcasts/feed": return podcast_feed((query.get("url") or [""])[0], int((query.get("limit") or ["100"])[0]))
+    if path == "/audio/librivox/search": return librivox_search((query.get("q") or [""])[0], (query.get("field") or ["title"])[0], int((query.get("limit") or ["24"])[0]))
+    if path == "/audio/librivox/book": return librivox_detail((query.get("id") or [""])[0])
+    if path == "/audio/librivox/collection": return librivox_collection()
+    raise FileNotFoundError("audio endpoint not found")
+
+
+def audio_post(path: str, payload: dict) -> dict:
+    if path == "/audio/gpodder/device": return gpodder_update_device(str(payload.pop("_device", "")), payload)
+    if path == "/audio/gpodder/subscriptions": return gpodder_update_subscriptions(str(payload.pop("_device", "pcga-portal")), payload)
+    if path == "/audio/gpodder/episodes": return gpodder_update_episode_actions(payload.get("actions"))
+    if path == "/audio/progress": return audio_set_progress(payload)
+    if path == "/audio/podcasts/subscribe": return podcast_subscribe(payload)
+    if path == "/audio/open-podcast/v1/subscriptions": return open_podcast_add(payload)
+    if path == "/audio/podcasts/unsubscribe": return podcast_unsubscribe(payload)
+    if path == "/audio/librivox/collect": return librivox_collect(payload)
+    if path == "/audio/librivox/remove": return librivox_remove(payload)
+    raise FileNotFoundError("audio endpoint not found")
+
+
+def validate_config(cfg: dict) -> dict:
+    out = merge(DEFAULTS, cfg)
+    for sec, key in [
+        ("ingest", "auto_rip"), ("ingest", "keep_raw"),
+        ("review", "auto_classify"),
+        ("games", "romm_enabled"), ("games", "filesystem_watch"),
+        ("games", "metadata_hasheous"), ("games", "metadata_playmatch"),
+        ("games", "compat_protondb"), ("games", "compat_playonlinux"),
+        ("photos", "immich_enabled"), ("media", "jellyfin_enabled"),
+        ("automation", "sorter_enabled"), ("automation", "classifier_enabled"),
+        ("automation", "dedupe_enabled"), ("remote_access", "tailscale_enabled"),
+        ("nas", "enabled"), ("nas", "schedule_enabled"),
+    ]:
+        out[sec][key] = bool(out[sec].get(key))
+    try:
+        threshold = float(out["review"].get("auto_threshold", .90))
+    except (TypeError, ValueError):
+        threshold = .90
+    out["review"]["auto_threshold"] = max(.50, min(1.0, threshold))
+    out["games"]["watch_debounce_seconds"] = clamp_int(out["games"].get("watch_debounce_seconds"), 30, 3600, 300)
+    graphics_backend = str(out["games"].get("graphics_backend") or "auto").strip().lower()
+    out["games"]["graphics_backend"] = graphics_backend if graphics_backend in {"auto", "dxvk", "wined3d"} else "auto"
+    cron = str(out["games"].get("scheduled_rescan") or "25 3 * * *").strip()
+    if len(cron) > 80 or any(c in cron for c in "\n\r\0"):
+        cron = "25 3 * * *"
+    out["games"]["scheduled_rescan"] = cron
+    out["media"]["background_video_max_width"] = clamp_int(out["media"].get("background_video_max_width"), 640, 3840, 1920)
+    out["media"]["background_video_max_height"] = clamp_int(out["media"].get("background_video_max_height"), 360, 2160, 1080)
+    out["media"]["background_video_bitrate"] = clamp_int(out["media"].get("background_video_bitrate"), 500000, 50000000, 8000000)
+    nas = out["nas"]
+    nas["protocol"] = str(nas.get("protocol") or "smb").lower()
+    if nas["protocol"] not in {"smb", "nfs"}: nas["protocol"] = "smb"
+    nas["mode"] = str(nas.get("mode") or "mirror").lower()
+    if nas["mode"] not in {"mirror", "offload"}: nas["mode"] = "mirror"
+    nas["host"] = str(nas.get("host") or "").strip()[:255]
+    nas["share"] = str(nas.get("share") or "").strip()[:512]
+    nas["username"] = str(nas.get("username") or "").strip()[:255]
+    nas["domain"] = str(nas.get("domain") or "").strip()[:255]
+    base_dir = str(nas.get("base_dir") or "PCGA").strip().strip("/")
+    nas["base_dir"] = base_dir if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,79}", base_dir) else "PCGA"
+    allowed_libs = {"movies", "tv", "music", "home-videos", "photos"}
+    libs = nas.get("libraries") if isinstance(nas.get("libraries"), list) else []
+    nas["libraries"] = [x for x in libs if x in allowed_libs] or ["movies", "tv", "music", "home-videos", "photos"]
+    nas["local_reserve_gib"] = clamp_int(nas.get("local_reserve_gib"), 1, 16384, 100)
+    nas["min_age_days"] = clamp_int(nas.get("min_age_days"), 0, 3650, 30)
+    out["schema"] = 2
+    out["version"] = VERSION
+    return out
+
+
+def patch_env(path: Path, values: dict[str, str]) -> None:
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines() if path.exists() else []
+    remaining = dict(values)
+    out = []
+    for line in lines:
+        if "=" in line and not line.lstrip().startswith("#"):
+            key = line.split("=", 1)[0].strip()
+            if key in remaining:
+                out.append(f"{key}={remaining.pop(key)}")
+                continue
+        out.append(line)
+    if out and out[-1] != "":
+        out.append("")
+    for key, value in remaining.items():
+        out.append(f"{key}={value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
+def set_unit(unit: str, enabled: bool) -> dict:
+    if enabled:
+        p = run(["systemctl", "enable", "--now", unit], timeout=30)
+    else:
+        p = run(["systemctl", "disable", "--now", unit], timeout=30)
+    return {"ok": p.returncode == 0, "unit": unit, "enabled": enabled, "detail": (p.stderr or p.stdout)[-500:]}
+
+
+def compose_files() -> list[str]:
+    names = ["compose.yml", "compose.jellyfin-gpu.yml", "compose.immich.yml", "compose.romm.yml", "compose.arm.yml", "compose.status.yml", "compose.wolf.yml", "compose.moonlight-web.yml", "compose.game-lan.yml", "compose.nas.yml"]
+    out = []
+    for name in names:
+        p = STACK_DIR / name
+        if p.exists():
+            out += ["-f", str(p)]
+    return out
+
+
+def compose_up(service: str) -> dict:
+    cmd = ["docker", "compose", *compose_files(), "up", "-d", "--no-deps", "--force-recreate", service]
+    p = run(cmd, timeout=180)
+    return {"ok": p.returncode == 0, "service": service, "detail": (p.stderr or p.stdout)[-1000:]}
+
+
+def docker_state(container: str) -> dict:
+    p = run(["docker", "inspect", "-f", "{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}", container], timeout=5)
+    if p.returncode:
+        return {"present": False, "active": False, "state": "missing"}
+    text = p.stdout.strip()
+    state, _, health = text.partition("|")
+    return {"present": True, "active": state == "running", "state": state, "health": health if health != "<no value>" else ""}
+
+
+def systemd_state(unit: str) -> dict:
+    active = run(["systemctl", "is-active", unit], timeout=5).stdout.strip()
+    enabled = run(["systemctl", "is-enabled", unit], timeout=5).stdout.strip()
+    return {"unit": unit, "active": active == "active", "state": active or "unknown", "enabled": enabled in {"enabled", "static", "indirect"}, "enable_state": enabled or "unknown"}
+
+
+# Browser-visible diagnostics are deliberately mediated by this privileged
+# control plane instead of mounting the Docker socket or journal into the
+# read-only portal container. Service identifiers are discovered from PCGA's
+# own systemd namespace and Compose project only; callers cannot supply an
+# arbitrary command, unit, path, or container name.
+LOG_STATIC_SYSTEMD = {
+    "pcga-control.service": "PCGA Control Plane",
+    "pcga-game-stack.service": "PCGA Game Stack",
+    "pcga-game-orchestrator.service": "PC Game Orchestrator",
+    "pcga-cdemu.service": "CDEmu Optical",
+    "pcga-service-auth.service": "Service Authentication",
+    "pcga-optical-watch.service": "Optical Watch",
+    "pcga-media-sort.service": "Media Sorter",
+    "pcga-metadata-classify.service": "Metadata Classifier",
+    "pcga-dedupe.service": "Duplicate Pruner",
+    "pcga-public-media.service": "Content Intake",
+    "pcga-nas-mount.service": "NAS Mount",
+    "pcga-nas-sync.service": "NAS Mirror / Offload",
+}
+
+LOG_STATIC_DOCKER = {
+    "pcga-status": "PCGA Portal",
+    "pcga-moonlight-web": "Moonlight Web",
+    "wolf": "Wolf",
+    "wolf-den": "Wolf Den",
+    "lancommander": "LANCommander",
+    "romm": "RomM",
+    "romm-db": "RomM Database",
+    "jellyfin": "Jellyfin",
+    "arm-rippers": "Automatic Ripping Machine",
+    "immich_server": "Immich",
+    "immich_machine_learning": "Immich Machine Learning",
+    "immich_postgres": "Immich Database",
+    "immich_redis": "Immich Redis",
+}
+
+_LOG_CATALOG_CACHE = {"at": 0.0, "data": None}
+_LOG_CATALOG_LOCK = threading.Lock()
+
+LOG_PROFILE_LABELS = {
+    "streaming": "Streaming",
+    "pc-games": "PC game setup",
+    "ingest": "Optical ingest",
+    "media": "Media pipeline",
+    "emulation": "Console emulation",
+    "photos": "Photos",
+    "system": "PCGA services",
+    "all": "All services",
+}
+
+
+def _log_display_name(source: str, kind: str) -> str:
+    if kind == "systemd" and source in LOG_STATIC_SYSTEMD:
+        return LOG_STATIC_SYSTEMD[source]
+    if kind == "docker" and source in LOG_STATIC_DOCKER:
+        return LOG_STATIC_DOCKER[source]
+    name = source.removesuffix(".service")
+    name = re.sub(r"^pcga[-_]", "", name, flags=re.I)
+    name = re.sub(r"[-_]", " ", name)
+    return " ".join(x.capitalize() for x in name.split()) or source
+
+
+def _log_tags(source: str, kind: str) -> list[str]:
+    s = source.lower()
+    tags = {"all"}
+    if kind == "systemd" and s.startswith("pcga-"):
+        tags.add("system")
+    if kind == "docker" and (s.startswith("pcga-") or s.startswith("pcga_") or s in LOG_STATIC_DOCKER):
+        tags.add("system")
+    if any(x in s for x in ("moonlight", "wolf", "game-stack", "game-orchestrator", "service-auth", "cdemu")) or s.startswith("pcga-setup-") or s.startswith("pcga-game-") or s.startswith("pcga_") and "game" in s:
+        tags.update({"streaming", "pc-games"})
+    if s == "pcga-status":
+        tags.add("streaming")
+    if s.startswith("pcga-") and ("setup" in s or "game" in s):
+        tags.update({"streaming", "pc-games"})
+    if "lancommander" in s:
+        tags.add("pc-games")
+    if any(x in s for x in ("arm-rip", "arm-rippers", "optical", "pc-disc-rip", "media-sort", "metadata-classify", "public-media")):
+        tags.add("ingest")
+    if any(x in s for x in ("jellyfin", "media-sort", "metadata-classify", "public-media", "dedupe")):
+        tags.add("media")
+    if "romm" in s:
+        tags.add("emulation")
+    if "immich" in s:
+        tags.add("photos")
+    return sorted(tags)
+
+
+def _redact_log_text(text: str) -> str:
+    """Remove common credentials before any log text reaches a browser."""
+    if not text:
+        return ""
+    # Authorization headers and shell-style bearer tokens.
+    text = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{12,}", r"\1[REDACTED]", text)
+    # JSON, env, and key/value credential fields. Keep the key so diagnostics
+    # remain understandable while replacing only the value.
+    secret = r"(?:password|passwd|token|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|pin)"
+    text = re.sub(
+        rf"(?i)((?:[\"']?{secret}[\"']?)\s*[:=]\s*)([\"'][^\"'\n]*[\"']|[^\s,;]+)",
+        lambda m: m.group(1) + "[REDACTED]",
+        text,
+    )
+    text = re.sub(r"(?i)([?&](?:token|key|password|secret|api_key)=)[^&#\s]+", r"\1[REDACTED]", text)
+    # Avoid pathological single lines monopolizing the thin client.
+    return "\n".join(line if len(line) <= 4096 else line[:4093] + "..." for line in text.splitlines())
+
+
+def _docker_log_candidates() -> list[tuple[str, str, str, str]]:
+    p = run(["docker", "ps", "-a", "--format", "{{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Labels}}"], timeout=8)
+    if p.returncode:
+        return []
+    out = []
+    for raw in p.stdout.splitlines():
+        parts = raw.split("\t", 3)
+        if len(parts) < 3:
+            continue
+        name, image, status = parts[:3]
+        labels = parts[3] if len(parts) > 3 else ""
+        managed = (
+            name in LOG_STATIC_DOCKER
+            or name.lower().startswith(("pcga-", "pcga_"))
+            or name.startswith("PCGA-")
+            or "com.docker.compose.project=pc-game-archive" in labels
+        )
+        if managed:
+            out.append((name, image, status, labels))
+    return out
+
+
+def _systemd_log_candidates() -> list[str]:
+    units = set(LOG_STATIC_SYSTEMD)
+    p = run(["systemctl", "list-units", "--all", "--type=service", "--no-legend", "--plain", "pcga-*.service"], timeout=8)
+    if p.returncode == 0:
+        for line in p.stdout.splitlines():
+            match = re.search(r"\b(pcga-[A-Za-z0-9_.@:-]+\.service)\b", line)
+            if match:
+                units.add(match.group(1))
+    return sorted(units)
+
+
+def _setup_session_log_candidates() -> list[dict]:
+    """Expose the current PC-game log surface without historical duplicates.
+
+    Setup and runtime logs remain on disk for recovery, but the streaming
+    diagnostic profile should represent the current canonical game state.  Older
+    snapshots listed both logs for every title and also listed superseded UUIDs,
+    which made one logical game appear several times in the status JSON.
+    """
+    root = Path("/srv/pc-game-archive/games/installed")
+    state_root = Path("/var/lib/pc-game-archive/game-installs")
+    sets_root = Path("/var/lib/pc-game-archive/game-intake/sets")
+    out = []
+    if not root.exists():
+        return out
+
+    def record(sid: str) -> tuple[dict,dict,bool,str]:
+        state={};game={}
+        try: state=json.loads((state_root/f"{sid}.json").read_text(encoding="utf-8"))
+        except Exception: pass
+        try: game=json.loads((sets_root/f"{sid}.json").read_text(encoding="utf-8"))
+        except Exception: pass
+        hidden=bool(
+            state.get("catalog_hidden") or state.get("duplicate_of") or
+            game.get("catalog_hidden") or game.get("superseded_by")
+        )
+        title=str(game.get("title") or state.get("title") or sid)
+        return state,game,hidden,title
+
+    setup_paths={p.parent.name:p for p in root.glob("*/pcga-setup-session.log")}
+    runtime_paths={p.parent.parent.name:p for p in root.glob("*/runtime-logs/session.log")}
+    for sid in sorted(set(setup_paths)|set(runtime_paths)):
+        if not re.fullmatch(r"[0-9A-Za-z._-]{8,80}", sid):
+            continue
+        state,_game,hidden,title=record(sid)
+        if hidden:
+            continue
+        status=str(state.get("status") or "")
+        # A ready game is represented by its runtime log.  A setup-required game
+        # is represented by its installer log.  If only one log exists, retain
+        # it so diagnostics never hide the sole useful failure history.
+        prefer_runtime=status=="ready"
+        path=None;kind=""
+        if prefer_runtime and sid in runtime_paths:
+            path=runtime_paths[sid];kind="runtime"
+        elif not prefer_runtime and sid in setup_paths:
+            path=setup_paths[sid];kind="setup"
+        elif sid in runtime_paths:
+            path=runtime_paths[sid];kind="runtime"
+        elif sid in setup_paths:
+            path=setup_paths[sid];kind="setup"
+        if path is None:
+            continue
+        out.append({
+            "id":f"file:pcga-{kind}:{sid}",
+            "kind":"file",
+            "source":str(path),
+            "name":("Game runtime" if kind=="runtime" else "Setup session")+f" • {title}",
+            "tags":["all","pc-games","streaming"],
+            "state":"persisted",
+            "active":False,
+            "health":"",
+        })
+    return out
+
+
+def log_catalog(force: bool = False) -> dict:
+    now = time.monotonic()
+    with _LOG_CATALOG_LOCK:
+        cached = _LOG_CATALOG_CACHE.get("data")
+        if not force and cached is not None and now - float(_LOG_CATALOG_CACHE.get("at") or 0) < 2.0:
+            return deepcopy(cached)
+        services = []
+        for unit in _systemd_log_candidates():
+            st = systemd_state(unit)
+            services.append({
+                "id": f"systemd:{unit}", "kind": "systemd", "source": unit,
+                "name": _log_display_name(unit, "systemd"), "tags": _log_tags(unit, "systemd"),
+                "state": st.get("state", "unknown"), "active": bool(st.get("active")), "health": "",
+            })
+        for name, image, status, _labels in _docker_log_candidates():
+            st = docker_state(name)
+            services.append({
+                "id": f"docker:{name}", "kind": "docker", "source": name,
+                "name": _log_display_name(name, "docker"), "tags": _log_tags(name, "docker"),
+                "state": st.get("state", "unknown"), "active": bool(st.get("active")),
+                "health": st.get("health", ""), "image": image, "status_text": status,
+            })
+        services.extend(_setup_session_log_candidates())
+        # Keep stable service positions between polls so the diagnostic grid does not
+        # jump while an incident is being observed.
+        services.sort(key=lambda x: (0 if "streaming" in x["tags"] else 1, x["kind"], x["name"].lower(), x["source"].lower()))
+        profiles = {}
+        for profile, label in LOG_PROFILE_LABELS.items():
+            ids = [s["id"] for s in services if profile == "all" or profile in s["tags"]]
+            profiles[profile] = {"label": label, "services": ids}
+        value = {"ok": True, "version": VERSION, "generated_at": time.time(), "services": services, "profiles": profiles}
+        _LOG_CATALOG_CACHE["at"] = now
+        _LOG_CATALOG_CACHE["data"] = value
+        return deepcopy(value)
+
+
+def service_log(service_id: str, lines: int = 160, seconds: int = 900) -> dict:
+    lines = max(20, min(1000, int(lines)))
+    seconds = max(15, min(86400, int(seconds)))
+    catalog = log_catalog()
+    item = next((x for x in catalog["services"] if x["id"] == service_id), None)
+    if not item:
+        raise ValueError("unknown log service")
+    source, kind = item["source"], item["kind"]
+    if kind == "docker":
+        p = run(["docker", "logs", "--timestamps", "--tail", str(lines), "--since", f"{seconds}s", source], timeout=15)
+        raw_text = (p.stdout or "") + (p.stderr or "")
+        returncode = p.returncode
+    elif kind == "file":
+        path = Path(source)
+        allowed_root = Path("/srv/pc-game-archive/games/installed").resolve()
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(allowed_root)
+            rows = resolved.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:]
+            raw_text = "\n".join(rows) + ("\n" if rows else "")
+            returncode = 0
+        except Exception as exc:
+            raw_text = f"Unable to read persisted PC-game log: {type(exc).__name__}: {exc}\n"
+            returncode = 1
+    else:
+        p = run(["journalctl", "--no-pager", "-o", "short-iso", "-u", source, "-n", str(lines), "--since", f"{seconds} seconds ago"], timeout=15)
+        raw_text = (p.stdout or "") + (p.stderr or "")
+        returncode = p.returncode
+    text = _redact_log_text(raw_text)
+    # Hard cap protects the portal and low-power TV clients even when a service
+    # emits extremely verbose structured errors.
+    if len(text) > 512_000:
+        text = "[...truncated to most recent 512 KiB...]\n" + text[-512_000:]
+    return {
+        "ok": returncode == 0, "version": VERSION, "generated_at": time.time(),
+        "service": item, "lines": lines, "seconds": seconds, "log": text,
+        "returncode": returncode,
+    }
+
+
+@contextmanager
+def game_stack_lock(timeout: float = 180.0):
+    """Serialize Control Center container mutations with boot/auth/bootstrap work."""
+    GAME_STACK_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with GAME_STACK_LOCK.open("a+") as fh:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for PCGA game-stack reconciliation lock")
+                time.sleep(0.2)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def tailscale_remote(command: str = "status") -> dict:
+    helper = Path("/usr/local/sbin/pcga-tailscale-remote")
+    if not helper.is_file():
+        return {"ok": False, "available": False, "configured": False, "state": "unavailable", "detail": "PCGA Tailscale helper is not installed."}
+    p = run([str(helper), command], timeout=45)
+    try:
+        value = json.loads(p.stdout or "{}")
+        if not isinstance(value, dict):
+            value = {}
+    except Exception:
+        value = {}
+    value.setdefault("ok", p.returncode == 0)
+    if p.returncode != 0:
+        value.setdefault("error", "tailscale-action-failed")
+        value.setdefault("detail", (p.stderr or p.stdout or f"pcga-tailscale-remote {command} failed")[-1200:])
+    return value
+
+
+def set_tailscale_remote(enabled: bool) -> dict:
+    result = tailscale_remote("enable" if enabled else "disable")
+    if result.get("ok") and (result.get("configured") == enabled or not enabled):
+        cfg = load_config()
+        cfg["remote_access"]["tailscale_enabled"] = enabled
+        atomic_json(CONFIG_PATH, validate_config(cfg))
+    return result
+
+
+def nas_storage(command: str = "status") -> dict:
+    if not NAS_HELPER.is_file():
+        return {"ok": False, "available": False, "mounted": False, "error": "nas-helper-unavailable", "detail": "PCGA NAS storage helper is not installed."}
+    p = run([str(NAS_HELPER), command], timeout=7200 if command in {"sync", "offload"} else 120)
+    try:
+        value = json.loads(p.stdout or "{}")
+        if not isinstance(value, dict): value = {}
+    except Exception:
+        value = {}
+    value.setdefault("available", True)
+    value.setdefault("ok", p.returncode == 0)
+    if p.returncode != 0:
+        value.setdefault("error", "nas-action-failed")
+        value.setdefault("detail", (p.stderr or p.stdout or f"pcga-nas-storage {command} failed")[-1600:])
+    return value
+
+
+def _safe_nas_text(value, field: str, max_len: int = 255) -> str:
+    text = str(value or "").strip()
+    if len(text) > max_len or any(ch in text for ch in "\r\n\0"):
+        raise ValueError(f"invalid NAS {field}")
+    return text
+
+
+def _write_nas_credentials(username: str, domain: str, password_value) -> None:
+    existing = {}
+    if NAS_CREDS.is_file():
+        for line in NAS_CREDS.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1); existing[key.strip()] = value
+    if password_value is None or password_value == "":
+        password = existing.get("password", "")
+    else:
+        password = str(password_value)
+        if any(ch in password for ch in "\r\n\0") or len(password) > 1024:
+            raise ValueError("invalid NAS password")
+    if not username:
+        NAS_CREDS.unlink(missing_ok=True)
+        return
+    NAS_CREDS.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"username={username}", f"password={password}"]
+    if domain: lines.append(f"domain={domain}")
+    NAS_CREDS.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.chmod(NAS_CREDS, 0o600)
+
+
+def start_nas_job(command: str) -> dict:
+    if command not in {"sync", "offload", "archive"}: raise ValueError("invalid NAS job")
+    unit = f"pcga-nas-manual-{command}"
+    current = run(["systemctl", "is-active", unit], timeout=5).stdout.strip()
+    if current in {"active", "activating"}:
+        return {"ok": True, "action": f"nas-{command}", "state": "already-running", "detail": f"NAS {command} is already running."}
+    # A prior transient unit can briefly remain in systemd's failed-unit cache.
+    # Clearing that state makes repeated manual mirror/archive actions reliable.
+    run(["systemctl", "reset-failed", unit], timeout=5)
+    p = run(["systemd-run", "--unit", unit, "--collect", "--property=Type=exec", "--property=TimeoutStartSec=0", str(NAS_HELPER), command], timeout=20)
+    return {"ok": p.returncode == 0, "action": f"nas-{command}", "state": "started" if p.returncode == 0 else "failed", "detail": (p.stderr or p.stdout or f"NAS {command} started.")[-1200:]}
+
+
+def configure_nas(payload: dict) -> dict:
+    settings = payload.get("nas")
+    if not isinstance(settings, dict):
+        raise ValueError("nas settings object required")
+    cfg = load_config()
+    old_nas = deepcopy(cfg.get("nas") or {})
+    patch = {}
+    for key in ("enabled", "schedule_enabled"):
+        if key in settings: patch[key] = bool(settings[key])
+    for key in ("protocol", "host", "share", "username", "domain", "base_dir", "mode"):
+        if key in settings: patch[key] = _safe_nas_text(settings[key], key, 512 if key == "share" else 255)
+    if "libraries" in settings:
+        if not isinstance(settings["libraries"], list): raise ValueError("NAS libraries must be a list")
+        patch["libraries"] = [str(x) for x in settings["libraries"]]
+    for key in ("local_reserve_gib", "min_age_days"):
+        if key in settings: patch[key] = settings[key]
+    cfg["nas"] = merge(cfg["nas"], patch)
+    cfg = validate_config(cfg)
+    nas = cfg["nas"]
+    if nas["enabled"]:
+        if not nas["host"] or not nas["share"]: raise ValueError("NAS host and share/export are required")
+        if not re.fullmatch(r"[A-Za-z0-9_.:\-\[\]]+", nas["host"]): raise ValueError("NAS host contains unsupported characters")
+        if nas["protocol"] == "smb" and "/" in nas["share"].strip("/"): raise ValueError("SMB share must be a share name, not a nested path; use the PCGA base folder for subdirectories")
+    endpoint_keys = {"protocol", "host", "share", "username", "domain"}
+    endpoint_changed = any(old_nas.get(k) != nas.get(k) for k in endpoint_keys)
+    password_changed = nas["protocol"] == "smb" and bool(settings.get("password"))
+    if old_nas.get("enabled") and (endpoint_changed or password_changed):
+        detached = nas_storage("unmount")
+        if not detached.get("ok"):
+            detached["detail"] = "PCGA could not detach the existing NAS mount, so the new endpoint was not applied. " + str(detached.get("detail") or "")
+            return detached
+    if nas["protocol"] == "smb":
+        _write_nas_credentials(nas["username"], nas["domain"], settings.get("password") if "password" in settings else None)
+    atomic_json(CONFIG_PATH, cfg)
+    result = nas_storage("reconcile")
+    result["config"] = cfg
+    return result
+
+
+def state_payload() -> dict:
+    cfg = load_config()
+    root = read_root()
+    try:
+        usage = shutil.disk_usage(root)
+        disk = {"total": usage.total, "used": usage.used, "free": usage.free, "used_percent": round(100 * usage.used / usage.total, 1) if usage.total else 0}
+    except OSError:
+        disk = {}
+    systemd = {name: systemd_state(unit) for name, unit in SERVICE_UNITS.items()}
+    docker = {name: docker_state(container) for name, container in DOCKER_SERVICES.items()}
+    return {
+        "ok": True,
+        "version": VERSION,
+        "config": cfg,
+        "archive_root": str(root),
+        "disk": disk,
+        "services": {"systemd": systemd, "docker": docker},
+        "remote_access": tailscale_remote("status"),
+        "nas": nas_storage("status"),
+        "pc_game_metadata": pc_game_metadata_config(),
+        "native_urls": {
+            "jellyfin": ":8096/",
+            "immich": ":2283/",
+            "romm": ":8082/",
+            "lancommander": ":1337/",
+            "wolfden": ":8080/",
+            "arm": ":8081/",
+        },
+    }
+
+
+def apply_config(cfg: dict) -> list[dict]:
+    results = []
+    # Host automation.
+    results.append(set_unit("pcga-optical-watch.service", cfg["ingest"]["auto_rip"]))
+    # Keep ARM aligned with the appliance-owned ingest policy. This helper is
+    # idempotent and refuses to rewrite arm.yaml while a rip is active; if a
+    # user changes the setting mid-rip, pcga-arm-rip applies it after the job.
+    arm = run(["/usr/local/sbin/pcga-arm-configure", "--ensure"], timeout=45)
+    results.append({
+        "ok": arm.returncode in {0, 75},
+        "service": "arm-config",
+        "pending": arm.returncode == 75,
+        "detail": (arm.stderr or arm.stdout)[-800:],
+    })
+    for unit in ("pcga-media-sort.path", "pcga-media-sort.timer"):
+        results.append(set_unit(unit, cfg["automation"]["sorter_enabled"]))
+    classifier_enabled = cfg["automation"]["classifier_enabled"] and cfg["review"]["auto_classify"]
+    for unit in ("pcga-metadata-classify.path", "pcga-metadata-classify.timer"):
+        results.append(set_unit(unit, classifier_enabled))
+    results.append(set_unit("pcga-dedupe.timer", cfg["automation"]["dedupe_enabled"]))
+
+    # Dedupe policy.
+    existing = DEDUPE_CONF.read_text(encoding="utf-8", errors="replace") if DEDUPE_CONF.exists() else ""
+    if "PCGA_DEDUPE_LIBRARY_DUPLICATES=" not in existing:
+        existing += "\nPCGA_DEDUPE_LIBRARY_DUPLICATES=0\n"
+    DEDUPE_CONF.parent.mkdir(parents=True, exist_ok=True)
+    DEDUPE_CONF.write_text(existing, encoding="utf-8")
+
+    # PC-game compatibility knowledge providers. These are host-side cached
+    # metadata lookups; changing them does not require rebuilding game services.
+    patch_env(GAME_METADATA_ENV, {
+        "PCGA_PROTONDB_ENABLED": "1" if cfg["games"]["compat_protondb"] else "0",
+        "PCGA_PLAYONLINUX_ENABLED": "1" if cfg["games"]["compat_playonlinux"] else "0",
+    })
+    # PCGA launches Wine directly rather than through Lutris' runner. Keep the
+    # Direct3D translation backend explicit so every streamed title receives the
+    # same appliance policy. The orchestrator propagates this into Wolf apps.
+    patch_env(RUNTIME_ENV, {
+        "PCGA_GRAPHICS_BACKEND": cfg["games"]["graphics_backend"],
+        "PCGA_DXVK_WINETRICKS_VERB": "dxvk2062",
+    })
+
+    # RomM background defaults. Recreate the container so env-file changes apply.
+    if ROMM_ENV.exists():
+        patch_env(ROMM_ENV, {
+            "ENABLE_RESCAN_ON_FILESYSTEM_CHANGE": "true" if cfg["games"]["filesystem_watch"] else "false",
+            "RESCAN_ON_FILESYSTEM_CHANGE_DELAY": str(max(1, cfg["games"]["watch_debounce_seconds"] // 60)),
+            "ENABLE_SCHEDULED_RESCAN": "true",
+            "SCHEDULED_RESCAN_CRON": cfg["games"]["scheduled_rescan"],
+            "HASHEOUS_API_ENABLED": "true" if cfg["games"]["metadata_hasheous"] else "false",
+            "PLAYMATCH_API_ENABLED": "true" if cfg["games"]["metadata_playmatch"] else "false",
+        })
+        if cfg["games"]["romm_enabled"]:
+            p = run(["docker", "compose", *compose_files(), "up", "-d", "romm-db", "romm"], timeout=180)
+            results.append({"ok": p.returncode == 0, "service": "romm", "enabled": True, "detail": (p.stderr or p.stdout)[-800:]})
+        else:
+            p = run(["docker", "stop", "romm", "romm-db"], timeout=60)
+            results.append({"ok": p.returncode == 0, "service": "romm", "enabled": False, "detail": (p.stderr or p.stdout)[-500:]})
+
+    if cfg["photos"]["immich_enabled"]:
+        p = run(["docker", "compose", *compose_files(), "up", "-d", "immich-database", "immich-redis", "immich-machine-learning", "immich-server"], timeout=240)
+        results.append({"ok": p.returncode == 0, "service": "immich", "enabled": True, "detail": (p.stderr or p.stdout)[-800:]})
+    else:
+        p = run(["docker", "stop", "immich_server", "immich_machine_learning", "immich_redis", "immich_postgres"], timeout=60)
+        results.append({"ok": p.returncode == 0, "service": "immich", "enabled": False, "detail": (p.stderr or p.stdout)[-500:]})
+    if cfg["media"]["jellyfin_enabled"]:
+        results.append(compose_up("jellyfin"))
+    else:
+        p = run(["docker", "stop", "jellyfin"], timeout=30)
+        results.append({"ok": p.returncode == 0, "service": "jellyfin", "enabled": False, "detail": (p.stderr or p.stdout)[-500:]})
+    return results
+
+
+def update_config(payload: dict) -> dict:
+    cfg = load_config()
+    patch = payload.get("config") if isinstance(payload, dict) else None
+    if not isinstance(patch, dict):
+        raise ValueError("config object required")
+    cfg = merge(cfg, patch)
+    cfg = validate_config(cfg)
+    atomic_json(CONFIG_PATH, cfg)
+    if payload.get("apply", True):
+        with game_stack_lock():
+            results = apply_config(cfg)
+    else:
+        results = []
+    return {"ok": all(r.get("ok", True) for r in results), "config": cfg, "results": results}
+
+
+def _validate_game_set_id(value) -> str:
+    sid = str(value or "").strip()
+    if not re.fullmatch(r"[0-9A-Za-z._-]{8,80}", sid):
+        raise ValueError("invalid game set id")
+    return sid
+
+
+def retry_pc_game(payload: dict) -> dict:
+    """Run the host-side game reconciler for one PCGA-managed game.
+
+    This action exists specifically so the containerized portal never tries to
+    execute host binaries directly.  The browser talks to pcga-status, which
+    forwards the authenticated request to this privileged host control plane.
+    """
+    sid = _validate_game_set_id(payload.get("game_set_id") or payload.get("set_id"))
+    orchestrator = Path("/usr/local/sbin/pcga-game-orchestrator")
+    if not orchestrator.is_file() or not os.access(orchestrator, os.X_OK):
+        return {
+            "ok": False,
+            "action": "pc-game-retry",
+            "game_set_id": sid,
+            "error": "orchestrator-unavailable",
+            "detail": f"Host component missing or not executable: {orchestrator}",
+        }
+    try:
+        runtime = Path("/run/pcga-game-orchestrator")
+        docker_cfg = runtime / "docker"
+        config_home = runtime / "config"
+        cache_home = runtime / "cache"
+        for path in (runtime, docker_cfg, config_home, cache_home):
+            path.mkdir(parents=True, exist_ok=True)
+        child_env = os.environ.copy()
+        child_env.update({
+            "HOME": str(runtime),
+            "DOCKER_CONFIG": str(docker_cfg),
+            "XDG_CONFIG_HOME": str(config_home),
+            "XDG_CACHE_HOME": str(cache_home),
+        })
+        proc = subprocess.Popen(
+            [str(orchestrator), "--set-id", sid, "--force"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=child_env,
+        )
+    except OSError as exc:
+        return {
+            "ok": False,
+            "action": "pc-game-retry",
+            "game_set_id": sid,
+            "error": type(exc).__name__,
+            "detail": str(exc)[:400],
+        }
+    return {
+        "ok": True,
+        "action": "pc-game-retry",
+        "game_set_id": sid,
+        "pid": proc.pid,
+        "detail": "Source identity, metadata, installation and Wolf registration are being reconciled on the host.",
+    }
+
+
+def refresh_pc_game_compatibility(payload: dict) -> dict:
+    """Refresh external compatibility evidence without reinstalling the game."""
+    sid = _validate_game_set_id(payload.get("game_set_id") or payload.get("set_id"))
+    resolver = Path("/usr/local/sbin/pcga-game-compat-resolver")
+    if not resolver.is_file() or not os.access(resolver, os.X_OK):
+        return {"ok": False, "action": "pc-game-compat-refresh", "game_set_id": sid,
+                "error": "resolver-unavailable", "detail": f"Host component missing or not executable: {resolver}"}
+    proc = run([str(resolver), "--set-id", sid, "--force", "--print"], timeout=75)
+    profile = {}
+    if proc.returncode == 0:
+        try:
+            profile = json.loads(proc.stdout or "{}")
+        except Exception:
+            profile = {}
+    return {
+        "ok": proc.returncode == 0, "action": "pc-game-compat-refresh", "game_set_id": sid,
+        "compatibility": profile if isinstance(profile, dict) else {},
+        "stdout": (proc.stdout or "")[-6000:] if proc.returncode else "",
+        "stderr": (proc.stderr or "")[-3000:],
+        "detail": "Compatibility evidence refreshed from enabled providers." if proc.returncode == 0 else "Compatibility refresh failed; existing cached profile was left intact.",
+    }
+
+
+def reconcile_pc_game_stream(payload: dict) -> dict:
+    """Reconcile one game's Wolf registration without reinstalling or network metadata work."""
+    sid = _validate_game_set_id(payload.get("game_set_id") or payload.get("set_id"))
+    orchestrator = Path("/usr/local/sbin/pcga-game-orchestrator")
+    if not orchestrator.is_file() or not os.access(orchestrator, os.X_OK):
+        return {"ok": False, "action": "pc-game-stream-reconcile", "game_set_id": sid,
+                "error": "orchestrator-unavailable", "detail": f"Host component missing or not executable: {orchestrator}"}
+    runtime = Path("/run/pcga-game-orchestrator")
+    docker_cfg = runtime / "docker"
+    config_home = runtime / "config"
+    cache_home = runtime / "cache"
+    for path in (runtime, docker_cfg, config_home, cache_home):
+        path.mkdir(parents=True, exist_ok=True)
+    child_env = os.environ.copy()
+    child_env.update({
+        "HOME": str(runtime),
+        "DOCKER_CONFIG": str(docker_cfg),
+        "XDG_CONFIG_HOME": str(config_home),
+        "XDG_CACHE_HOME": str(cache_home),
+    })
+    proc = run([str(orchestrator), "--set-id", sid, "--metadata-only", "--no-network", "--force"], timeout=180, env=child_env)
+    return {
+        "ok": proc.returncode == 0, "action": "pc-game-stream-reconcile", "game_set_id": sid,
+        "stdout": (proc.stdout or "")[-4000:], "stderr": (proc.stderr or "")[-2000:],
+        "detail": "Wolf registration reconciliation completed." if proc.returncode == 0 else "Wolf registration reconciliation failed.",
+    }
+
+
+
+def _validate_pcga_client_id(value) -> str:
+    client_id = str(value or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", client_id):
+        raise ValueError("invalid PCGA client id")
+    return client_id
+
+
+def _pc_game_session_owner_state() -> dict:
+    raw = load_json(PC_GAME_SESSION_OWNER_PATH)
+    return {
+        "schema": 1,
+        "version": VERSION,
+        "reservations": raw.get("reservations") if isinstance(raw.get("reservations"), dict) else {},
+        "containers": raw.get("containers") if isinstance(raw.get("containers"), dict) else {},
+    }
+
+
+def _pc_game_session_owner_save(state: dict) -> None:
+    state["schema"] = 1
+    state["version"] = VERSION
+    atomic_json(PC_GAME_SESSION_OWNER_PATH, state, 0o600)
+
+
+def _pc_game_started_epoch(value: str) -> float:
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+
+def _pc_game_reconcile_session_owners(sessions: list[dict]) -> tuple[list[dict], dict]:
+    """Attach durable portal-client ownership to newly created Wolf containers.
+
+    Wolf names a Docker child only after GameStream launch. PCGA therefore
+    reserves a Moonlight lane first, then claims the first matching runtime
+    container created after that reservation. The mapping lives on the host and
+    survives portal reloads while the container remains active.
+    """
+    now_ts = time.time()
+    active_ids = {str(x.get("container_id") or "") for x in sessions if x.get("container_id")}
+    with PC_GAME_SESSION_OWNER_LOCK:
+        state = _pc_game_session_owner_state()
+        reservations = state["reservations"]
+        containers = state["containers"]
+        changed = False
+
+        for cid in list(containers):
+            if cid not in active_ids:
+                owner = containers.pop(cid, None)
+                rid = str(owner.get("reservation_id") or "") if isinstance(owner, dict) else ""
+                if rid and isinstance(reservations.get(rid), dict) and str(reservations[rid].get("container_id") or "") == cid:
+                    reservations.pop(rid, None)
+                changed = True
+
+        for rid, row in list(reservations.items()):
+            if not isinstance(row, dict):
+                reservations.pop(rid, None); changed = True; continue
+            cid = str(row.get("container_id") or "")
+            age = now_ts - float(row.get("reserved_at") or 0)
+            if cid and cid in active_ids:
+                continue
+            if age > 300:
+                reservations.pop(rid, None); changed = True
+
+        claimed_reservations = {str(v.get("reservation_id") or "") for v in containers.values() if isinstance(v, dict)}
+        for session in sorted(sessions, key=lambda x: str(x.get("started_at") or "")):
+            cid = str(session.get("container_id") or "")
+            if not cid or cid in containers:
+                continue
+            sid = str(session.get("game_set_id") or "")
+            started = _pc_game_started_epoch(str(session.get("started_at") or ""))
+            candidates = []
+            for rid, row in reservations.items():
+                if rid in claimed_reservations or not isinstance(row, dict):
+                    continue
+                if str(row.get("game_set_id") or "") != sid:
+                    continue
+                requested_variant = str(row.get("launch_variant") or "")
+                session_variant = str(session.get("launch_variant") or "")
+                if requested_variant and session_variant and requested_variant != session_variant:
+                    continue
+                reserved_at = float(row.get("reserved_at") or 0)
+                if started and reserved_at and started < reserved_at - 2:
+                    continue
+                candidates.append((reserved_at, rid, row))
+            if not candidates:
+                continue
+            _, rid, row = sorted(candidates, key=lambda x: x[0])[0]
+            owner = {
+                "client_id": str(row.get("client_id") or ""),
+                "lane": int(row.get("lane") or 0),
+                "reservation_id": rid,
+                "game_set_id": sid,
+                "launch_variant": row.get("launch_variant") or session.get("launch_variant") or None,
+                "active_disc": int(row.get("active_disc") or 1),
+                "claimed_at": now_ts,
+            }
+            containers[cid] = owner
+            row["container_id"] = cid
+            row["claimed_at"] = now_ts
+            claimed_reservations.add(rid)
+            changed = True
+
+        decorated = []
+        for session in sessions:
+            row = dict(session)
+            owner = containers.get(str(row.get("container_id") or ""))
+            if isinstance(owner, dict):
+                row.update({
+                    "owner_client_id": owner.get("client_id") or None,
+                    "lane": owner.get("lane") or None,
+                    "reservation_id": owner.get("reservation_id") or None,
+                    "launch_variant": owner.get("launch_variant") or row.get("launch_variant") or None,
+                    "active_disc": owner.get("active_disc") or 1,
+                    "resumable": bool(owner.get("reservation_id") and owner.get("lane")),
+                    "stream_id": "pcga:" + str(row.get("game_set_id") or ""),
+                })
+            else:
+                row.update({"owner_client_id": None, "lane": None, "reservation_id": None, "active_disc": None, "resumable": False, "stream_id": "pcga:" + str(row.get("game_set_id") or "")})
+            decorated.append(row)
+        if changed:
+            _pc_game_session_owner_save(state)
+        return decorated, state
+
+
+def reserve_pc_game_session(payload: dict) -> dict:
+    client_id = _validate_pcga_client_id(payload.get("client_id"))
+    sid = _validate_game_set_id(payload.get("game_set_id") or payload.get("set_id"))
+    variant = str(payload.get("launch_variant") or payload.get("variant") or "").strip().casefold()
+    if variant and not re.fullmatch(r"[a-z0-9._-]{1,40}", variant):
+        raise ValueError("invalid PC game launch variant")
+    lane_count = max(1, min(PC_GAME_SESSION_LANES, int(payload.get("lane_count") or PC_GAME_SESSION_LANES)))
+    listing = pc_game_sessions()
+    if not listing.get("ok"):
+        return listing
+    now_ts = time.time()
+    with PC_GAME_SESSION_OWNER_LOCK:
+        state = _pc_game_session_owner_state()
+        used = {int(x.get("lane") or 0) for x in listing.get("sessions") or [] if int(x.get("lane") or 0) > 0}
+        for row in state["reservations"].values():
+            if not isinstance(row, dict):
+                continue
+            pending = now_ts - float(row.get("reserved_at") or 0) <= 300 and not row.get("container_id")
+            if pending and str(row.get("game_set_id") or "") == sid:
+                return {
+                    "ok": False, "action": "pc-game-session-reserve", "error": "same-game-launch-pending",
+                    "detail": "Another launch of this same PC game is still being claimed by Wolf. Wait for that desktop to open, then launch the next instance.",
+                }
+            if pending:
+                lane = int(row.get("lane") or 0)
+                if lane:
+                    used.add(lane)
+        lane = next((n for n in range(1, lane_count + 1) if n not in used), 0)
+        if not lane:
+            return {
+                "ok": False, "action": "pc-game-session-reserve", "error": "no-stream-lane",
+                "detail": f"All {lane_count} browser-stream lanes are in use. End one of your sessions, or wait for another appliance client to free a lane.",
+                "active": len(listing.get("sessions") or []), "reserved_lanes": len(used), "lane_count": lane_count,
+            }
+        rid = uuid.uuid4().hex
+        state["reservations"][rid] = {
+            "client_id": client_id, "game_set_id": sid, "lane": lane,
+            "launch_variant": variant or None,
+            "active_disc": 1, "reserved_at": now_ts, "container_id": None,
+        }
+        _pc_game_session_owner_save(state)
+    return {
+        "ok": True, "action": "pc-game-session-reserve", "reservation_id": rid,
+        "client_id": client_id, "game_set_id": sid, "lane": lane, "launch_variant": variant or None,
+        "browser_port": 8100 + lane, "lane_count": lane_count,
+        "detail": f"Reserved browser-stream lane {lane} for this client.",
+    }
+
+
+def claim_pc_game_session(payload: dict) -> dict:
+    client_id = _validate_pcga_client_id(payload.get("client_id"))
+    rid = str(payload.get("reservation_id") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", rid):
+        raise ValueError("invalid PC game session reservation id")
+    listing = pc_game_sessions()
+    if not listing.get("ok"):
+        return listing
+    for row in listing.get("sessions") or []:
+        if row.get("reservation_id") == rid and row.get("owner_client_id") == client_id:
+            return {"ok": True, "action": "pc-game-session-claim", "claimed": True, "session": row, "container_id": row.get("container_id")}
+    with PC_GAME_SESSION_OWNER_LOCK:
+        state = _pc_game_session_owner_state()
+        reservation = state["reservations"].get(rid)
+    if not isinstance(reservation, dict) or reservation.get("client_id") != client_id:
+        return {"ok": False, "action": "pc-game-session-claim", "error": "reservation-not-found", "detail": "The stream reservation is no longer active."}
+    return {"ok": True, "action": "pc-game-session-claim", "claimed": False, "reservation_id": rid, "lane": reservation.get("lane")}
+
+
+def release_pc_game_session(payload: dict) -> dict:
+    client_id = _validate_pcga_client_id(payload.get("client_id"))
+    rid = str(payload.get("reservation_id") or "").strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", rid):
+        raise ValueError("invalid PC game session reservation id")
+    with PC_GAME_SESSION_OWNER_LOCK:
+        state = _pc_game_session_owner_state()
+        row = state["reservations"].get(rid)
+        if isinstance(row, dict) and row.get("client_id") == client_id and not row.get("container_id"):
+            state["reservations"].pop(rid, None)
+            _pc_game_session_owner_save(state)
+            return {"ok": True, "action": "pc-game-session-release", "released": True}
+    return {"ok": True, "action": "pc-game-session-release", "released": False}
+
+def _pc_game_runtime_record(raw: dict, *, include_stopped: bool = False) -> dict|None:
+    """Return a safe summary for one Wolf-owned PCGA runtime container.
+
+    The control plane never accepts a container name alone as authority. A
+    session must carry PCGA_GAME_SET_ID and use a PCGA runtime image before the
+    portal may terminate it. This keeps the session manager from becoming an
+    arbitrary Docker stop endpoint.
+    """
+    if not isinstance(raw, dict):
+        return None
+    config = raw.get("Config") if isinstance(raw.get("Config"), dict) else {}
+    state = raw.get("State") if isinstance(raw.get("State"), dict) else {}
+    running = bool(state.get("Running"))
+    if not running and not include_stopped:
+        return None
+    name = str(raw.get("Name") or "").lstrip("/")
+    image = str(config.get("Image") or "")
+    env = {}
+    for item in config.get("Env") or []:
+        if isinstance(item, str) and "=" in item:
+            key, value = item.split("=", 1)
+            env[key] = value
+    sid = str(env.get("PCGA_GAME_SET_ID") or "").strip()
+    if not re.fullmatch(r"[0-9A-Za-z._-]{8,80}", sid):
+        return None
+    managed_name = bool(re.fullmatch(r"PCGA-(?:Setup-)?[A-Za-z0-9_.-]+", name))
+    managed_image = image.startswith("pcga/game-") or image.startswith("pcga/setup-")
+    if not (managed_name and managed_image):
+        return None
+    setup = name.startswith("PCGA-Setup-") or image.startswith("pcga/setup-")
+    launch_variant = str(env.get("PCGA_LAUNCH_VARIANT") or "").strip() or None
+    title = ""
+    try:
+        state_doc = json.loads((PC_GAME_STATE_ROOT / f"{sid}.json").read_text(encoding="utf-8"))
+        if isinstance(state_doc, dict):
+            title = str(state_doc.get("title") or "").strip()
+    except Exception:
+        pass
+    if not title:
+        prefix = "PCGA-Setup-" if setup else "PCGA-"
+        title = re.sub(r"[_-][0-9]{8,}$", "", name.removeprefix(prefix)).replace("-", " ").strip() or "PC Game"
+    started = str(state.get("StartedAt") or "")
+    age_seconds = None
+    if started:
+        try:
+            dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+            age_seconds = max(0, int((datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()))
+        except Exception:
+            pass
+    host_config = raw.get("HostConfig") if isinstance(raw.get("HostConfig"), dict) else {}
+    network_settings = raw.get("NetworkSettings") if isinstance(raw.get("NetworkSettings"), dict) else {}
+    networks = network_settings.get("Networks") if isinstance(network_settings.get("Networks"), dict) else {}
+    lan = networks.get("legacy-games") if isinstance(networks.get("legacy-games"), dict) else {}
+    cid = str(raw.get("Id") or "")
+    return {
+        "container_id": cid,
+        "container_short_id": cid[:12],
+        "name": name,
+        "game_set_id": sid,
+        "title": title,
+        "launch_variant": launch_variant,
+        "kind": "setup" if setup else "game",
+        "image": image,
+        "started_at": started,
+        "age_seconds": age_seconds,
+        "network_mode": str(host_config.get("NetworkMode") or ""),
+        "lan_network": "legacy-games" if lan else "",
+        "lan_ip": str(lan.get("IPAddress") or ""),
+        "running": running,
+        "container_status": str(state.get("Status") or ""),
+    }
+
+
+def pc_game_sessions(payload: dict|None = None) -> dict:
+    """List active Wolf-created PCGA runtimes with optional client ownership scope.
+
+    Pending stream reservations are reported as counts as well. This lets a
+    browser client release a launch that never reached the Wolf-container claim
+    step instead of silently occupying a Moonlight lane for the full timeout.
+    """
+    ps = run(["docker", "ps", "-q"], timeout=15)
+    if ps.returncode != 0:
+        return {"ok": False, "action": "pc-game-session-list", "error": "docker-unavailable", "detail": (ps.stderr or ps.stdout)[-800:]}
+    ids = [x.strip() for x in ps.stdout.splitlines() if x.strip()]
+    sessions = []
+    if ids:
+        inspected = run(["docker", "inspect", *ids], timeout=25)
+        if inspected.returncode != 0:
+            return {"ok": False, "action": "pc-game-session-list", "error": "docker-inspect-failed", "detail": (inspected.stderr or inspected.stdout)[-800:]}
+        try:
+            raw = json.loads(inspected.stdout)
+        except Exception as exc:
+            return {"ok": False, "action": "pc-game-session-list", "error": "invalid-docker-inspect", "detail": str(exc)[:300]}
+        for item in raw if isinstance(raw, list) else []:
+            record = _pc_game_runtime_record(item)
+            if record:
+                sessions.append(record)
+    sessions.sort(key=lambda x: str(x.get("started_at") or ""))
+    sessions, owner_state = _pc_game_reconcile_session_owners(sessions)
+    total_count = len(sessions)
+    pending_rows = [
+        row for row in owner_state.get("reservations", {}).values()
+        if isinstance(row, dict) and not row.get("container_id")
+    ]
+    total_pending_count = len(pending_rows)
+    payload = payload if isinstance(payload, dict) else {}
+    client_raw = str(payload.get("client_id") or "").strip()
+    pending_count = total_pending_count
+    if client_raw:
+        client_id = _validate_pcga_client_id(client_raw)
+        sessions = [dict(x, owned_by_request=True) for x in sessions if x.get("owner_client_id") == client_id]
+        pending_count = sum(1 for row in pending_rows if row.get("client_id") == client_id)
+    return {
+        "ok": True, "action": "pc-game-session-list", "sessions": sessions,
+        "count": len(sessions), "total_count": total_count,
+        "pending_count": pending_count, "total_pending_count": total_pending_count,
+    }
+
+def stop_pc_game_session(payload: dict) -> dict:
+    """Terminate selected PCGA runtime sessions, then nudge deferred Wolf work.
+
+    docker stop provides a short graceful window so the generated runtime can
+    forward SIGTERM to Wine. Docker performs the forced kill if the process does
+    not exit before that window expires.
+    """
+    listing = pc_game_sessions()
+    if not listing.get("ok"):
+        return listing
+    sessions = list(listing.get("sessions") or [])
+    target_id = str(payload.get("container_id") or "").strip()
+    target_sid = str(payload.get("game_set_id") or payload.get("set_id") or "").strip()
+    reservation_id = str(payload.get("reservation_id") or "").strip()
+    client_raw = str(payload.get("client_id") or "").strip()
+    client_id = _validate_pcga_client_id(client_raw) if client_raw else ""
+    stop_all = bool(payload.get("all"))
+    if target_id and not re.fullmatch(r"[0-9a-fA-F]{12,64}", target_id):
+        raise ValueError("invalid PC game runtime container id")
+    if target_sid:
+        target_sid = _validate_game_set_id(target_sid)
+    if reservation_id and not re.fullmatch(r"[0-9a-f]{32}", reservation_id):
+        raise ValueError("invalid PC game session reservation id")
+    visible = [x for x in sessions if (not client_id or x.get("owner_client_id") == client_id)]
+    released_pending = []
+    if stop_all and client_id:
+        with PC_GAME_SESSION_OWNER_LOCK:
+            owner_state = _pc_game_session_owner_state()
+            for rid, row in list(owner_state["reservations"].items()):
+                if isinstance(row, dict) and row.get("client_id") == client_id and not row.get("container_id"):
+                    released_pending.append(rid)
+                    owner_state["reservations"].pop(rid, None)
+            if released_pending:
+                _pc_game_session_owner_save(owner_state)
+    if stop_all:
+        targets = visible
+    elif reservation_id:
+        targets = [x for x in visible if x.get("reservation_id") == reservation_id]
+    elif target_id:
+        targets = [x for x in visible if str(x.get("container_id") or "").startswith(target_id)]
+    elif target_sid:
+        targets = [x for x in visible if x.get("game_set_id") == target_sid]
+    else:
+        raise ValueError("container_id, reservation_id, game_set_id, or all=true is required")
+    if not targets:
+        released = False
+        removed_inactive = []
+        if reservation_id and client_id:
+            release = release_pc_game_session({"client_id": client_id, "reservation_id": reservation_id})
+            released = bool(release.get("released")) if isinstance(release, dict) else False
+        # The runtime may have exited between the browser's last session poll and
+        # this request. It is still safe and useful to remove that transient
+        # Docker object after validating its PCGA name/image/environment.
+        if target_id:
+            inspect = run(["docker", "inspect", target_id], timeout=12)
+            if inspect.returncode == 0:
+                try:
+                    rows = json.loads(inspect.stdout)
+                    stale = _pc_game_runtime_record(rows[0] if isinstance(rows, list) and rows else {}, include_stopped=True)
+                except Exception:
+                    stale = None
+                if stale and not stale.get("running"):
+                    rm = run(["docker", "rm", "-f", str(stale.get("container_id") or target_id)], timeout=15)
+                    if rm.returncode == 0 or "No such container" in ((rm.stderr or "") + (rm.stdout or "")):
+                        removed_inactive.append({**stale, "result": "removed-after-exit"})
+        return {
+            "ok": True,
+            "action": "pc-game-session-stop",
+            "stopped": removed_inactive,
+            "released_reservation": released,
+            "released_reservations": released_pending,
+            "remaining": len(sessions),
+            "detail": (
+                "Removed the already-exited PCGA runtime container."
+                if removed_inactive else
+                f"Released {len(released_pending)} pending browser-stream reservation(s) for this client."
+                if released_pending else
+                "Released the pending browser-stream reservation before a runtime container was created."
+                if released else "The selected PCGA game session had already ended."
+            ),
+        }
+    stopped = []
+    failed = []
+    # Re-check each target immediately before stopping so a stale browser list
+    # cannot be used to terminate a replacement container with the same name.
+    for target in targets:
+        cid = str(target.get("container_id") or "")
+        verify = run(["docker", "inspect", cid], timeout=12)
+        if verify.returncode != 0:
+            stopped.append({**target, "result": "already-ended"})
+            continue
+        try:
+            rows = json.loads(verify.stdout)
+            current = _pc_game_runtime_record(rows[0] if isinstance(rows, list) and rows else {})
+        except Exception:
+            current = None
+        if not current or current.get("container_id") != cid:
+            failed.append({**target, "detail": "Container no longer matches a managed PCGA runtime session"})
+            continue
+        proc = run(["docker", "stop", "-t", "6", cid], timeout=20)
+        # Stopping the game process is not enough: Wolf child containers are
+        # disposable desktops. Remove the container object as well so a stale
+        # compositor/helper cannot keep a lane busy or block the next Wolf reload.
+        rm = run(["docker", "rm", "-f", cid], timeout=20)
+        rm_missing = "No such container" in ((rm.stderr or "") + (rm.stdout or ""))
+        if (proc.returncode == 0 or rm.returncode == 0 or rm_missing) and (rm.returncode == 0 or rm_missing):
+            stopped.append({
+                **current,
+                "owner_client_id": target.get("owner_client_id"),
+                "lane": target.get("lane"),
+                "reservation_id": target.get("reservation_id"),
+                "result": "stopped-and-removed" if proc.returncode == 0 else "force-removed",
+            })
+        else:
+            detail = ((rm.stderr or rm.stdout) if rm.returncode else (proc.stderr or proc.stdout))[-500:]
+            failed.append({**current, "detail": detail or "docker stop/remove failed"})
+    if stopped:
+        with PC_GAME_SESSION_OWNER_LOCK:
+            owner_state = _pc_game_session_owner_state()
+            stopped_ids = {str(x.get("container_id") or "") for x in stopped}
+            stopped_reservations = {str(x.get("reservation_id") or "") for x in stopped if x.get("reservation_id")}
+            for cid in stopped_ids:
+                owner_state["containers"].pop(cid, None)
+            for rid in stopped_reservations:
+                owner_state["reservations"].pop(rid, None)
+            _pc_game_session_owner_save(owner_state)
+    remaining_result = pc_game_sessions()
+    remaining = int(remaining_result.get("count") or 0) if remaining_result.get("ok") else None
+    # A completed interactive installer is persistent host state. Finalize each
+    # stopped setup synchronously so End Session transitions the portal from the
+    # Setup app to the direct game app instead of making the user launch Setup
+    # again and wait for the periodic timer.
+    finalized=[]
+    setup_ids=sorted({str(x.get("game_set_id") or "") for x in stopped if x.get("kind") == "setup" and x.get("game_set_id")})
+    orchestrator=Path("/usr/local/sbin/pcga-game-orchestrator")
+    if setup_ids and orchestrator.is_file() and os.access(orchestrator, os.X_OK):
+        runtime=Path("/run/pcga-game-orchestrator"); docker_cfg=runtime/"docker"; config_home=runtime/"config"; cache_home=runtime/"cache"
+        for path in (runtime,docker_cfg,config_home,cache_home): path.mkdir(parents=True, exist_ok=True)
+        child_env=os.environ.copy(); child_env.update({"HOME":str(runtime),"DOCKER_CONFIG":str(docker_cfg),"XDG_CONFIG_HOME":str(config_home),"XDG_CACHE_HOME":str(cache_home)})
+        for sid in setup_ids:
+            proc=run([str(orchestrator),"--set-id",sid,"--metadata-only","--no-network"],timeout=180,env=child_env)
+            finalized.append({"game_set_id":sid,"ok":proc.returncode==0,"detail":((proc.stderr or proc.stdout)[-800:] if proc.returncode else "Installation finalized and stream registration reconciled.")})
+    # When the final session is gone, also wake the periodic orchestrator so any
+    # unrelated deferred Wolf app-catalog reload can complete immediately.
+    if remaining == 0:
+        run(["systemctl", "start", "--no-block", "pcga-game-orchestrator.service"], timeout=10)
+    ok = not failed and all(x.get("ok") for x in finalized)
+    return {
+        "ok": ok,
+        "action": "pc-game-session-stop",
+        "stopped": stopped,
+        "failed": failed,
+        "finalized": finalized,
+        "released_reservations": released_pending,
+        "remaining": remaining,
+        "detail": (
+            f"Ended {len(stopped)} PCGA game session{'s' if len(stopped) != 1 else ''}."
+            if ok else f"Ended {len(stopped)} session(s); {len(failed)} could not be terminated."
+        ),
+    }
+
+
+def _pcga_disc_image_files(bundle: Path) -> list[dict]:
+    """Describe preserved optical artifacts without reading or mutating payload data."""
+    rows=[]
+    allowed={".iso",".bin",".cue",".toc",".img",".nrg",".mdf",".mds",".ccd",".sub"}
+    try: children=sorted(bundle.iterdir(), key=lambda x:x.name.casefold())
+    except OSError: return rows
+    for q in children:
+        if not q.is_file() or q.suffix.casefold() not in allowed: continue
+        try:size=q.stat().st_size
+        except OSError:size=0
+        rows.append({"name":q.name,"format":q.suffix.casefold().lstrip('.'),"bytes":size})
+    return rows
+
+
+def _pcga_preserved_disc_copies() -> dict[str,list[dict]]:
+    root=read_root()
+    search_roots=[
+        root/"ingest/inbox/pc-games", root/"ingest/inbox/software", root/"ingest/inbox/disc-images",
+        root/"media/metadata-pending", root/"media/quarantine/unidentified", root/"media/quarantine/duplicates",
+    ]
+    found:dict[str,list[dict]]={}; seen=set()
+    for base in search_roots:
+        if not base.exists(): continue
+        # Canonical preservation bundles carry .pcga-game.json.  A fallback to
+        # .pcga-optical.json keeps partially-classified but successfully-ripped
+        # images visible to the user as well.
+        markers=list(base.rglob('.pcga-game.json'))
+        marker_parents={m.parent.resolve() for m in markers}
+        for marker in markers:
+            meta=load_json(marker); fp=str(meta.get('fingerprint') or '').strip()
+            if not fp: continue
+            bundle=marker.parent
+            key=(fp,str(bundle.resolve()))
+            if key in seen: continue
+            seen.add(key)
+            files=_pcga_disc_image_files(bundle)
+            try:rel=str(bundle.resolve().relative_to(root.resolve()))
+            except Exception:rel=bundle.name
+            found.setdefault(fp,[]).append({"path":rel,"files":files,"bytes":sum(int(x.get('bytes') or 0) for x in files if x.get('format') in {'iso','bin','img','nrg','mdf'}),"source":"game-sidecar"})
+        for optical in base.rglob('.pcga-optical.json'):
+            bundle=optical.parent
+            try: resolved=bundle.resolve()
+            except OSError: resolved=bundle
+            if resolved in marker_parents: continue
+            meta=load_json(optical); fp=str(meta.get('fingerprint') or '').strip()
+            if not fp: continue
+            files=_pcga_disc_image_files(bundle)
+            if not files: continue
+            key=(fp,str(resolved))
+            if key in seen: continue
+            seen.add(key)
+            try:rel=str(resolved.relative_to(root.resolve()))
+            except Exception:rel=bundle.name
+            found.setdefault(fp,[]).append({"path":rel,"files":files,"bytes":sum(int(x.get('bytes') or 0) for x in files if x.get('format') in {'iso','bin','img','nrg','mdf'}),"source":"optical-sidecar"})
+    return found
+
+
+def pc_game_disc_library(payload: dict|None=None) -> dict:
+    """Return title records plus every preservation-backed PC-game optical image."""
+    sets_dir=PC_GAME_INTAKE_ROOT/'sets'; discs_dir=PC_GAME_INTAKE_ROOT/'discs'
+    sets=[]; set_map={}
+    for p in sorted(sets_dir.glob('*.json')) if sets_dir.exists() else []:
+        d=load_json(p)
+        if not d: continue
+        sid=str(d.get('id') or p.stem)
+        row={"id":sid,"title":str(d.get('title') or 'Unidentified PC Game'),"sort_title":str(d.get('sort_title') or d.get('title') or ''),"provisional":bool(d.get('provisional')),"user_confirmed":bool(d.get('user_confirmed')),"disc_count":len((d.get('media') or {}).get('discs') or []) if isinstance(d.get('media'),dict) else len(d.get('disc_fingerprints') or [])}
+        sets.append(row);set_map[sid]=row
+    copies=_pcga_preserved_disc_copies(); rows=[]; seen=set()
+    for p in sorted(discs_dir.glob('*.json')) if discs_dir.exists() else []:
+        d=load_json(p)
+        if not d: continue
+        fp=str(d.get('fingerprint') or p.stem); seen.add(fp)
+        ids=[str(x) for x in (d.get('game_set_ids') or ([d.get('game_set_id')] if d.get('game_set_id') else [])) if x]
+        owners=[set_map[x] for x in ids if x in set_map]
+        cp=copies.get(fp,[])
+        rows.append({
+            "fingerprint":fp,"volume_label":d.get('volume_label'),"filesystem_type":d.get('filesystem_type'),
+            "layout":d.get('layout'),"disc_number":d.get('disc_number'),"disc_count":d.get('disc_count'),"disc_role":d.get('disc_role'),
+            "metadata_status":d.get('metadata_status'),"game_set_ids":ids,"owners":owners,"assigned":bool(ids),
+            "copies":cp,"copy_count":len(cp),"preserved":bool(cp),"bytes":sum(int(x.get('bytes') or 0) for x in cp),
+            "match":d.get('match') if isinstance(d.get('match'),dict) else {},"updated_at":d.get('updated_at'),
+        })
+    # A successful rip may be visible before metadata classification created the
+    # canonical fingerprint record. Keep it in the browser as an unassigned image.
+    for fp,cp in copies.items():
+        if fp in seen: continue
+        rows.append({"fingerprint":fp,"volume_label":None,"filesystem_type":None,"layout":"unknown","disc_number":None,"disc_count":None,"disc_role":None,"metadata_status":"preserved-unclassified","game_set_ids":[],"owners":[],"assigned":False,"copies":cp,"copy_count":len(cp),"preserved":True,"bytes":sum(int(x.get('bytes') or 0) for x in cp),"match":{},"updated_at":None})
+    rows.sort(key=lambda x:(not bool(x.get('preserved')), bool(x.get('assigned')), str(x.get('volume_label') or '').casefold(), str(x.get('fingerprint') or '')))
+    sets.sort(key=lambda x:str(x.get('sort_title') or x.get('title') or '').casefold())
+    return {"ok":True,"action":"pc-game-disc-library","version":VERSION,"items":rows,"sets":sets,"count":len(rows),"unassigned":sum(1 for x in rows if not x.get('assigned'))}
+
+
+def _pcga_start_reconcile(set_ids:list[str]) -> list[dict]:
+    out=[]; orchestrator=Path('/usr/local/sbin/pcga-game-orchestrator')
+    if not orchestrator.is_file(): return out
+    runtime=Path('/run/pcga-game-orchestrator'); docker_cfg=runtime/'docker'; config_home=runtime/'config'; cache_home=runtime/'cache'
+    for path in (runtime,docker_cfg,config_home,cache_home): path.mkdir(parents=True,exist_ok=True)
+    child_env=os.environ.copy();child_env.update({"HOME":str(runtime),"DOCKER_CONFIG":str(docker_cfg),"XDG_CONFIG_HOME":str(config_home),"XDG_CACHE_HOME":str(cache_home)})
+    for sid in dict.fromkeys(x for x in set_ids if x):
+        try:
+            proc=subprocess.Popen([str(orchestrator),'--set-id',sid,'--force'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True,close_fds=True,env=child_env)
+            out.append({"game_set_id":sid,"pid":proc.pid})
+        except OSError as exc: out.append({"game_set_id":sid,"error":type(exc).__name__,"detail":str(exc)[:200]})
+    return out
+
+
+def assign_pc_game_disc(payload: dict) -> dict:
+    fp=str(payload.get('fingerprint') or '').strip(); sid=_validate_game_set_id(payload.get('game_set_id') or payload.get('set_id'))
+    if not fp or len(fp)>256 or not re.fullmatch(r'[0-9A-Za-z._:+-]+',fp): raise ValueError('invalid disc fingerprint')
+    disc_path=PC_GAME_INTAKE_ROOT/'discs'/f'{fp}.json'; before=load_json(disc_path)
+    if not before:
+        # A freshly-preserved image can reach the inventory before the game
+        # classifier has emitted its canonical disc record. Recover enough
+        # metadata from the preservation sidecars to let the user own it now.
+        root=read_root(); recovered={}
+        for base in (root/'ingest/inbox/pc-games',root/'ingest/inbox/software',root/'ingest/inbox/disc-images',root/'media/metadata-pending',root/'media/quarantine/unidentified'):
+            if not base.exists(): continue
+            for marker in list(base.rglob('.pcga-game.json'))+list(base.rglob('.pcga-optical.json')):
+                doc=load_json(marker)
+                if str(doc.get('fingerprint') or '')!=fp: continue
+                if marker.name=='.pcga-game.json': recovered=dict(doc)
+                else:
+                    fs=doc.get('filesystem') if isinstance(doc.get('filesystem'),dict) else {}
+                    recovered={'schema':2,'fingerprint':fp,'layout':'unknown','game_set_id':None,'game_set_ids':[],'contents':[],
+                               'volume_label':fs.get('label'),'filesystem_type':fs.get('type'),'metadata_status':'preserved-unclassified',
+                               'metadata_sources':['preservation-sidecar'],'created_at':datetime.now(timezone.utc).isoformat(timespec='seconds'),
+                               'updated_at':datetime.now(timezone.utc).isoformat(timespec='seconds')}
+                if recovered: break
+            if recovered: break
+        if recovered:
+            disc_path.parent.mkdir(parents=True,exist_ok=True);atomic_json(disc_path,recovered);before=recovered
+    if not before: raise FileNotFoundError('disc metadata record not found')
+    previous=[str(x) for x in (before.get('game_set_ids') or ([before.get('game_set_id')] if before.get('game_set_id') else [])) if x]
+    cmd=['/usr/local/sbin/pcga-game-intake','assign-disc',fp,sid,'--confirm']
+    for key,flag in (('disc_number','--number'),('disc_count','--count')):
+        value=payload.get(key)
+        if value not in (None,''):
+            try:n=int(value)
+            except (TypeError,ValueError): raise ValueError(f'{key} must be an integer')
+            if n<1 or n>99: raise ValueError(f'{key} must be between 1 and 99')
+            cmd += [flag,str(n)]
+    role=str(payload.get('disc_role') or payload.get('role') or '').strip()
+    if role:
+        if len(role)>64 or any(ord(c)<32 for c in role): raise ValueError('invalid disc role')
+        cmd += ['--role',role]
+    if bool(payload.get('replace_compilation')): cmd.append('--replace-compilation')
+    proc=run(cmd,timeout=30)
+    if proc.returncode!=0:
+        return {"ok":False,"action":"pc-game-disc-assign","fingerprint":fp,"game_set_id":sid,"error":"assignment-failed","detail":((proc.stderr or proc.stdout) or 'assignment failed')[-1600:]}
+    try:disc=json.loads(proc.stdout or '{}')
+    except Exception:disc=load_json(disc_path)
+    reconcile=_pcga_start_reconcile(previous+[sid])
+    return {"ok":True,"action":"pc-game-disc-assign","fingerprint":fp,"game_set_id":sid,"disc":disc,"reconcile":reconcile,"detail":"Preserved disc ownership updated. The image payload and preservation checksums were not modified."}
+
+
+
+
+def _simple_env(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip().strip('"').strip("'")
+    return out
+
+
+def pc_game_metadata_config() -> dict:
+    env = _simple_env(GAME_METADATA_ENV)
+    provider = str(env.get("PCGA_GAME_DB_PROVIDER") or "rawg").strip().lower()
+    if provider not in {"rawg"}:
+        provider = "rawg"
+    return {
+        "provider": provider,
+        "rawg": {
+            "configured": bool(str(env.get("RAWG_API_KEY") or "").strip()),
+            "attribution": "RAWG",
+            "url": "https://rawg.io/",
+            "api_docs": "https://rawg.io/apidocs",
+        },
+        "igdb": {
+            "configured": bool(str(env.get("IGDB_CLIENT_ID") or "").strip() and str(env.get("IGDB_CLIENT_SECRET") or "").strip()),
+            "available": False,
+        },
+    }
+
+
+def configure_pc_game_metadata(payload: dict) -> dict:
+    provider = str(payload.get("provider") or "rawg").strip().lower()
+    if provider != "rawg":
+        raise ValueError("v0.18.69 currently supports RAWG for interactive PC-game database search")
+    values = {"PCGA_GAME_DB_PROVIDER": "rawg"}
+    if "rawg_api_key" in payload:
+        key = str(payload.get("rawg_api_key") or "").strip()
+        if any(ch in key for ch in "\r\n\0") or len(key) > 512:
+            raise ValueError("invalid RAWG API key")
+        # A blank key is deliberately ignored unless clear_rawg_api_key=true so
+        # reopening Settings never destroys a configured secret.
+        if key:
+            values["RAWG_API_KEY"] = key
+        elif bool(payload.get("clear_rawg_api_key")):
+            values["RAWG_API_KEY"] = ""
+    patch_env(GAME_METADATA_ENV, values)
+    cfg = pc_game_metadata_config()
+    return {"ok": True, "action": "pc-game-metadata-configure", "metadata": cfg, "detail": "PC game database settings saved."}
+
+
+def _game_db_http_json(url: str, *, timeout: float = 12.0, max_bytes: int = 4 * 1024 * 1024) -> dict:
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": AUDIO_USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raise RuntimeError("game database response exceeded PCGA safety limit")
+            data = json.loads(raw.decode("utf-8", "replace") or "{}")
+            if not isinstance(data, dict):
+                raise RuntimeError("game database returned an unexpected response")
+            return data
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(2048).decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        if exc.code in {401, 403}:
+            raise RuntimeError("RAWG rejected the configured API key") from exc
+        if exc.code == 429:
+            raise RuntimeError("RAWG rate limit reached; try the search again later") from exc
+        raise RuntimeError(f"RAWG returned HTTP {exc.code}: {detail[:500]}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"RAWG is unreachable: {exc.reason}") from exc
+
+
+def _rawg_api_key() -> str:
+    key = str(_simple_env(GAME_METADATA_ENV).get("RAWG_API_KEY") or "").strip()
+    if not key:
+        raise RuntimeError("RAWG is not configured. Add an API key under Settings → PC games & LAN sessions.")
+    return key
+
+
+def _rawg_request(path: str, params: dict | None = None) -> dict:
+    query = dict(params or {})
+    query["key"] = _rawg_api_key()
+    return _game_db_http_json("https://api.rawg.io/api" + path + "?" + urlencode(query))
+
+
+def _rawg_result(row: dict) -> dict:
+    platforms=[]
+    for item in row.get("platforms") or []:
+        if isinstance(item, dict) and isinstance(item.get("platform"), dict) and item["platform"].get("name"):
+            platforms.append(str(item["platform"]["name"]))
+    genres=[str(x.get("name")) for x in row.get("genres") or [] if isinstance(x,dict) and x.get("name")]
+    released=str(row.get("released") or "")
+    year=None
+    m=re.match(r"^(19|20)\d{2}", released)
+    if m:
+        year=int(released[:4])
+    slug=str(row.get("slug") or "")
+    return {
+        "provider":"rawg",
+        "provider_id":str(row.get("id") or ""),
+        "title":str(row.get("name") or "Untitled game"),
+        "released":released or None,
+        "release_year":year,
+        "platforms":platforms[:10],
+        "genres":genres[:10],
+        "image_url":row.get("background_image"),
+        "metacritic":row.get("metacritic"),
+        "rating":row.get("rating"),
+        "source_url":f"https://rawg.io/games/{quote(slug)}" if slug else "https://rawg.io/",
+        "attribution":"RAWG",
+    }
+
+
+def _metadata_search_norm(value: str) -> str:
+    value = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(value or ""))
+    value = value.casefold().replace("&", " and ")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", value).split())
+
+
+def _metadata_search_terms(query: str) -> list[str]:
+    """Generate useful search variants without rewriting the user's query.
+
+    Optical labels and provisional PCGA titles frequently contain transport/setup
+    noise (COD2CD1, setupBF2, syscheck, installer, DVD-ROM).  RAWG's precise
+    search is much more useful when those tokens are also removed, but the raw
+    user-entered title remains the first and highest-authority search term.
+    """
+    raw = " ".join(str(query or "").strip().split())
+    terms: list[str] = []
+    def add(value: str) -> None:
+        value = " ".join(str(value or "").strip().split())
+        if len(value) >= 2 and value.casefold() not in {x.casefold() for x in terms}:
+            terms.append(value[:180])
+    add(raw)
+    split = re.sub(r"([a-z])([A-Z])", r"\1 \2", raw)
+    split = re.sub(r"[_\-.]+", " ", split)
+    add(split)
+    clean = split
+    # Remove only unmistakable media/setup tokens.  Standalone numbers are kept
+    # because they are often sequel numbers (Call of Duty 2, Battlefield 2).
+    clean = re.sub(r"(?i)(?:\b|(?<=[a-z0-9]))(?:cd|disc|disk|dvd)[ _-]*\d{1,2}\b", " ", clean)
+    clean = re.sub(r"(?i)\b(?:cdrom|dvdrom|setup|installer|install|autorun|syscheck|launcher|launch|uninstall|patcher|updater|update|game ?data)\b", " ", clean)
+    clean = re.sub(r"(?i)\b(?:cdkey|keygen)\b", " ", clean)
+    clean = " ".join(clean.split())
+    add(clean)
+    # A second variant drops common packaging suffixes while leaving the original
+    # edition-aware query available for exact matches.
+    broad = re.sub(r"(?i)\b(?:game of the year|goty|gold|platinum|collector'?s|collectors|limited|deluxe|special|complete|ultimate)\s+edition\b", " ", clean)
+    broad = " ".join(broad.split())
+    add(broad)
+    return terms[:4]
+
+
+def _metadata_match_score(query_terms: list[str], result: dict) -> float:
+    title = _metadata_search_norm(str(result.get("title") or ""))
+    if not title:
+        return 0.0
+    best = 0.0
+    for term in query_terms:
+        q = _metadata_search_norm(term)
+        if not q:
+            continue
+        if q == title:
+            score = 1.0
+        else:
+            ratio = difflib.SequenceMatcher(None, q, title).ratio()
+            qtok, ttok = set(q.split()), set(title.split())
+            overlap = len(qtok & ttok) / max(1, len(qtok | ttok))
+            prefix = 1.0 if (title.startswith(q + " ") or q.startswith(title + " ")) else 0.0
+            score = ratio * 0.68 + overlap * 0.24 + prefix * 0.08
+        best = max(best, score)
+    platforms = {str(x).casefold() for x in result.get("platforms") or []}
+    if any("pc" == x or "windows" in x for x in platforms):
+        best = min(1.0, best + 0.035)
+    # When PCGA is cleaning a setup/disc-derived title, do not let an unrelated
+    # utility/product whose *actual* catalog title is "Setup ..." outrank a
+    # plausible game returned by the cleaned query variant.
+    noise={"setup","installer","install","syscheck","updater","update","launcher","cdkey"}
+    title_tokens=set(title.split())
+    cleaned_exists=any(not (set(_metadata_search_norm(t).split()) & noise) for t in query_terms[1:])
+    if cleaned_exists and title_tokens & noise:
+        best=max(0.0,best-0.30)
+    return round(best, 4)
+
+
+def _rawg_direct_lookup(query: str) -> dict | None:
+    """Resolve a pasted RAWG URL or numeric id directly into a search result."""
+    q = str(query or "").strip()
+    target = ""
+    if q.isdigit() and 1 <= len(q) <= 12:
+        target = q
+    else:
+        try:
+            parsed = urlparse(q)
+        except Exception:
+            parsed = None
+        if parsed and parsed.scheme in {"http", "https"} and (parsed.hostname or "").lower().endswith("rawg.io"):
+            parts = [x for x in (parsed.path or "").split("/") if x]
+            if "games" in parts:
+                idx = parts.index("games")
+                if idx + 1 < len(parts):
+                    target = parts[idx + 1]
+    if not target:
+        return None
+    try:
+        data = _rawg_request("/games/" + quote(target, safe=""))
+    except Exception:
+        return None
+    return _rawg_result(data) if data.get("id") else None
+
+
+def search_pc_game_metadata(payload: dict) -> dict:
+    query = " ".join(str(payload.get("query") or payload.get("q") or "").strip().split())
+    if len(query) < 2 or len(query) > 180:
+        raise ValueError("metadata search query must contain 2-180 characters")
+    terms = _metadata_search_terms(query)
+    collected: dict[str, dict] = {}
+
+    direct = _rawg_direct_lookup(query)
+    if direct and direct.get("provider_id"):
+        direct["matched_search_term"] = query
+        direct["match_score"] = 1.0
+        direct["match_reason"] = "direct RAWG record"
+        return {
+            "ok":True,
+            "action":"pc-game-metadata-search",
+            "provider":"rawg",
+            "query":query,
+            "search_terms":[query],
+            "results":[direct],
+            "attribution":{"name":"RAWG","url":"https://rawg.io/","required":True},
+        }
+
+    # Search both precise and broad modes.  The previous implementation only
+    # broadened when RAWG returned *zero* PC results, which meant a few weak
+    # matches could hide the correct legacy title entirely.
+    plans: list[tuple[str, bool, bool]] = []
+    if terms:
+        plans.append((terms[0], True, True))
+        plans.append((terms[0], False, True))
+    for term in terms[1:]:
+        plans.append((term, False, True))
+    # Global fallback is useful for old Windows releases whose RAWG platform
+    # tagging is incomplete.  Only one broad global request is needed.
+    if terms:
+        plans.append((terms[-1], False, False))
+
+    seen_plans: set[tuple[str, bool, bool]] = set()
+    for term, precise, pc_only in plans[:6]:
+        key=(term.casefold(), precise, pc_only)
+        if key in seen_plans:
+            continue
+        seen_plans.add(key)
+        params={"search":term,"page_size":"24"}
+        if precise:
+            params["search_precise"]="true"
+        if pc_only:
+            params["platforms"]="4"
+        try:
+            data=_rawg_request("/games",params)
+        except RuntimeError:
+            # Preserve a useful result set when one fallback request fails after
+            # an earlier provider request already succeeded.
+            if not collected:
+                raise
+            continue
+        rows=data.get("results") if isinstance(data.get("results"),list) else []
+        for row in rows:
+            if not isinstance(row,dict):
+                continue
+            item=_rawg_result(row)
+            pid=str(item.get("provider_id") or "")
+            if not pid:
+                continue
+            score=_metadata_match_score(terms,item)
+            item["match_score"]=score
+            item["matched_search_term"]=term
+            item["match_reason"]=("precise PC" if precise and pc_only else "PC catalog" if pc_only else "global fallback")
+            previous=collected.get(pid)
+            if previous is None or score > float(previous.get("match_score") or 0):
+                collected[pid]=item
+
+    results=sorted(
+        collected.values(),
+        key=lambda x:(-float(x.get("match_score") or 0), -(int(x.get("release_year") or 0)), str(x.get("title") or "").casefold()),
+    )[:30]
+    return {
+        "ok":True,
+        "action":"pc-game-metadata-search",
+        "provider":"rawg",
+        "query":query,
+        "search_terms":terms,
+        "results":results,
+        "attribution":{"name":"RAWG","url":"https://rawg.io/","required":True},
+    }
+
+
+def _strip_html(value: str) -> str:
+    text=re.sub(r"<[^>]+>"," ",str(value or ""))
+    return re.sub(r"\s+"," ",html_lib.unescape(text)).strip()
+
+
+def _rawg_profile(provider_id: str) -> dict:
+    if not provider_id.isdigit():
+        raise ValueError("invalid RAWG game id")
+    data=_rawg_request(f"/games/{provider_id}")
+    if not data.get("id"):
+        raise RuntimeError("RAWG game record was not found")
+    shots=[]
+    try:
+        shot_data=_rawg_request(f"/games/{provider_id}/screenshots",{"page_size":"6"})
+        shots=[str(x.get("image")) for x in shot_data.get("results") or [] if isinstance(x,dict) and x.get("image")][:6]
+    except Exception:
+        shots=[]
+    devs=[str(x.get("name")) for x in data.get("developers") or [] if isinstance(x,dict) and x.get("name")]
+    pubs=[str(x.get("name")) for x in data.get("publishers") or [] if isinstance(x,dict) and x.get("name")]
+    genres=[str(x.get("name")) for x in data.get("genres") or [] if isinstance(x,dict) and x.get("name")]
+    tags=[str(x.get("name")) for x in data.get("tags") or [] if isinstance(x,dict) and x.get("name")]
+    platforms=[]
+    for item in data.get("platforms") or []:
+        if isinstance(item,dict) and isinstance(item.get("platform"),dict) and item["platform"].get("name"):
+            platforms.append(str(item["platform"]["name"]))
+    released=str(data.get("released") or "")
+    year=None
+    m=re.match(r"^(19|20)\d{2}",released)
+    if m: year=int(released[:4])
+    slug=str(data.get("slug") or "")
+    source_url=f"https://rawg.io/games/{quote(slug)}" if slug else "https://rawg.io/"
+    primary=str(data.get("background_image") or "")
+    secondary=str(data.get("background_image_additional") or "") or primary
+    description=str(data.get("description_raw") or "").strip() or _strip_html(data.get("description") or "")
+    esrb=data.get("esrb_rating") if isinstance(data.get("esrb_rating"),dict) else {}
+    return {
+        "title":str(data.get("name") or "Untitled game"),
+        "sort_title":str(data.get("name") or "Untitled game"),
+        "normalized_title":" ".join(re.sub(r"[^a-z0-9]+"," ",str(data.get("name") or "").casefold()).split()),
+        "release_date":released or None,
+        "release_year":year,
+        "developer":", ".join(devs[:6]) or None,
+        "publisher":", ".join(pubs[:6]) or None,
+        "genres":genres[:16],
+        "categories":tags[:20],
+        "description":description[:12000],
+        "marketing_description":description[:12000],
+        "website":str(data.get("website") or "") or None,
+        "external_ids":{"rawg":str(data.get("id"))},
+        "platform":"PC",
+        "database_platforms":platforms[:16],
+        "esrb_rating":str(esrb.get("name") or "") or None,
+        "metacritic":data.get("metacritic"),
+        "database_rating":data.get("rating"),
+        "database_ratings_count":data.get("ratings_count"),
+        "marketing_assets":{
+            "cover_remote":primary or None,
+            "header_remote":secondary or None,
+            "screenshots_remote":shots,
+        },
+        "metadata_profile":{
+            "provider":"rawg",
+            "provider_id":str(data.get("id")),
+            "source_url":source_url,
+            "attribution":"RAWG",
+            "selected_by_user":True,
+            "locked_by_user":True,
+            "selected_at":datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+        "metadata_match":{
+            "provider":"rawg",
+            "id":str(data.get("id")),
+            "confidence":1.0,
+            "relation":"user-selected",
+            "matched_title":str(data.get("name") or "Untitled game"),
+            "updated_at":datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        },
+        "identity_source":"user-game-database",
+        "identity_confidence":1.0,
+        "provisional":False,
+        "user_confirmed":True,
+    }
+
+
+def preview_pc_game_metadata(payload: dict) -> dict:
+    provider=str(payload.get("provider") or "rawg").strip().lower()
+    if provider!="rawg":
+        raise ValueError("unsupported PC game database provider")
+    provider_id=str(payload.get("provider_id") or payload.get("id") or "").strip()
+    profile=_rawg_profile(provider_id)
+    metadata=dict(profile.get("metadata_profile") or {})
+    assets=dict(profile.get("marketing_assets") or {})
+    public={
+        "title":profile.get("title"),
+        "release_date":profile.get("release_date"),
+        "release_year":profile.get("release_year"),
+        "developer":profile.get("developer"),
+        "publisher":profile.get("publisher"),
+        "genres":profile.get("genres") or [],
+        "categories":profile.get("categories") or [],
+        "description":profile.get("description"),
+        "website":profile.get("website"),
+        "platforms":profile.get("database_platforms") or [],
+        "esrb_rating":profile.get("esrb_rating"),
+        "metacritic":profile.get("metacritic"),
+        "database_rating":profile.get("database_rating"),
+        "ratings_count":profile.get("database_ratings_count"),
+        "cover_url":assets.get("cover_remote"),
+        "hero_url":assets.get("header_remote"),
+        "screenshots":assets.get("screenshots_remote") or [],
+        "source_url":metadata.get("source_url"),
+        "attribution":metadata.get("attribution") or "RAWG",
+    }
+    return {
+        "ok":True,
+        "action":"pc-game-metadata-preview",
+        "provider":"rawg",
+        "provider_id":provider_id,
+        "profile":public,
+    }
+
+
+def _download_game_db_asset(url: str, dest_base: Path, stem: str) -> str | None:
+    if not url:
+        return None
+    parsed=urlparse(url)
+    host=(parsed.hostname or "").lower()
+    if parsed.scheme != "https" or not (host == "rawg.io" or host.endswith(".rawg.io")):
+        return None
+    req=urllib.request.Request(url,headers={"User-Agent":AUDIO_USER_AGENT,"Accept":"image/avif,image/webp,image/png,image/jpeg,*/*;q=0.5"})
+    try:
+        with urllib.request.urlopen(req,timeout=15) as resp:
+            ctype=str(resp.headers.get("Content-Type") or "").split(";",1)[0].strip().lower()
+            data=resp.read(12*1024*1024+1)
+        if not data or len(data)>12*1024*1024:
+            return None
+        ext={"image/jpeg":".jpg","image/png":".png","image/webp":".webp"}.get(ctype)
+        if not ext:
+            return None
+        dest_base.mkdir(parents=True,exist_ok=True)
+        for old in dest_base.glob(stem+".*"):
+            try: old.unlink()
+            except OSError: pass
+        out=dest_base/(stem+ext);out.write_bytes(data);return str(out)
+    except Exception:
+        return None
+
+
+def _existing_pc_game_set_for_profile(profile: dict) -> str | None:
+    pid=str((profile.get("external_ids") or {}).get("rawg") or "")
+    norm=str(profile.get("normalized_title") or "")
+    base=PC_GAME_INTAKE_ROOT/"sets"
+    if not base.exists(): return None
+    exact_title=None
+    for path in base.glob("*.json"):
+        rec=load_json(path)
+        if not rec: continue
+        ext=rec.get("external_ids") if isinstance(rec.get("external_ids"),dict) else {}
+        if pid and str(ext.get("rawg") or "")==pid:
+            return str(rec.get("id") or path.stem)
+        if norm and str(rec.get("normalized_title") or "")==norm:
+            exact_title=str(rec.get("id") or path.stem)
+    return exact_title
+
+
+
+def _pc_game_identity_aliases(value: object) -> set[str]:
+    key=" ".join(re.sub(r"[^a-z0-9]+"," ",str(value or "").casefold()).split())
+    if not key:
+        return set()
+    key=re.sub(r"(?:^|\s)(?:disc|disk|cd|dvd)\s*\d+(?:\s*(?:of|/)\s*\d+)?$"," ",key).strip()
+    key=re.sub(r"(?:disc|disk|cd|dvd)\d+(?:of\d+)?$","",key).strip()
+    words=re.findall(r"[a-z]+|\d+",key)
+    aliases=set()
+    compact="".join(words)
+    if len(compact)>=4:
+        aliases.add(compact)
+    if len(words)>=2:
+        acronym="".join((w if w.isdigit() else w[0]) for w in words if w)
+        if len(acronym)>=4:
+            aliases.add(acronym)
+    return aliases
+
+
+def _pc_game_metadata_runtime_score(set_id: str, group_disc_count: int = 0) -> tuple:
+    state=load_json(PC_GAME_STATE_ROOT/f"{set_id}.json")
+    game=load_json(PC_GAME_INTAKE_ROOT/"sets"/f"{set_id}.json")
+    status=str(state.get("status") or "")
+    stream=str(state.get("stream_state") or "")
+    score=0
+    if status=="ready":score+=1000
+    elif status=="setup-required":score+=600
+    elif status=="installing":score+=450
+    elif status in {"queued","source"}:score+=250
+    if state.get("launch_executable"):score+=220
+    if state.get("runtime_image"):score+=120
+    if stream=="ready":score+=180
+    elif stream=="setup-ready":score+=90
+    media=game.get("media") if isinstance(game.get("media"),dict) else {}
+    try:
+        disc_count=max(int(media.get("disc_count") or 0),int(state.get("source_logical_disc_count") or 0),int(group_disc_count or 0))
+    except (TypeError,ValueError):
+        disc_count=0
+    if str(state.get("install_method") or "").casefold()=="portable-copy" and disc_count>1:
+        # Never redirect selected metadata onto a known-invalid multi-disc
+        # portable migration when a real setup/prefix sibling exists.
+        score-=1200
+    return (score,str(state.get("updated_at") or state.get("created_at") or ""),set_id)
+
+
+def _pc_game_metadata_target(requested: str, fingerprint: str, profile: dict) -> str:
+    """Resolve metadata onto the strongest linked install/runtime UUID.
+
+    A metadata choice must decorate the working game; it must not create a
+    parallel pretty card while the usable Wine prefix remains under a raw disc
+    label UUID. Links come from persisted duplicate history and, for ordinary
+    single-title media, shared disc fingerprints.
+    """
+    sets_dir=PC_GAME_INTAKE_ROOT/"sets"
+    if not sets_dir.exists():
+        return requested
+    docs={}
+    for path in sets_dir.glob("*.json"):
+        rec=load_json(path)
+        if rec:docs[str(rec.get("id") or path.stem)]=rec
+    candidates=set()
+    if requested and requested in docs:candidates.add(requested)
+    rawg=str((profile.get("external_ids") or {}).get("rawg") or "").strip()
+    if rawg:
+        for sid,rec in docs.items():
+            ext=rec.get("external_ids") if isinstance(rec.get("external_ids"),dict) else {}
+            if str(ext.get("rawg") or "").strip()==rawg:candidates.add(sid)
+    # A user-selected retail title can identify a working runtime that still
+    # carries a mastering-label acronym (cod2 <-> Call of Duty 2). Keep this
+    # conservative and require aliases of at least four characters.
+    profile_aliases=_pc_game_identity_aliases(profile.get("title"))
+    requested_aliases=_pc_game_identity_aliases((docs.get(requested) or {}).get("title")) if requested else set()
+    wanted_aliases=profile_aliases|requested_aliases
+    if wanted_aliases:
+        for other,rec in docs.items():
+            if wanted_aliases & _pc_game_identity_aliases(rec.get("title")):
+                candidates.add(other)
+    if fingerprint:
+        disc=load_json(PC_GAME_INTAKE_ROOT/"discs"/f"{fingerprint}.json")
+        owners=disc.get("game_set_ids") if isinstance(disc.get("game_set_ids"),list) else [disc.get("game_set_id")]
+        candidates.update(str(x) for x in owners if str(x or "") in docs)
+    # Expand persisted duplicate relationships and ordinary single-title media
+    # fingerprints transitively. Compilation media is excluded because one disc
+    # legitimately owns multiple different games.
+    changed=True
+    while changed:
+        changed=False
+        known_fps=set()
+        for sid in list(candidates):
+            rec=docs.get(sid,{})
+            target=str(rec.get("superseded_by") or "")
+            if target in docs and target not in candidates:
+                candidates.add(target);changed=True
+            for other in rec.get("merged_set_ids") or []:
+                other=str(other or "")
+                if other in docs and other not in candidates:
+                    candidates.add(other);changed=True
+            media=rec.get("media") if isinstance(rec.get("media"),dict) else {}
+            discs=media.get("discs") if isinstance(media.get("discs"),list) else []
+            compilation=any(str(x.get("layout") or "").casefold()=="compilation" for x in discs if isinstance(x,dict))
+            if not compilation:
+                known_fps.update(str(x) for x in (rec.get("disc_fingerprints") or []) if str(x))
+        for sid,rec in docs.items():
+            if sid in candidates:continue
+            merged={str(x) for x in rec.get("merged_set_ids") or [] if str(x)}
+            if merged & candidates or str(rec.get("superseded_by") or "") in candidates:
+                candidates.add(sid);changed=True;continue
+            media=rec.get("media") if isinstance(rec.get("media"),dict) else {}
+            discs=media.get("discs") if isinstance(media.get("discs"),list) else []
+            compilation=any(str(x.get("layout") or "").casefold()=="compilation" for x in discs if isinstance(x,dict))
+            if not compilation and known_fps & {str(x) for x in (rec.get("disc_fingerprints") or []) if str(x)}:
+                candidates.add(sid);changed=True
+    if not candidates:
+        return requested
+    group_disc_count=0
+    for sid in candidates:
+        state=load_json(PC_GAME_STATE_ROOT/f"{sid}.json")
+        rec=docs.get(sid,{})
+        media=rec.get("media") if isinstance(rec.get("media"),dict) else {}
+        try:
+            group_disc_count=max(group_disc_count,int(media.get("disc_count") or 0),int(state.get("source_logical_disc_count") or 0))
+        except (TypeError,ValueError):
+            pass
+    return max(candidates,key=lambda sid:_pc_game_metadata_runtime_score(sid,group_disc_count))
+
+
+def apply_pc_game_metadata(payload: dict) -> dict:
+    provider=str(payload.get("provider") or "rawg").strip().lower()
+    if provider!="rawg": raise ValueError("unsupported PC game database provider")
+    provider_id=str(payload.get("provider_id") or payload.get("id") or "").strip()
+    profile=_rawg_profile(provider_id)
+    requested=str(payload.get("game_set_id") or payload.get("set_id") or "").strip()
+    requested=_validate_game_set_id(requested) if requested else ""
+    fp=str(payload.get("fingerprint") or "").strip()
+    seed=requested or (_existing_pc_game_set_for_profile(profile) or "")
+    sid=_pc_game_metadata_target(seed,fp,profile) if (seed or fp) else ""
+    created=False
+    if not sid:
+        proc=run(["/usr/local/sbin/pcga-game-intake","create-set","--title",str(profile["title"]),"--confirm"],timeout=20)
+        if proc.returncode!=0:
+            raise RuntimeError(((proc.stderr or proc.stdout) or "title creation failed")[-1200:])
+        try: created_doc=json.loads(proc.stdout or "{}")
+        except Exception: created_doc={}
+        sid=_validate_game_set_id(created_doc.get("id") or "")
+        created=True
+    path=PC_GAME_INTAKE_ROOT/"sets"/f"{sid}.json"
+    current=load_json(path)
+    if not current:
+        raise FileNotFoundError("PC game title record not found")
+    # Preserve ownership/provenance/install-facing fields while replacing only the
+    # canonical profile fields chosen by the user from the external database.
+    preserved={k:current.get(k) for k in ("id","schema","created_at","media","disc_fingerprints","collection_id","source") if k in current}
+    merged=dict(current)
+    for key,value in profile.items():
+        if key in {"external_ids","marketing_assets"}: continue
+        if value is not None: merged[key]=value
+    ext=dict(current.get("external_ids") or {});ext.update(profile.get("external_ids") or {});merged["external_ids"]=ext
+    marketing=dict(current.get("marketing_assets") or {});marketing.update({k:v for k,v in (profile.get("marketing_assets") or {}).items() if v});merged["marketing_assets"]=marketing
+    merged.update({k:v for k,v in preserved.items() if v is not None})
+    merged["id"]=sid;merged["updated_at"]=datetime.now(timezone.utc).isoformat(timespec="seconds")
+    asset_dir=PC_GAME_INTAKE_ROOT/"assets"/sid
+    local=dict(marketing.get("local") or {})
+    if marketing.get("cover_remote"):
+        saved=_download_game_db_asset(str(marketing["cover_remote"]),asset_dir,"cover")
+        if saved: local["cover"]=saved
+    if marketing.get("header_remote"):
+        saved=_download_game_db_asset(str(marketing["header_remote"]),asset_dir,"hero")
+        if saved: local["hero"]=saved
+    shot_paths=[]
+    for idx,url in enumerate(marketing.get("screenshots_remote") or [],1):
+        if idx>4: break
+        saved=_download_game_db_asset(str(url),asset_dir,f"screenshot-{idx}")
+        if saved: shot_paths.append(saved)
+    if shot_paths: local["screenshots"]=shot_paths
+    marketing["local"]=local;merged["marketing_assets"]=marketing
+    atomic_json(path,merged)
+    disc_result=None
+    if fp:
+        assign_payload={"fingerprint":fp,"game_set_id":sid}
+        for key in ("disc_number","disc_count","disc_role"):
+            if payload.get(key) not in (None,""): assign_payload[key]=payload.get(key)
+        disc_result=assign_pc_game_disc(assign_payload)
+        if disc_result.get("ok") is False:
+            return {"ok":False,"action":"pc-game-metadata-apply","game_set_id":sid,"error":"disc-assignment-failed","detail":disc_result.get("detail"),"profile":merged}
+    else:
+        _pcga_start_reconcile(list(dict.fromkeys([sid, requested] if requested else [sid])))
+    return {
+        "ok":True,
+        "action":"pc-game-metadata-apply",
+        "game_set_id":sid,
+        "created":created,
+        "metadata_target_redirected":bool(requested and requested!=sid),
+        "requested_game_set_id":requested or None,
+        "set":merged,
+        "disc_assignment":disc_result,
+        "source_url":(profile.get("metadata_profile") or {}).get("source_url"),
+        "detail":f"Applied RAWG metadata to {merged.get('title') or 'PC game'}" + (" on the linked working runtime" if requested and requested!=sid else "") + (" and assigned the preserved disc." if fp else "."),
+    }
+
+def create_pc_game_title(payload: dict) -> dict:
+    title=' '.join(str(payload.get('title') or '').strip().split())
+    if not title or len(title)>180: raise ValueError('title must contain 1-180 characters')
+    if any(ord(c)<32 for c in title): raise ValueError('invalid title')
+    proc=run(['/usr/local/sbin/pcga-game-intake','create-set','--title',title,'--confirm'],timeout=20)
+    if proc.returncode!=0:
+        return {"ok":False,"action":"pc-game-title-create","error":"create-failed","detail":((proc.stderr or proc.stdout) or 'title creation failed')[-1200:]}
+    try:rec=json.loads(proc.stdout or '{}')
+    except Exception:rec={}
+    return {"ok":True,"action":"pc-game-title-create","set":rec,"game_set_id":rec.get('id'),"detail":f'Created PC game title {title}.'}
+
+
+def switch_pc_game_disc(payload: dict) -> dict:
+    """Switch D: for a live multi-disc session without affecting other clients.
+
+    The portal sends both its stable client id and the selected Wolf child
+    container.  Older callers that omit container_id retain the legacy
+    game-set-wide behavior.
+    """
+    sid=_validate_game_set_id(str(payload.get("game_set_id") or payload.get("set_id") or "").strip())
+    try: disc=int(payload.get("disc") or payload.get("disc_number") or 0)
+    except (TypeError,ValueError): disc=0
+    if disc < 1 or disc > 16: raise ValueError("disc must be between 1 and 16")
+    client_raw=str(payload.get("client_id") or "").strip()
+    client_id=_validate_pcga_client_id(client_raw) if client_raw else ""
+    target_id=str(payload.get("container_id") or "").strip()
+    if target_id and not re.fullmatch(r"[0-9a-fA-F]{12,64}", target_id):
+        raise ValueError("invalid PC game runtime container id")
+
+    listing=pc_game_sessions({"client_id":client_id} if client_id else None)
+    if not listing.get("ok"):
+        return listing
+    targets=[x for x in listing.get("sessions") or [] if x.get("game_set_id")==sid]
+    if target_id:
+        targets=[x for x in targets if str(x.get("container_id") or "").startswith(target_id)]
+    if not targets:
+        return {
+            "ok":False,"action":"pc-game-disc-switch","game_set_id":sid,"disc":disc,
+            "error":"no-active-session",
+            "detail":"The selected PC game session is no longer active or is not owned by this portal client." if client_id else "Start the game/setup session before changing discs.",
+        }
+
+    changed=[]; failed=[]
+    for target in targets:
+        cid=str(target.get("container_id") or "")
+        # Revalidate immediately before docker exec.  This prevents a stale
+        # browser tab from switching media in a replacement/unrelated container.
+        verify=run(["docker","inspect",cid],timeout=12)
+        if verify.returncode!=0:
+            failed.append({**target,"detail":"Runtime container ended before the disc switch completed"}); continue
+        try:
+            rows=json.loads(verify.stdout)
+            current=_pc_game_runtime_record(rows[0] if isinstance(rows,list) and rows else {})
+        except Exception:
+            current=None
+        if not current or current.get("container_id")!=cid or current.get("game_set_id")!=sid:
+            failed.append({**target,"detail":"Container no longer matches this managed PCGA game session"}); continue
+        proc=run(["docker","exec","-u","retro",cid,"/tmp/pcga-disc-switch",str(disc)],timeout=20)
+        if proc.returncode==0:
+            changed.append({**target,"active_disc":disc,"output":(proc.stdout or "")[-800:]})
+        else:
+            failed.append({**target,"detail":((proc.stderr or proc.stdout) or "disc switch failed")[-800:]})
+
+    if changed:
+        # Per-session active disc is ownership state, not title-global state.
+        # This lets two clients install/play the same title on different discs.
+        with PC_GAME_SESSION_OWNER_LOCK:
+            owner_state=_pc_game_session_owner_state()
+            for row in changed:
+                cid=str(row.get("container_id") or "")
+                owner=owner_state["containers"].get(cid)
+                if isinstance(owner,dict):
+                    owner["active_disc"]=disc
+                    rid=str(owner.get("reservation_id") or "")
+                    if rid and isinstance(owner_state["reservations"].get(rid),dict):
+                        owner_state["reservations"][rid]["active_disc"]=disc
+            _pc_game_session_owner_save(owner_state)
+        # Preserve the old title-level default only for legacy broad callers.
+        if not target_id:
+            state_path=PC_GAME_STATE_ROOT/f"{sid}.json"
+            try: state_doc=json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
+            except Exception: state_doc={}
+            if isinstance(state_doc,dict):
+                state_doc["runtime_active_disc"]=disc
+                state_doc["updated_at"]=datetime.now(timezone.utc).isoformat(timespec="seconds")
+                atomic_json(state_path,state_doc)
+    return {
+        "ok":not failed,"action":"pc-game-disc-switch","game_set_id":sid,"disc":disc,
+        "changed":changed,"failed":failed,
+        "detail":f"Active optical drive D: switched to title disc {disc} for {len(changed)} session(s)." if not failed else f"Disc {disc} could not be applied to every selected session.",
+    }
+
+
+def reinstall_pc_game(payload: dict) -> dict:
+    """Reinstall one PCGA game from preserved source without touching the archive copy."""
+    sid = _validate_game_set_id(payload.get("game_set_id") or payload.get("set_id"))
+    orchestrator = Path("/usr/local/sbin/pcga-game-orchestrator")
+    if not orchestrator.is_file() or not os.access(orchestrator, os.X_OK):
+        return {
+            "ok": False,
+            "action": "pc-game-reinstall",
+            "game_set_id": sid,
+            "error": "orchestrator-unavailable",
+            "detail": f"Host component missing or not executable: {orchestrator}",
+        }
+    try:
+        runtime = Path("/run/pcga-game-orchestrator")
+        docker_cfg = runtime / "docker"
+        config_home = runtime / "config"
+        cache_home = runtime / "cache"
+        for path in (runtime, docker_cfg, config_home, cache_home):
+            path.mkdir(parents=True, exist_ok=True)
+        child_env = os.environ.copy()
+        child_env.update({
+            "HOME": str(runtime),
+            "DOCKER_CONFIG": str(docker_cfg),
+            "XDG_CONFIG_HOME": str(config_home),
+            "XDG_CACHE_HOME": str(cache_home),
+        })
+        proc = subprocess.Popen(
+            [str(orchestrator), "--set-id", sid, "--reinstall", "--force"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=child_env,
+        )
+    except OSError as exc:
+        return {
+            "ok": False,
+            "action": "pc-game-reinstall",
+            "game_set_id": sid,
+            "error": type(exc).__name__,
+            "detail": str(exc)[:400],
+        }
+    return {
+        "ok": True,
+        "action": "pc-game-reinstall",
+        "game_set_id": sid,
+        "pid": proc.pid,
+        "detail": "Reinstall started from the preserved PCGA source. The archived disc/image is retained; only mutable install and runtime state are reset.",
+    }
+
+
+def _version_tuple(value: str) -> tuple[int, ...]:
+    if not re.fullmatch(r"\d+(?:\.\d+){2,3}(?:-[0-9A-Za-z.-]+)?", value or ""):
+        raise ValueError("invalid patch version")
+    base = value.split("-",1)[0]
+    return tuple(int(x) for x in base.split("."))
+
+
+def _safe_extract_patch(zip_path: Path, dest: Path) -> tuple[str, Path, Path]:
+    with zipfile.ZipFile(zip_path) as zf:
+        infos = zf.infolist()
+        if not infos or len(infos) > 4000:
+            raise ValueError("patch archive has an invalid file count")
+        total = 0; roots = set()
+        for info in infos:
+            name = info.filename.replace("\\", "/")
+            pp = Path(name)
+            if not name or name.startswith("/") or ".." in pp.parts:
+                raise ValueError("patch archive contains an unsafe path")
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == 0o120000:
+                raise ValueError("patch archive contains a symbolic link")
+            total += max(0, int(info.file_size))
+            if total > 256 * 1024 * 1024:
+                raise ValueError("patch archive expands beyond the safety limit")
+            if pp.parts: roots.add(pp.parts[0])
+        if len(roots) != 1:
+            raise ValueError("patch ZIP must contain one PCGA release directory")
+        root_name = next(iter(roots))
+        m = re.fullmatch(r"pc_game_archive_v(\d+(?:\.\d+){2,3}(?:-[0-9A-Za-z.-]+)?)", root_name)
+        if not m:
+            raise ValueError("patch root must be named pc_game_archive_v<version>")
+        version = m.group(1)
+        if _version_tuple(version) <= _version_tuple(VERSION):
+            raise ValueError(f"patch version {version} is not newer than installed {VERSION}")
+        zf.extractall(dest)
+    release = (dest / root_name).resolve()
+    release.relative_to(dest.resolve())
+    upgrade = release / f"upgrade_to_v{version}.sh"
+    if not upgrade.is_file():
+        raise ValueError("patch is missing its versioned upgrade script")
+    manifest = release / "MANIFEST.sha256"
+    if manifest.is_file():
+        check = subprocess.run(["sha256sum","-c",manifest.name], cwd=release, capture_output=True, text=True, timeout=60)
+        if check.returncode != 0:
+            raise ValueError("patch manifest verification failed: " + (check.stderr or check.stdout)[-500:])
+    upgrade.chmod(upgrade.stat().st_mode | 0o111)
+    return version, release, upgrade
+
+
+def install_patch_from_stream(handler, length: int, filename: str) -> dict:
+    if length <= 0 or length > PATCH_MAX_BYTES:
+        raise ValueError("invalid patch size")
+    if not str(filename or "").lower().endswith(".zip"):
+        raise ValueError("PCGA patches must be ZIP files")
+    PATCH_ROOT.mkdir(parents=True, exist_ok=True)
+    incoming = PATCH_ROOT / "incoming"; jobs = PATCH_ROOT / "jobs"
+    incoming.mkdir(parents=True, exist_ok=True); jobs.mkdir(parents=True, exist_ok=True)
+    job_id = time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(4).hex()
+    zip_path = incoming / f"{job_id}.zip"
+    remaining = length
+    with zip_path.open("wb") as fh:
+        while remaining:
+            chunk = handler.rfile.read(min(1024*1024, remaining))
+            if not chunk: raise ValueError("patch upload ended early")
+            fh.write(chunk); remaining -= len(chunk)
+    extract_root = PATCH_ROOT / "releases" / job_id
+    extract_root.mkdir(parents=True, exist_ok=False)
+    try:
+        version, release, upgrade = _safe_extract_patch(zip_path, extract_root)
+    except Exception:
+        shutil.rmtree(extract_root, ignore_errors=True); zip_path.unlink(missing_ok=True); raise
+    log_path = jobs / f"{job_id}.log"
+    exit_path = jobs / f"{job_id}.exit"
+    meta_path = jobs / f"{job_id}.json"
+    unit = "pcga-patch-" + re.sub(r"[^A-Za-z0-9_.-]", "-", job_id)
+    runner = jobs / f"{job_id}.sh"
+    runner.write_text(
+        "#!/bin/bash\n"
+        "set -uo pipefail\n"
+        "exec >>" + shlex.quote(str(log_path)) + " 2>&1\n"
+        "echo '[pcga-patch] starting v" + version + " at '$(date -Is)\n"
+        "cd " + shlex.quote(str(release)) + "\n"
+        "set +e\n"
+        + shlex.quote(str(upgrade)) + "\n"
+        "rc=$?\n"
+        "tmp=" + shlex.quote(str(exit_path)) + ".tmp.$$\n"
+        "printf '%s\n' \"$rc\" >\"$tmp\"\n"
+        "mv -f \"$tmp\" " + shlex.quote(str(exit_path)) + "\n"
+        "echo '[pcga-patch] finished v" + version + " rc='\"$rc\"' at '$(date -Is)\n"
+        "exit \"$rc\"\n",
+        encoding="utf-8",
+    )
+    runner.chmod(0o700)
+    meta = {"id":job_id,"version":version,"filename":Path(filename).name,"unit":unit,"log":str(log_path),"exit_file":str(exit_path),"release":str(release),"created_at":time.time(),"state":"queued"}
+    atomic_json(meta_path, meta)
+    cmd=["systemd-run","--unit",unit,"--collect","--property=Type=exec","--property=TimeoutStartSec=0","/bin/bash",str(runner)]
+    proc=run(cmd, timeout=20)
+    if proc.returncode != 0:
+        meta["state"]="failed-to-start"; meta["detail"]=(proc.stderr or proc.stdout)[-1200:]; atomic_json(meta_path,meta)
+        raise RuntimeError(meta["detail"] or "systemd-run failed")
+    meta["state"]="running"; atomic_json(meta_path,meta)
+    return {"ok":True,"job_id":job_id,"version":version,"state":"running","detail":f"PCGA v{version} patch accepted and installation started"}
+
+
+def patch_status(job_id: str) -> dict:
+    if not re.fullmatch(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{8}", job_id or ""):
+        raise ValueError("invalid patch job id")
+    meta_path=PATCH_ROOT/"jobs"/f"{job_id}.json"; meta=load_json(meta_path)
+    if not meta: raise FileNotFoundError("patch job not found")
+    unit=str(meta.get("unit") or "")
+    props={}
+    exit_path=Path(str(meta.get("exit_file") or (PATCH_ROOT/"jobs"/f"{job_id}.exit")))
+    if exit_path.is_file():
+        try:
+            code=int(exit_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            code=1
+        meta["state"]="complete" if code==0 else "failed"
+        meta["exit_code"]=code; atomic_json(meta_path,meta)
+    else:
+        p=run(["systemctl","show",unit,"--property=ActiveState,SubState,Result,ExecMainStatus","--no-pager"], timeout=10)
+        for line in p.stdout.splitlines():
+            if "=" in line:
+                k,v=line.split("=",1); props[k]=v
+        active=props.get("ActiveState","")
+        if active in {"inactive","failed"}:
+            code=int(props.get("ExecMainStatus") or 0)
+            meta["state"]="complete" if active=="inactive" and code==0 and props.get("Result") in {"success",""} else "failed"
+            meta["exit_code"]=code; atomic_json(meta_path,meta)
+    log_path=Path(str(meta.get("log") or "")); tail=""
+    try: tail="\n".join(log_path.read_text(errors="replace").splitlines()[-80:])
+    except OSError: pass
+    return {"ok":True,**meta,"systemd":props,"log_tail":tail}
+
+
+def action(name: str, payload: dict) -> dict:
+    if name == "nas-configure":
+        return configure_nas(payload)
+    if name == "nas-status":
+        return nas_storage("status")
+    if name == "nas-sync":
+        return start_nas_job("sync")
+    if name == "nas-offload":
+        return start_nas_job("offload")
+    if name == "nas-archive":
+        return start_nas_job("archive")
+    if name == "nas-mount":
+        return nas_storage("reconcile")
+    if name == "nas-unmount":
+        return nas_storage("unmount")
+    if name == "tailscale-enable":
+        return set_tailscale_remote(True)
+    if name == "tailscale-disable":
+        return set_tailscale_remote(False)
+    if name == "tailscale-status":
+        return tailscale_remote("status")
+    if name == "pc-game-retry":
+        return retry_pc_game(payload)
+    if name == "pc-game-reinstall":
+        return reinstall_pc_game(payload)
+    if name == "pc-game-compat-refresh":
+        return refresh_pc_game_compatibility(payload)
+    if name == "pc-game-session-list":
+        return pc_game_sessions(payload)
+    if name == "pc-game-session-reserve":
+        return reserve_pc_game_session(payload)
+    if name == "pc-game-session-claim":
+        return claim_pc_game_session(payload)
+    if name == "pc-game-session-release":
+        return release_pc_game_session(payload)
+    if name == "pc-game-session-stop":
+        return stop_pc_game_session(payload)
+    if name == "pc-game-disc-switch":
+        return switch_pc_game_disc(payload)
+    if name == "pc-game-metadata-configure":
+        return configure_pc_game_metadata(payload)
+    if name == "pc-game-metadata-search":
+        return search_pc_game_metadata(payload)
+    if name == "pc-game-metadata-preview":
+        return preview_pc_game_metadata(payload)
+    if name == "pc-game-metadata-apply":
+        return apply_pc_game_metadata(payload)
+    if name == "pc-game-disc-library":
+        return pc_game_disc_library(payload)
+    if name == "pc-game-disc-assign":
+        return assign_pc_game_disc(payload)
+    if name == "pc-game-title-create":
+        return create_pc_game_title(payload)
+    if name == "pc-game-stream-reconcile":
+        return reconcile_pc_game_stream(payload)
+    allowed_restart = {
+        "romm": ["docker", "restart", "romm"],
+        "jellyfin": ["docker", "restart", "jellyfin"],
+        "immich": ["docker", "restart", "immich_server"],
+        "public-media": ["systemctl", "restart", "pcga-public-media.service"],
+        "optical-watch": ["systemctl", "restart", "pcga-optical-watch.service"],
+    }
+    if name.startswith("restart:"):
+        target = name.split(":", 1)[1]
+        if target not in allowed_restart:
+            raise ValueError("unsupported restart target")
+        if target in {"romm", "jellyfin", "immich"}:
+            with game_stack_lock():
+                p = run(allowed_restart[target], timeout=90)
+        else:
+            p = run(allowed_restart[target], timeout=90)
+        return {"ok": p.returncode == 0, "action": name, "detail": (p.stderr or p.stdout)[-1200:]}
+    commands = {
+        "ingest-reconcile": ["/usr/local/sbin/pcga-ingest-reconcile", "reconcile"],
+        "classify": ["/usr/local/sbin/pcga-classify"],
+        "dedupe-audit": ["/usr/local/sbin/pcga-dedupe", "audit"],
+        "dedupe-run": ["/usr/local/sbin/pcga-dedupe", "run"],
+        "jellyfin-configure": ["/usr/local/sbin/pcga-jellyfin-configure", "--non-interactive", "--no-restart"],
+        "optical-health": ["/usr/local/sbin/pcga-optical-health", "--all"],
+        "moonlight-reconcile": ["/usr/local/sbin/pcga-moonlight-web-bootstrap"],
+    }
+    if name not in commands:
+        raise ValueError("unsupported action")
+    p = run(commands[name], timeout=600)
+    return {"ok": p.returncode == 0, "action": name, "stdout": p.stdout[-6000:], "stderr": p.stderr[-3000:]}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = f"PCGAControl/{VERSION}"
+
+    def log_message(self, fmt, *args):
+        if urlparse(self.path).path != "/health":
+            super().log_message(fmt, *args)
+
+    def send_json(self, status: int, value: dict):
+        body = (json.dumps(value, separators=(",", ":"), default=str) + "\n").encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def authorized(self) -> bool:
+        try:
+            token = TOKEN_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            return False
+        supplied = self.headers.get("Authorization", "")
+        return bool(token) and supplied == f"Bearer {token}"
+
+    def json_body(self, limit=65536):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise ValueError("invalid content length")
+        if length < 0 or length > limit:
+            raise ValueError("invalid request size")
+        if not length:
+            return {}
+        data = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+        if not isinstance(data, dict):
+            raise ValueError("JSON object required")
+        return data
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/health":
+            self.send_json(HTTPStatus.OK, {"ok": True, "version": VERSION})
+            return
+        if not self.authorized():
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+            return
+        if path == "/game-activity":
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                limit = int((q.get("limit") or ["48"])[0])
+                self.send_json(HTTPStatus.OK, game_activity_recent(limit))
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)[:300]})
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+            return
+        if path.startswith("/audio/"):
+            try:
+                self.send_json(HTTPStatus.OK, audio_get(path, parse_qs(urlparse(self.path).query)))
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)[:300]})
+            except FileNotFoundError as exc:
+                self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)[:300]})
+            except urllib.error.HTTPError as exc:
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "provider-http-error", "detail": f"HTTP {exc.code}"})
+            except Exception as exc:
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+            return
+        if path == "/patch/status":
+            try:
+                q=parse_qs(urlparse(self.path).query); job=str((q.get("id") or [""])[0])
+                self.send_json(HTTPStatus.OK, patch_status(job))
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST,{"ok":False,"error":str(exc)})
+            except FileNotFoundError as exc:
+                self.send_json(HTTPStatus.NOT_FOUND,{"ok":False,"error":str(exc)})
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR,{"ok":False,"error":type(exc).__name__,"detail":str(exc)[:400]})
+            return
+        if path in {"/state", "/config"}:
+            try:
+                value = state_payload() if path == "/state" else {"ok": True, "version": VERSION, "config": load_config()}
+                self.send_json(HTTPStatus.OK, value)
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+            return
+        if path == "/logs/catalog":
+            try:
+                self.send_json(HTTPStatus.OK, log_catalog())
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+            return
+        if path == "/logs":
+            try:
+                q = parse_qs(urlparse(self.path).query)
+                service_id = str((q.get("service") or [""])[0])[:200]
+                lines = int((q.get("lines") or ["160"])[0])
+                seconds = int((q.get("seconds") or ["900"])[0])
+                self.send_json(HTTPStatus.OK, service_log(service_id, lines, seconds))
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)[:200]})
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+            return
+        self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not-found"})
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        if not self.authorized():
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+            return
+        if path.startswith("/audio/open-podcast/v1/subscriptions/"):
+            try:
+                self.send_json(HTTPStatus.ACCEPTED, open_podcast_delete(path.rsplit("/", 1)[-1]))
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"code": 405, "message": str(exc)[:300]})
+            except FileNotFoundError:
+                self.send_json(HTTPStatus.NOT_FOUND, {"code": 404, "message": "Resource not found"})
+            return
+        self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not-found"})
+
+
+    def do_PATCH(self):
+        path = urlparse(self.path).path
+        if not self.authorized():
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+            return
+        if path != "/config":
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not-found"})
+            return
+        try:
+            result = update_config(self.json_body())
+            self.send_json(HTTPStatus.OK if result.get("ok") else HTTPStatus.MULTI_STATUS, result)
+        except ValueError as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if not self.authorized():
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+            return
+        if path == "/game-activity":
+            try:
+                self.send_json(HTTPStatus.OK, game_activity_record(self.json_body()))
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)[:300]})
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+            return
+        if path.startswith("/audio/"):
+            try:
+                result = audio_post(path, self.json_body())
+                code = HTTPStatus.ACCEPTED if path == "/audio/librivox/collect" else HTTPStatus.OK
+                self.send_json(code, result)
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)[:300]})
+            except FileNotFoundError as exc:
+                self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": str(exc)[:300]})
+            except Exception as exc:
+                self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+            return
+        if path == "/patch":
+            try:
+                length=int(self.headers.get("Content-Length","0")); filename=self.headers.get("X-PCGA-Filename", "pcga-patch.zip")
+                result=install_patch_from_stream(self,length,filename)
+                self.send_json(HTTPStatus.ACCEPTED,result)
+            except ValueError as exc:
+                self.send_json(HTTPStatus.BAD_REQUEST,{"ok":False,"error":str(exc)})
+            except Exception as exc:
+                self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR,{"ok":False,"error":type(exc).__name__,"detail":str(exc)[:400]})
+            return
+        if path != "/action":
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not-found"})
+            return
+        try:
+            payload = self.json_body()
+            name = str(payload.get("action") or "")[:80]
+            result = action(name, payload)
+            self.send_json(HTTPStatus.OK if result.get("ok") else HTTPStatus.INTERNAL_SERVER_ERROR, result)
+        except ValueError as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+        except Exception as exc:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:400]})
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--bind", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8100)
+    args = parser.parse_args()
+    ETC.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_PATH.exists():
+        atomic_json(CONFIG_PATH, validate_config(DEFAULTS))
+    server = ThreadingHTTPServer((args.bind, args.port), Handler)
+    server.daemon_threads = True
+    print(f"PCGA control plane v{VERSION} listening on {args.bind}:{args.port}", flush=True)
+    try:
+        server.serve_forever(poll_interval=.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+if __name__ == "__main__":
+    main()

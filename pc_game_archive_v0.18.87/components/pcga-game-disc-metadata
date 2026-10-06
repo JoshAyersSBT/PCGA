@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, configparser, datetime as dt, fcntl, json, os, re, subprocess, tempfile, uuid
+from pathlib import Path
+
+STATE=Path('/var/lib/pc-game-archive/game-intake')
+SETS=STATE/'sets'; DISCS=STATE/'discs'; COLLECTIONS=STATE/'collections'
+DISC_RE=re.compile(r'(?i)(?:^|[ _\-.])(disc|disk|cd)[ _\-.]*(\d+)(?:[ _\-.]*(?:of|/)[ _\-.]*(\d+))?(?:$|[ _\-.])')
+EDITION_WORDS=('collector','collectors','gold','platinum','deluxe','complete','enhanced','special','goty','game of the year','anthology','collection','compilation')
+ROLE_WORDS={'install':'installer','setup':'installer','play':'play','game':'play','data':'data','bonus':'bonus','soundtrack':'soundtrack','ost':'soundtrack'}
+ENGINE_MARKERS={'chitin.key':'Infinity Engine','dialog.tlk':'Infinity Engine','steam_api.dll':'Steamworks','steam_api64.dll':'Steamworks','galaxy.dll':'GOG Galaxy','goggame.dll':'GOG','dos4gw.exe':'DOS/4GW'}
+GENERIC_DIRS={'data','setup','install','installer','support','redist','redistributables','directx','drivers','docs','doc','manual','manuals','common','shared','movies','video','videos','sound','sounds','audio','music','bin','autorun','extras','extra','patch','patches','demo','demos','tools','utility','utilities','windows','win32','win64'}
+
+
+def run(cmd,timeout=12):
+    try:return subprocess.run(cmd,text=True,capture_output=True,timeout=timeout,check=False)
+    except Exception:return None
+
+def slug_title(v:str)->str:
+    v=(v or '').replace('_',' ').strip()
+    v=re.sub(r'(?i)\b(?:disc|disk|cd|dvd)\s*[-_ ]*\d+(?:\s*(?:of|/)\s*\d+)?\b',' ',v)
+    v=re.sub(r'(?i)(?:disc|disk|cd|dvd)\d+(?:of\d+)?$','',v)
+    v=re.sub(r'\s+',' ',v).strip(' -_.')
+    return v.title() if v and v.upper()==v else v
+
+def norm(v:str)->str:
+    v=slug_title(v).casefold();v=re.sub(r'[^a-z0-9]+',' ',v);return ' '.join(v.split())
+
+def weak_title(v:str)->bool:
+    raw=str(v or '').strip()
+    n=norm(raw)
+    if not n or n in {'cdrom','cd rom','data','disc','disk','install','setup','dvd','cd'}:return True
+    if re.fullmatch(r'(?i)[a-z0-9]{2,12}[-_ ]+(?:cd|dvd|disc|disk)(?:[-_ ]*\d+)?',raw):return True
+    compact=re.sub(r'[^a-z0-9]+','',raw.casefold())
+    if re.fullmatch(r'.{2,24}(?:cd|dvd|disc|disk)\d+(?:of\d+)?',compact):return True
+    # Retail game discs commonly bundle Adobe Reader, DirectX and similar
+    # prerequisite installers. Their package/file-version names are never the
+    # game identity even when they are the most descriptive shallow executable.
+    if re.fullmatch(r'(?:adberdr|adobereader|acrobatreader|acroread)\d*(?:[a-z]{2,10})?',compact):return True
+    if re.fullmatch(r'(?:directx|dxsetup|dotnetfx|vcredist|vcredistx86|vcredistx64|physx|pbsvc|pbsetup|gamespy)\d*[a-z0-9]*',compact):return True
+    if re.fullmatch(r'(?:launchbfii|launcheaw)(?:\d{6,})?',compact):return True
+    return False
+
+TITLE_STEM_SKIP={'setup','install','installer','autorun','uninstall','unins000','unwise','dxsetup','directx','dsetup32','vcredist','vc redist','isdel','ikernel','idriver','cdkey','syscheck','systemcheck','fpupdate','update','updater','patch','patcher','launcher','launch','start','play','game','config','configure','register','readme','binkplay','mplayer','adberdr','acroread','reader'}
+
+def content_title_candidates(files):
+    scores={}
+    for rel,_ in files:
+        q=Path(rel)
+        if len(q.parts)>3 or q.suffix.lower() not in {'.exe','.com','.ico','.ini','.cfg'}:continue
+        stem=slug_title(q.stem); n=norm(stem)
+        if not n or n in TITLE_STEM_SKIP or weak_title(stem) or len(n)<4:continue
+        if any(t in TITLE_STEM_SKIP for t in n.split()):continue
+        weight={'.exe':8,'.com':6,'.ico':3,'.ini':2,'.cfg':1}[q.suffix.lower()]+max(0,3-len(q.parts))
+        old=scores.get(n,(0,stem));scores[n]=(old[0]+weight,old[1])
+    return [x[1] for x in sorted(scores.values(),key=lambda x:(-x[0],len(norm(x[1])),x[1].casefold()))[:8]]
+
+def parse_disc_number(*values):
+    for value in values:
+        text=str(value or '')
+        m=DISC_RE.search(' '+text+' ')
+        if m:return int(m.group(2)), int(m.group(3)) if m.group(3) else None
+        # Mastering labels often omit separators (COD2CD1, GAME_DVD2). Parse
+        # only explicit optical-media suffixes so sequel numbers remain titles.
+        compact=re.sub(r'[^a-z0-9]+','',text.casefold())
+        m=re.search(r'(?:disc|disk|cd|dvd)(\d+)(?:of(\d+))?$',compact)
+        if m:return int(m.group(1)), int(m.group(2)) if m.group(2) else None
+    return None,None
+
+def mount_ro(dev):
+    p=Path(tempfile.mkdtemp(prefix='pcga-game-meta-',dir='/run' if Path('/run').is_dir() else None))
+    r=run(['mount','-o','ro,nosuid,nodev,noexec',dev,str(p)],20)
+    if not r or r.returncode:
+        try:p.rmdir()
+        except OSError:pass
+        return None,None
+    return p,p
+
+def scan(root:Path):
+    files=[]; root_entries=[]
+    try:root_entries=sorted(x.name for x in root.iterdir())[:160]
+    except OSError:pass
+    for base,dirs,names in os.walk(root):
+        bp=Path(base)
+        try:depth=len(bp.relative_to(root).parts)
+        except ValueError:continue
+        if depth>=4:dirs[:]=[]
+        for n in names:
+            q=bp/n
+            try:size=q.stat().st_size
+            except OSError:continue
+            rel=q.relative_to(root).as_posix();files.append((rel,size))
+            if len(files)>=3500:break
+        if len(files)>=3500:break
+    return files,root_entries
+
+def autorun_info(root:Path):
+    for name in ('autorun.inf','AUTORUN.INF','Autorun.inf'):
+        p=root/name
+        if not p.is_file():continue
+        try:text=p.read_text(encoding='utf-8-sig',errors='replace')
+        except OSError:continue
+        cp=configparser.ConfigParser(interpolation=None,strict=False)
+        try:
+            cp.read_string(text);sec=cp['autorun'] if cp.has_section('autorun') else {}
+            return {k:str(sec.get(k,'')).strip() for k in ('label','open','shellexecute','icon') if str(sec.get(k,'')).strip()}
+        except Exception:
+            out={}
+            for line in text.splitlines():
+                if '=' in line:
+                    k,v=line.split('=',1);k=k.strip().lower()
+                    if k in {'label','open','shellexecute','icon'}:out[k]=v.strip()
+            return out
+    return {}
+
+
+def _autorun_target_stem(value:str)->str:
+    """Extract a product-like filename stem from an autorun command/icon value."""
+    raw=str(value or '').strip().strip('"').strip("'")
+    if not raw:return ''
+    # Icons can use the Windows resource form ``foo.ico,0``.  OPEN and
+    # SHELLEXECUTE may include arguments; keep only the executable/path token.
+    raw=raw.split(',',1)[0].strip()
+    m=re.match(r'^"([^"]+)"',raw)
+    if m:raw=m.group(1)
+    else:raw=raw.split(None,1)[0]
+    raw=raw.replace('\\','/')
+    stem=slug_title(Path(raw).stem)
+    n=norm(stem)
+    if not n or n in TITLE_STEM_SKIP or weak_title(stem) or len(n)<4:return ''
+    if any(t in TITLE_STEM_SKIP for t in n.split()):return ''
+    return stem
+
+def autorun_title_candidates(info:dict)->list[dict]:
+    """Return title evidence explicitly referenced by AUTORUN.INF.
+
+    A referenced product icon is stronger identity evidence than an unrelated
+    executable merely present on the disc (retail discs commonly shipped demos
+    and bonus applications).
+    """
+    out=[];seen=set()
+    def add(value,kind,score):
+        value=slug_title(value);n=norm(value)
+        if not value or not n or n in seen or weak_title(value):return
+        seen.add(n);out.append({'title':value,'kind':kind,'confidence':score})
+    label=str(info.get('label') or '').strip()
+    if label:add(label,'autorun-label',0.98)
+    icon=_autorun_target_stem(str(info.get('icon') or ''))
+    if icon:add(icon,'autorun-icon',0.94)
+    for key in ('shellexecute','open'):
+        stem=_autorun_target_stem(str(info.get(key) or ''))
+        if stem:add(stem,'autorun-'+key,0.88)
+    return out
+
+def detect_installer(files):
+    lows=[Path(x).name.lower() for x,_ in files]
+    if any(x.endswith('.msi') for x in lows):return 'Windows Installer (MSI)'
+    if any(x in {'setup.inx','setup.ins'} for x in lows):return 'InstallShield'
+    if any(x=='setup.exe' for x in lows):return 'Windows setup executable'
+    if any(x=='install.exe' for x in lows):return 'Windows install executable'
+    return None
+
+def load_dir(path:Path):
+    out=[]
+    for p in path.glob('*.json') if path.exists() else []:
+        try:
+            d=json.loads(p.read_text())
+            if isinstance(d,dict):out.append(d)
+        except Exception:pass
+    return out
+
+def save(path:Path,data):
+    path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_suffix(path.suffix+'.tmp');tmp.write_text(json.dumps(data,indent=2,sort_keys=True)+'\n');os.replace(tmp,path)
+
+def candidate_groups(files:list[tuple[str,int]]):
+    groups={}
+    for rel,size in files:
+        parts=Path(rel).parts
+        if len(parts)<2:continue
+        top=parts[0];key=top.casefold()
+        if key in GENERIC_DIRS or top.startswith('.') or len(top.strip())<2:continue
+        g=groups.setdefault(top,[]);g.append((rel,size))
+    candidates=[]
+    for top,rows in groups.items():
+        basenames=[Path(x).name.lower() for x,_ in rows]
+        installer=detect_installer(rows)
+        engines=sorted({v for k,v in ENGINE_MARKERS.items() if k in basenames})
+        exes=[x for x in basenames if x.endswith(('.exe','.com','.bat'))]
+        msi=[x for x in basenames if x.endswith('.msi')]
+        score=0.0;evidence=[]
+        if installer:score+=0.55;evidence.append(installer)
+        if engines:score+=0.38;evidence.extend(engines[:2])
+        if msi and not installer:score+=0.45;evidence.append('MSI payload')
+        if len(exes)>=2:score+=0.23;evidence.append(f'{len(exes)} executable files')
+        elif len(exes)==1:score+=0.12;evidence.append('application executable')
+        if len(rows)>=8:score+=0.08
+        # An anthology candidate must have a strong game/install signal. This
+        # intentionally avoids treating ordinary DATA/MOVIES/SOUND folders as games.
+        if score < 0.45:continue
+        title=slug_title(top)
+        if not title or norm(title) in GENERIC_DIRS:continue
+        candidates.append({'title':title,'normalized_title':norm(title),'source_path':top,'confidence':min(0.96,round(score,2)),'installer':installer,'engines':engines,'evidence':evidence[:6],'file_count':len(rows)})
+    candidates.sort(key=lambda x:(-x['confidence'],x['title'].casefold()))
+    return candidates
+
+def find_or_create_set(title:str, existing:list[dict], now:str, *, evidence=None):
+    normalized=norm(title);exact=[x for x in existing if str(x.get('normalized_title') or '')==normalized and normalized]
+    if exact:return exact[0],False,exact
+    sid=str(uuid.uuid4())
+    rec={'schema':1,'id':sid,'title':title or 'Unidentified PC Game','sort_title':title or 'Unidentified PC Game','normalized_title':normalized,'series':None,'release_year':None,'edition':None,'publisher':None,'developer':None,'platform':'PC','operating_system':None,'language':None,'region':None,'external_ids':{},'provisional':True,'created_at':now,'updated_at':now}
+    if evidence:rec['discovery_evidence']=evidence
+    existing.append(rec);return rec,True,[]
+
+
+def _disc_member(d:dict)->dict:
+    return {
+        'fingerprint':str(d.get('fingerprint') or ''),
+        'disc_number':d.get('disc_number'),'disc_count':d.get('disc_count'),
+        'disc_role':d.get('disc_role'),'volume_label':d.get('volume_label'),
+        'metadata_status':d.get('metadata_status'),'layout':d.get('layout'),
+    }
+
+def sync_title_disc_inventory(set_rec:dict,current:dict|None=None)->dict:
+    """Make the title record authoritative for its owned physical disc set."""
+    sid=str(set_rec.get('id') or '')
+    members={}
+    for q in DISCS.glob('*.json') if DISCS.exists() else []:
+        try:d=json.loads(q.read_text())
+        except Exception:continue
+        ids=d.get('game_set_ids') if isinstance(d.get('game_set_ids'),list) else [d.get('game_set_id')]
+        if sid in [str(x or '') for x in ids]:members[str(d.get('fingerprint') or q.stem)]=_disc_member(d)
+    if current:
+        ids=current.get('game_set_ids') if isinstance(current.get('game_set_ids'),list) else [current.get('game_set_id')]
+        if sid in [str(x or '') for x in ids]:members[str(current.get('fingerprint') or '')]=_disc_member(current)
+    rows=list(members.values())
+    rows.sort(key=lambda x:(int(x.get('disc_number')) if isinstance(x.get('disc_number'),int) else 9999,str(x.get('volume_label') or '').casefold(),x.get('fingerprint') or ''))
+    declared=[int(x['disc_count']) for x in rows if isinstance(x.get('disc_count'),int) and x['disc_count']>0]
+    set_rec['media']={'schema':1,'kind':'optical-disc-set','disc_count':max(declared) if declared else len(rows),'discs':rows}
+    set_rec['disc_fingerprints']=[x['fingerprint'] for x in rows if x.get('fingerprint')]
+    set_rec['updated_at']=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+    return set_rec
+
+def family_norm(v:str)->str:
+    n=norm(v)
+    n=re.sub(r'\b(?:disc|disk|cd|dvd)\s*\d+(?:\s*(?:of)\s*\d+)?\b',' ',n)
+    return ' '.join(n.split())
+
+def title_set_match(title:str,existing:list[dict],disc_no=None,disc_count=None):
+    """Match a newly seen physical disc to an existing title, conservatively."""
+    n=family_norm(title)
+    if not n:return None,[]
+    exact=[]
+    for rec in existing:
+        aliases=[rec.get('title'),rec.get('sort_title'),*(rec.get('aliases') or [])]
+        if n in {family_norm(x) for x in aliases if x}:exact.append(rec)
+    if len(exact)==1:return exact[0],exact
+    # Fuzzy disc-family matching is only allowed when the media itself says it is
+    # part of a multi-disc set; this avoids folding sequels into their predecessor.
+    if not (disc_no or (isinstance(disc_count,int) and disc_count>1)):return None,exact
+    want=set(n.split()); scored=[]
+    for rec in existing:
+        rn=family_norm(rec.get('title') or '')
+        have=set(rn.split())
+        if not want or not have:continue
+        score=len(want&have)/max(1,len(want|have))
+        if score>=0.82:scored.append((score,rec))
+    scored.sort(key=lambda x:x[0],reverse=True)
+    if scored and (len(scored)==1 or scored[0][0]>scored[1][0]+0.08):return scored[0][1],[x[1] for x in scored]
+    return None,[x[1] for x in scored]
+
+def find_or_create_collection(title:str, existing:list[dict], now:str, edition=None):
+    normalized=norm(title);exact=[x for x in existing if str(x.get('normalized_title') or '')==normalized and normalized]
+    if exact:return exact[0],False,exact
+    cid=str(uuid.uuid4());rec={'schema':1,'id':cid,'title':title or 'Unidentified Game Collection','sort_title':title or 'Unidentified Game Collection','normalized_title':normalized,'release_year':None,'edition':edition,'publisher':None,'developer':None,'language':None,'region':None,'external_ids':{},'game_set_ids':[],'provisional':True,'created_at':now,'updated_at':now};existing.append(rec);return rec,True,[]
+
+def main():
+    ap=argparse.ArgumentParser(description='Collect pre-rip PC game/compilation metadata and associate optical media with game records')
+    ap.add_argument('device');ap.add_argument('--probe',required=True);ap.add_argument('--record',action='store_true')
+    args=ap.parse_args();dev=args.device if args.device.startswith('/dev/') else '/dev/'+args.device
+    probe=json.load(open(args.probe));fp=str(probe.get('fingerprint') or '')
+    if not fp:raise SystemExit('probe is missing fingerprint')
+    fs=probe.get('filesystem') or {};label=str(fs.get('label') or '').strip()
+    mount,_=mount_ro(dev);files=[];roots=[];autorun={}
+    try:
+        if mount:files,roots=scan(mount);autorun=autorun_info(mount)
+    finally:
+        if mount:
+            run(['umount',str(mount)],10)
+            try:mount.rmdir()
+            except OSError:pass
+    names=[Path(x).name.lower() for x,_ in files];engines=sorted({v for k,v in ENGINE_MARKERS.items() if k in names})
+    disc_no,disc_count=parse_disc_number(label,*roots)
+    now=dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+    # Two optical drives can finish preservation almost simultaneously.  Without
+    # a registry lock both metadata workers can read the same pre-create set list
+    # and each mint a UUID for the same game title.  Hold this lock through the
+    # read/match/write transaction so multi-disc imports converge on one set.
+    lock_path=Path('/run/pcga-game-disc-metadata.lock');lock_path.parent.mkdir(parents=True,exist_ok=True)
+    registry_lock=lock_path.open('a+')
+    fcntl.flock(registry_lock.fileno(),fcntl.LOCK_EX)
+    existing_sets=load_dir(SETS);existing_collections=load_dir(COLLECTIONS)
+    old_disc={};old_path=DISCS/f'{fp}.json'
+    if old_path.is_file():
+        try:old_disc=json.loads(old_path.read_text())
+        except Exception:old_disc={}
+
+    anthology=candidate_groups(files)
+    # Require at least two independently game-like roots. A single candidate is
+    # ordinary single-game evidence and follows the established game-set path.
+    # A confirmed user/review layout always wins over later heuristic scans.
+    locked_layout=str(old_disc.get('layout') or '') if old_disc.get('metadata_status')=='confirmed' else ''
+    is_compilation=(locked_layout=='compilation') if locked_layout else len(anthology)>=2
+    edition=None;low=(str(autorun.get('label') or '')+' '+label).casefold()
+    for word in EDITION_WORDS:
+        if word in low:edition=word.title();break
+
+    created_sets=[]
+    if is_compilation:
+        collection_title=slug_title(autorun.get('label') or label) or str(old_disc.get('collection_title') or '') or 'PC Game Collection'
+        pinned_collection=str(old_disc.get('collection_id') or '')
+        collection=next((x for x in existing_collections if str(x.get('id') or '')==pinned_collection),None) if pinned_collection else None
+        if collection is None:collection,created_collection,_=find_or_create_collection(collection_title,existing_collections,now,edition)
+        else:created_collection=False
+        contents=[]
+        if locked_layout=='compilation' and isinstance(old_disc.get('contents'),list) and old_disc.get('contents'):
+            contents=[dict(x) for x in old_disc['contents'] if isinstance(x,dict)]
+        else:
+            for cand in anthology:
+                s,created,_=find_or_create_set(cand['title'],existing_sets,now,evidence=cand.get('evidence'))
+                if created:created_sets.append(s)
+                contents.append({'game_set_id':s['id'],'title':s['title'],'source_path':cand['source_path'],'role':'included-game','confidence':cand['confidence'],'status':'provisional','installer':cand.get('installer'),'engines':cand.get('engines') or [],'evidence':cand.get('evidence') or []})
+        ids=[]
+        for x in contents:
+            if x['game_set_id'] not in ids:ids.append(x['game_set_id'])
+        collection['game_set_ids']=list(dict.fromkeys(list(collection.get('game_set_ids') or [])+ids));collection['updated_at']=now
+        meta={'schema':2,'fingerprint':fp,'device':dev,'layout':'compilation','collection_id':collection['id'],'collection_title':collection['title'],'game_set_id':None,'game_set_ids':ids,'contents':contents,'title':collection['title'],'series':None,'edition':collection.get('edition'),'disc_number':disc_no,'disc_count':disc_count,'disc_role':'collection-disc','volume_label':label,'filesystem_type':fs.get('type'),'content_guess':probe.get('content_guess'),'content_confidence':probe.get('content_confidence'),'installer':detect_installer(files),'engines':engines,'autorun':autorun,'root_entries':roots[:160],'source_file_count':len(files),'metadata_status':'provisional','metadata_sources':['filesystem','volume-label','directory-layout']+(['autorun'] if autorun else []),'match':{'method':'multi-game-directory-detection','confidence':min(x['confidence'] for x in contents),'candidate_set_ids':ids},'created_at':old_disc.get('created_at') or now,'updated_at':now}
+        if old_disc.get('metadata_status')=='confirmed':
+            # A reviewed anthology mapping wins over future heuristic rescans.
+            for key in ('layout','collection_id','collection_title','game_set_id','game_set_ids','contents','disc_number','disc_count','disc_role','title'):
+                if key in old_disc:meta[key]=old_disc[key]
+            meta['metadata_status']='confirmed'
+        if isinstance(old_disc.get('user_overrides'),dict):meta['user_overrides']=old_disc['user_overrides']
+        if args.record:
+            for s in created_sets:save(SETS/f"{s['id']}.json",s)
+            # Existing sets may have been reused unchanged; only collection needs updating.
+            save(COLLECTIONS/f"{collection['id']}.json",collection);save(DISCS/f'{fp}.json',meta)
+        print(json.dumps(meta,indent=2,sort_keys=True));return
+
+    # Established single-title / multi-disc-title path.
+    title=slug_title(autorun.get('label') or label)
+    identity_evidence=[]
+    # Optical mastering labels such as PST-DVD are evidence, not final product
+    # names.  First trust product assets explicitly referenced by AUTORUN.INF
+    # (for example ICON=Torment.ico).  Only then fall back to arbitrary shallow
+    # application filenames: retail discs often contain demos/bonus executables
+    # for other games, so a lone EXE name must not outrank the disc's own UI.
+    if weak_title(title):
+        autorun_candidates=autorun_title_candidates(autorun)
+        if autorun_candidates:
+            title=autorun_candidates[0]['title'];identity_evidence=autorun_candidates
+        else:
+            app_candidates=content_title_candidates(files)
+            if app_candidates:
+                title=app_candidates[0]
+                identity_evidence=[{'title':x,'kind':'content-filename','confidence':0.55} for x in app_candidates[:5]]
+    if not title or weak_title(title):
+        candidates=[]
+        for n in roots:
+            stem=Path(n).stem
+            if len(stem)>=4 and stem.lower() not in {'setup','install','autorun','readme'} and not weak_title(stem):candidates.append(stem)
+        if candidates:title=slug_title(max(candidates,key=len))
+    normalized=norm(title);family_match,family_candidates=title_set_match(title,existing_sets,disc_no,disc_count);exact=[x for x in existing_sets if str(x.get('normalized_title') or '')==normalized and normalized]
+    pinned_id=str(old_disc.get('game_set_id') or '')
+    set_rec=next((x for x in existing_sets if str(x.get('id') or '')==pinned_id),None) if pinned_id else None
+    created=False
+    if set_rec is None:set_rec=exact[0] if exact else family_match
+    if not set_rec:
+        set_rec,created,_=find_or_create_set(title or label or 'Unidentified PC Game',existing_sets,now)
+        if edition:set_rec['edition']=edition
+    else:
+        set_rec['updated_at']=now
+        if edition and not set_rec.get('edition'):set_rec['edition']=edition
+    sid=str(set_rec['id'])
+    sibling_discs=[]
+    if DISCS.exists():
+        for p in DISCS.glob('*.json'):
+            try:
+                d=json.loads(p.read_text())
+                ids=d.get('game_set_ids') if isinstance(d.get('game_set_ids'),list) else [d.get('game_set_id')]
+                if sid in ids and d.get('fingerprint')!=fp:sibling_discs.append(d)
+            except Exception:pass
+    if disc_no is None and sibling_discs:
+        used={int(x['disc_number']) for x in sibling_discs if isinstance(x.get('disc_number'),int)};n=1
+        while n in used:n+=1
+        disc_no=n
+    role=None
+    for word,val in ROLE_WORDS.items():
+        if re.search(r'(?i)\b'+re.escape(word)+r'\b',label):role=val;break
+    if not role:role='installer' if any(x in names for x in ('setup.exe','install.exe')) else 'data'
+    layout='multi-disc-game' if disc_no is not None or disc_count is not None or sibling_discs else 'single-game'
+    content={'game_set_id':sid,'title':set_rec['title'],'source_path':'.','role':'included-game','confidence':1.0 if pinned_id else (0.98 if exact else 0.65),'status':'provisional','installer':detect_installer(files),'engines':engines,'identity_evidence':identity_evidence[:8]}
+    match_method='existing-disc-assignment' if pinned_id and set_rec else ('normalized-title-exact' if exact else ('title-disc-family' if family_match else ('autorun-product-evidence' if identity_evidence and str(identity_evidence[0].get('kind','')).startswith('autorun-') else 'new-provisional-set')))
+    match_conf=1.0 if pinned_id and set_rec else (0.98 if exact else (0.90 if family_match else (float(identity_evidence[0].get('confidence',0.65)) if identity_evidence else 0.65)))
+    meta={'schema':2,'fingerprint':fp,'device':dev,'layout':layout,'collection_id':None,'collection_title':None,'game_set_id':sid,'game_set_ids':[sid],'contents':[content],'title':set_rec['title'],'series':set_rec.get('series'),'edition':set_rec.get('edition'),'disc_number':disc_no,'disc_count':disc_count,'disc_role':role,'volume_label':label,'filesystem_type':fs.get('type'),'content_guess':probe.get('content_guess'),'content_confidence':probe.get('content_confidence'),'installer':detect_installer(files),'engines':engines,'autorun':autorun,'identity_evidence':identity_evidence[:8],'root_entries':roots[:160],'source_file_count':len(files),'metadata_status':'provisional','metadata_sources':['filesystem','volume-label']+(['autorun'] if autorun else []),'match':{'method':match_method,'confidence':match_conf,'candidate_set_ids':[x.get('id') for x in (exact or family_candidates)[:5]]},'created_at':old_disc.get('created_at') or now,'updated_at':now}
+    if old_disc.get('metadata_status')=='confirmed':
+        for key in ('layout','collection_id','collection_title','game_set_id','game_set_ids','contents','disc_number','disc_count','disc_role','title'):
+            if key in old_disc:meta[key]=old_disc[key]
+        meta['metadata_status']='confirmed'
+    if isinstance(old_disc.get('user_overrides'),dict):
+        meta['user_overrides']=old_disc['user_overrides']
+        for key,val in old_disc['user_overrides'].items():
+            if key in {'disc_number','disc_count','disc_role','layout','collection_id','game_set_ids'}:meta[key]=val
+    if title and family_norm(title) != family_norm(set_rec.get('title') or ''):
+        aliases=list(set_rec.get('aliases') or [])
+        if title not in aliases: aliases.append(title)
+        set_rec['aliases']=aliases[-16:]
+    set_rec=sync_title_disc_inventory(set_rec,meta)
+    if args.record:
+        save(SETS/f'{sid}.json',set_rec);save(DISCS/f'{fp}.json',meta)
+    print(json.dumps(meta,indent=2,sort_keys=True))
+
+if __name__=='__main__':main()

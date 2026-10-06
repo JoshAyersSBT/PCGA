@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -u
+log(){ printf '[pcga-auth] %s\n' "$*"; }
+
+PCGA_GAME_STACK_LOCK="${PCGA_GAME_STACK_LOCK:-/run/pcga-game-stack-start.lock}"
+pcga_acquire_game_stack_lock(){
+  [[ "${PCGA_GAME_STACK_LOCK_HELD:-0}" == 1 ]] && return 0
+  exec 9>"$PCGA_GAME_STACK_LOCK"
+  if ! flock -w "${PCGA_GAME_STACK_LOCK_TIMEOUT:-180}" 9; then
+    printf '[pcga-lock] Timed out waiting for game-stack reconciliation lock: %s\n' "$PCGA_GAME_STACK_LOCK" >&2
+    return 75
+  fi
+  export PCGA_GAME_STACK_LOCK_HELD=1
+}
+pcga_acquire_game_stack_lock || exit $?
+failed=0
+/usr/local/sbin/pcga-appliance-credentials || exit 1
+/usr/local/sbin/pcga-game-stack-start --ensure || { log 'Game-stack reconciliation failed; timer will retry'; failed=1; }
+romm_present=0
+if docker inspect -f '{{.State.Running}}' romm 2>/dev/null | grep -qx true; then
+  romm_present=1
+  romm_state="$(cat /var/lib/pc-game-archive/bootstrap/romm.state 2>/dev/null || true)"
+  if [[ "$romm_state" != ready ]]; then
+    /usr/local/sbin/pcga-romm-bootstrap || { log 'RomM reconciliation failed; timer will retry'; failed=1; }
+  fi
+fi
+if docker inspect -f '{{.State.Running}}' lancommander 2>/dev/null | grep -qx true; then
+  lan_state="$(cat /var/lib/pc-game-archive/bootstrap/lancommander.state 2>/dev/null || true)"
+  if [[ "$lan_state" != ready ]]; then
+    /usr/local/sbin/pcga-lancommander-bootstrap || { log 'LANCommander reconciliation failed; timer will retry'; failed=1; }
+  fi
+fi
+if docker inspect -f '{{.State.Running}}' pcga-moonlight-web 2>/dev/null | grep -qx true; then
+  moon_state="$(python3 - <<'PY'
+import json
+try: print(json.load(open('/var/lib/pc-game-archive/bootstrap/moonlight-web.json')).get('state',''))
+except Exception: print('')
+PY
+)"
+  if [[ "$moon_state" != ready ]]; then
+    /usr/local/sbin/pcga-moonlight-web-bootstrap || { log 'Moonlight Web reconciliation failed; timer will retry'; failed=1; }
+  fi
+fi
+if docker inspect -f '{{.State.Running}}' immich_server 2>/dev/null | grep -qx true; then
+  immich_state="$(cat /var/lib/pc-game-archive/bootstrap/immich.state 2>/dev/null || true)"
+  if [[ "$immich_state" != ready && "$immich_state" != external ]]; then
+    /usr/local/sbin/pcga-immich-bootstrap || { log 'Immich reconciliation failed; timer will retry'; failed=1; }
+  fi
+fi
+if docker inspect -f '{{.State.Running}}' jellyfin 2>/dev/null | grep -qx true; then
+  jellyfin_state="$(cat /var/lib/pc-game-archive/bootstrap/jellyfin.state 2>/dev/null || true)"
+  if [[ "$jellyfin_state" != ready ]]; then
+    /usr/local/sbin/pcga-jellyfin-appliance-user >/dev/null 2>&1 || { log 'Jellyfin common-account reconciliation failed; timer will retry'; failed=1; }
+  fi
+fi
+# Warm the portal's scoped RomM bearer-token cache. This is best-effort because
+# pcga-status may still be starting when the boot service runs.
+status_port=8098
+if [[ -r /opt/pc-game-archive/.env ]]; then p="$(awk -F= '$1=="STATUS_PORT"{print $2}' /opt/pc-game-archive/.env | tail -n1)"; [[ -n "$p" ]] && status_port="$p"; fi
+if [[ "$romm_present" -eq 1 ]]; then
+  if ! curl -fsS --max-time 8 "http://127.0.0.1:${status_port}/api/games/health" | python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin).get("available") is True else 1)' >/dev/null 2>&1; then
+    log 'RomM portal authentication warm-up is not healthy yet; timer will retry'
+    failed=1
+  fi
+fi
+exit "$failed"

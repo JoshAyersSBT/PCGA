@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+import argparse, hashlib, html, json, os, re, shutil, subprocess, threading, time, urllib.error, urllib.parse, urllib.request, uuid
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from xml.sax.saxutils import escape as xesc
+
+VERSION='0.18.6'
+UA=f'PC-Game-Archive/{VERSION} (+local public media importer)'
+SOURCES={
+    'feature_films': {'name':'Feature Films','query':'collection:feature_films AND mediatype:movies','default':'movies','note':'Internet Archive public-domain-oriented Feature Films collection.'},
+    'classic_tv': {'name':'Classic TV','query':'collection:classic_tv AND mediatype:movies','default':'home-videos','note':'Classic TV submissions; imported to Home Videos unless you explicitly choose Movies.'},
+    'prelinger': {'name':'Prelinger Archives','query':'collection:prelinger AND mediatype:movies','default':'home-videos','note':'Rights vary by item; PCGA requires an explicit Creative Commons/Public Domain signal before import.'},
+}
+SAFE_ID=re.compile(r'^[A-Za-z0-9._-]{1,180}$')
+VIDEO_EXT={'.mp4','.m4v','.mov','.ogv','.webm'}
+
+ROM_PLATFORMS={
+    'nes': {'name':'Nintendo Entertainment System','exts':{'.nes'},'terms':['NES','Nintendo Entertainment System']},
+    'snes': {'name':'Super Nintendo','exts':{'.sfc','.smc'},'terms':['SNES','Super Nintendo']},
+    'gb': {'name':'Game Boy','exts':{'.gb'},'terms':['Game Boy']},
+    'gbc': {'name':'Game Boy Color','exts':{'.gbc'},'terms':['Game Boy Color']},
+    'gba': {'name':'Game Boy Advance','exts':{'.gba'},'terms':['Game Boy Advance']},
+    'n64': {'name':'Nintendo 64','exts':{'.z64','.n64','.v64'},'terms':['Nintendo 64','N64']},
+    'nds': {'name':'Nintendo DS','exts':{'.nds'},'terms':['Nintendo DS','NDS']},
+    'genesis': {'name':'Genesis / Mega Drive','exts':{'.md','.gen','.bin'},'terms':['Genesis','Mega Drive']},
+    'sms': {'name':'Master System','exts':{'.sms'},'terms':['Master System']},
+    'gamegear': {'name':'Game Gear','exts':{'.gg'},'terms':['Game Gear']},
+    'sega32': {'name':'Sega 32X','exts':{'.32x'},'terms':['32X']},
+    'atari2600': {'name':'Atari 2600','exts':{'.a26'},'terms':['Atari 2600']},
+    'atari5200': {'name':'Atari 5200','exts':{'.a52'},'terms':['Atari 5200']},
+    'atari7800': {'name':'Atari 7800','exts':{'.a78'},'terms':['Atari 7800']},
+    'lynx': {'name':'Atari Lynx','exts':{'.lnx'},'terms':['Atari Lynx']},
+    'jaguar': {'name':'Atari Jaguar','exts':{'.j64','.jag'},'terms':['Atari Jaguar']},
+    'tg16': {'name':'TurboGrafx-16','exts':{'.pce'},'terms':['TurboGrafx','PC Engine']},
+    'virtualboy': {'name':'Virtual Boy','exts':{'.vb'},'terms':['Virtual Boy']},
+    'wonderswan': {'name':'WonderSwan','exts':{'.ws'},'terms':['WonderSwan']},
+    'wonderswan-color': {'name':'WonderSwan Color','exts':{'.wsc'},'terms':['WonderSwan Color']},
+    'neo-geo-pocket': {'name':'Neo Geo Pocket','exts':{'.ngp'},'terms':['Neo Geo Pocket']},
+    'neo-geo-pocket-color': {'name':'Neo Geo Pocket Color','exts':{'.ngc'},'terms':['Neo Geo Pocket Color']},
+    'colecovision': {'name':'ColecoVision','exts':{'.col'},'terms':['ColecoVision']},
+    'c64': {'name':'Commodore 64','exts':{'.d64','.t64','.crt'},'terms':['Commodore 64','C64']},
+    'amiga': {'name':'Amiga','exts':{'.adf','.adz','.hdf'},'terms':['Amiga']},
+    'zxs': {'name':'ZX Spectrum','exts':{'.tap','.tzx','.z80','.sna'},'terms':['ZX Spectrum']},
+    'psx': {'name':'PlayStation','exts':{'.chd','.pbp','.iso'},'terms':['PlayStation','PS1','PSX']},
+    'psp': {'name':'PlayStation Portable','exts':{'.iso','.cso','.pbp'},'terms':['PSP','PlayStation Portable']},
+    'saturn': {'name':'Sega Saturn','exts':{'.chd','.iso'},'terms':['Sega Saturn']},
+    'segacd': {'name':'Sega CD','exts':{'.chd','.iso'},'terms':['Sega CD','Mega CD']},
+    '3do': {'name':'3DO','exts':{'.chd','.iso'},'terms':['3DO']},
+    'pc-fx': {'name':'PC-FX','exts':{'.chd'},'terms':['PC-FX']},
+    'turbografx-cd': {'name':'TurboGrafx-CD','exts':{'.chd'},'terms':['TurboGrafx-CD','PC Engine CD']},
+    'philips-cd-i': {'name':'Philips CD-i','exts':{'.chd'},'terms':['CD-i','CDI']},
+}
+ROM_EXT_PLATFORMS={}
+for _slug,_info in ROM_PLATFORMS.items():
+    for _ext in _info['exts']:
+        ROM_EXT_PLATFORMS.setdefault(_ext,[]).append(_slug)
+ROM_SEARCH_BASE='mediatype:software AND (subject:(homebrew OR freeware OR abandonware OR "public domain" OR "creative commons") OR description:(homebrew OR freeware OR abandonware OR "public domain" OR "creative commons") OR licenseurl:creativecommons.org*)' 
+
+
+# Browser uploads land here first, then the intake worker routes them through the
+# same canonical libraries used by optical ingest and the public-media importer.
+UPLOAD_HINTS={'auto','movie','tv','music','home-video','photos','pc-game','software','disc-image','rom','bios'}
+IMAGE_EXT={'.jpg','.jpeg','.png','.webp','.gif','.avif','.bmp','.tif','.tiff','.heic','.heif','.dng'}
+AUDIO_EXT={'.flac','.mp3','.m4a','.aac','.ogg','.opus','.wav','.wma','.alac','.ape'}
+LOCAL_VIDEO_EXT={'.mkv','.mp4','.m4v','.avi','.mov','.mpg','.mpeg','.ts','.m2ts','.vob','.webm','.ogv'}
+UPLOAD_SESSION_RE=re.compile(r'^[a-f0-9]{20,64}$')
+MAX_UPLOAD_BYTES=max(1024*1024,int(os.environ.get('PCGA_MAX_UPLOAD_BYTES',str(128*1024**3))))
+UPLOAD_SIDECAR_EXT={'.txt','.nfo','.xml','.json','.jpg','.jpeg','.png','.webp','.cue','.m3u'}
+
+class State:
+    def __init__(self, root: Path):
+        self.root=root
+        self.jobs_dir=Path('/var/lib/pc-game-archive/public-media')
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.upload_root=self.root/'ingest/user-uploads'
+        self.upload_staging=self.upload_root/'staging'
+        self.upload_staging.mkdir(parents=True, exist_ok=True)
+        self.lock=threading.Lock()
+        self.jobs={}
+        for job_file in sorted(self.jobs_dir.glob('*.json'), key=lambda x:x.stat().st_mtime, reverse=True)[:80]:
+            try:
+                job=json.loads(job_file.read_text(encoding='utf-8'))
+                if isinstance(job,dict) and job.get('id'): self.jobs[str(job['id'])]=job
+            except Exception:
+                pass
+
+    def save_job(self,j):
+        p=self.jobs_dir/f"{j['id']}.json"
+        tmp=p.with_suffix('.tmp')
+        tmp.write_text(json.dumps(j,indent=2,sort_keys=True),encoding='utf-8')
+        os.replace(tmp,p)
+
+STATE=None
+
+def http_json(url, timeout=12):
+    req=urllib.request.Request(url,headers={'User-Agent':UA,'Accept':'application/json'})
+    with urllib.request.urlopen(req,timeout=timeout) as r:
+        return json.loads(r.read().decode('utf-8','replace'))
+
+def search_archive(source, q, page=1, rows=20):
+    src=SOURCES[source]
+    terms=src['query']
+    q=(q or '').strip()
+    if q:
+        safe=' '.join(re.findall(r'[\w\-\.]{2,}',q,flags=re.UNICODE)[:8])
+        if safe:
+            terms=f'({terms}) AND (title:({safe}) OR description:({safe}) OR creator:({safe}))'
+    params=[('q',terms),('fl[]','identifier'),('fl[]','title'),('fl[]','creator'),('fl[]','date'),('fl[]','year'),('fl[]','description'),('fl[]','licenseurl'),('fl[]','rights'),('fl[]','collection'),('fl[]','downloads'),('rows',str(rows)),('page',str(max(1,page))),('output','json'),('sort[]','downloads desc')]
+    data=http_json('https://archive.org/advancedsearch.php?'+urllib.parse.urlencode(params))
+    docs=((data.get('response') or {}).get('docs') or [])
+    out=[]
+    for d in docs:
+        ident=str(d.get('identifier') or '')
+        if not SAFE_ID.fullmatch(ident):
+            continue
+        out.append({
+            'identifier':ident,'title':str(d.get('title') or ident)[:240],
+            'creator':flatten(d.get('creator'))[:200], 'date':str(d.get('date') or d.get('year') or '')[:32],
+            'description':flatten(d.get('description'))[:420], 'downloads':intish(d.get('downloads')),
+            'rights_hint':rights_hint(d), 'source':source,
+        })
+    return {'source':source,'source_name':src['name'],'page':page,'num_found':intish((data.get('response') or {}).get('numFound')),'items':out}
+
+def flatten(v):
+    if isinstance(v,list): return '; '.join(str(x) for x in v if x is not None)
+    if isinstance(v,dict): return ' '.join(str(x) for x in v.values())
+    return str(v or '')
+
+def intish(v):
+    try:return int(v or 0)
+    except:return 0
+
+def metadata(identifier):
+    if not SAFE_ID.fullmatch(identifier): raise ValueError('invalid identifier')
+    return http_json('https://archive.org/metadata/'+urllib.parse.quote(identifier,safe=''))
+
+def rights_hint(meta):
+    text=' '.join([flatten(meta.get('licenseurl')),flatten(meta.get('rights')),flatten(meta.get('description'))]).lower()
+    if 'creativecommons.org/publicdomain' in text or 'public domain' in text or 'cc0' in text:
+        return 'public-domain'
+    if 'creativecommons.org/licenses/' in text or 'creative commons' in text:
+        return 'creative-commons'
+    return 'collection-policy'
+
+def item_collections(m):
+    c=m.get('collection')
+    if isinstance(c,list): return {str(x) for x in c}
+    if c: return {str(c)}
+    return set()
+
+def rights_status(meta,source):
+    m=meta.get('metadata') or {}
+    hint=rights_hint(m)
+    cols=item_collections(m)
+    if hint in {'public-domain','creative-commons'}:
+        return {'allowed':True,'basis':hint,'detail':flatten(m.get('licenseurl') or m.get('rights'))[:500]}
+    if source in {'feature_films','classic_tv'} and source in cols:
+        return {'allowed':True,'basis':'collection-policy','detail':'Imported from an Internet Archive collection intended for public-domain submissions. Verify item rights if you plan to redistribute it.'}
+    return {'allowed':False,'basis':'unverified','detail':'No explicit Creative Commons/Public Domain signal was found for this item.'}
+
+def choose_video(meta,quality='balanced'):
+    files=meta.get('files') or []
+    cand=[]
+    for f in files:
+        name=str(f.get('name') or '')
+        ext=Path(name).suffix.lower()
+        if ext not in VIDEO_EXT: continue
+        low=name.lower()
+        if any(x in low for x in ('thumb','sample','clip','trailer')): continue
+        size=intish(f.get('size'))
+        fmt=str(f.get('format') or '')
+        score=0
+        if ext=='.mp4': score+=100
+        if any(x in fmt.lower() for x in ('h.264','h264','mpeg4','mpeg-4','avc')): score+=45
+        if str(f.get('source') or '').lower()=='original': score+=10
+        if size>20_000_000: score+=20
+        cand.append((score,size,name,fmt))
+    if not cand: raise ValueError('No downloadable video derivative was found for this item.')
+    if quality=='compact':
+        cand.sort(key=lambda x: (x[0], -(x[1] if x[1] else 10**18)), reverse=True)
+        plausible=[x for x in cand if x[1]>=30_000_000]
+        if plausible: return min(plausible,key=lambda x:x[1])
+    elif quality=='best':
+        cand.sort(key=lambda x:(x[0],x[1]),reverse=True); return cand[0]
+    # balanced: prefer high-scoring mp4 <= 4 GiB, then best overall
+    plausible=[x for x in cand if x[1] and x[1] <= 4*1024**3]
+    if plausible:
+        plausible.sort(key=lambda x:(x[0],x[1]),reverse=True); return plausible[0]
+    cand.sort(key=lambda x:(x[0],x[1]),reverse=True); return cand[0]
+
+def rom_rights_hint(meta):
+    text=' '.join([flatten(meta.get('licenseurl')),flatten(meta.get('rights')),flatten(meta.get('description')),flatten(meta.get('subject'))]).lower()
+    if 'creativecommons.org/publicdomain' in text or 'public domain' in text or 'cc0' in text:
+        return 'public-domain'
+    if 'creativecommons.org/licenses/' in text or 'creative commons' in text:
+        return 'creative-commons'
+    if any(x in text for x in ('permission granted to distribute','freely distributable','may be distributed freely','redistribution permitted')):
+        return 'permission-stated'
+    if 'homebrew' in text:
+        return 'homebrew-review'
+    if 'freeware' in text:
+        return 'freeware-review'
+    if 'abandonware' in text:
+        return 'abandonware-review'
+    return 'unverified'
+
+def rom_rights_status(meta):
+    m=meta.get('metadata') or {}
+    hint=rom_rights_hint(m)
+    detail=flatten(m.get('licenseurl') or m.get('rights'))[:700]
+    if hint in {'public-domain','creative-commons','permission-stated'}:
+        return {'allowed':True,'basis':hint,'detail':detail or 'Archive.org item metadata contains an explicit reuse/distribution signal.'}
+    return {'allowed':False,'basis':hint,'detail':detail or 'No explicit public-domain, Creative Commons, or redistribution permission was found in the item metadata.'}
+
+def _rom_search_terms(platform):
+    info=ROM_PLATFORMS.get(platform) or {}
+    terms=info.get('terms') or []
+    if not terms: return ''
+    parts=[]
+    for t in terms[:4]:
+        t=str(t).replace('"',' ').strip()
+        if not t: continue
+        parts.append(f'"{t}"' if ' ' in t else t)
+    if not parts:return ''
+    joined=' OR '.join(parts)
+    return f' AND (subject:({joined}) OR title:({joined}) OR description:({joined}))'
+
+def search_archive_roms(q, platform='', page=1, rows=24):
+    if platform and platform not in ROM_PLATFORMS: raise ValueError('unsupported platform')
+    terms=ROM_SEARCH_BASE+_rom_search_terms(platform)
+    q=(q or '').strip(); safe=''
+    if q:
+        safe=' '.join(re.findall(r'[\w\-\.]{2,}',q,flags=re.UNICODE)[:8])
+        if safe: terms=f'({terms}) AND (title:({safe}) OR description:({safe}) OR subject:({safe}) OR creator:({safe}))'
+    params=[('q',terms),('fl[]','identifier'),('fl[]','title'),('fl[]','creator'),('fl[]','date'),('fl[]','year'),('fl[]','description'),('fl[]','licenseurl'),('fl[]','rights'),('fl[]','subject'),('fl[]','downloads'),('rows',str(max(1,min(rows,40)))),('page',str(max(1,page))),('output','json'),('sort[]','downloads desc')]
+    try:
+        data=http_json('https://archive.org/advancedsearch.php?'+urllib.parse.urlencode(params))
+    except Exception:
+        fallback='mediatype:software AND (subject:homebrew OR subject:freeware OR subject:abandonware OR subject:"public domain")'+_rom_search_terms(platform)
+        if q and safe: fallback+=f' AND (title:({safe}) OR description:({safe}) OR subject:({safe}))'
+        params=[('q',fallback),('fl[]','identifier'),('fl[]','title'),('fl[]','creator'),('fl[]','date'),('fl[]','year'),('fl[]','description'),('fl[]','licenseurl'),('fl[]','rights'),('fl[]','subject'),('fl[]','downloads'),('rows',str(max(1,min(rows,40)))),('page',str(max(1,page))),('output','json'),('sort[]','downloads desc')]
+        data=http_json('https://archive.org/advancedsearch.php?'+urllib.parse.urlencode(params))
+    docs=((data.get('response') or {}).get('docs') or [])
+    out=[]
+    for d in docs:
+        ident=str(d.get('identifier') or '')
+        if not SAFE_ID.fullmatch(ident): continue
+        hint=rom_rights_hint(d)
+        out.append({'identifier':ident,'title':str(d.get('title') or ident)[:240],'creator':flatten(d.get('creator'))[:200],'date':str(d.get('date') or d.get('year') or '')[:32],'description':flatten(d.get('description'))[:420],'downloads':intish(d.get('downloads')),'rights_hint':hint,'verified_rights':hint in {'public-domain','creative-commons','permission-stated'},'platform':platform})
+    return {'page':page,'platform':platform,'num_found':intish((data.get('response') or {}).get('numFound')),'items':out,'rights_policy':'One-click import requires explicit public-domain, Creative Commons, or redistribution permission in Archive.org item metadata.'}
+
+def rom_candidates(meta, platform=''):
+    if platform and platform not in ROM_PLATFORMS: raise ValueError('unsupported platform')
+    out=[]; allowed=ROM_PLATFORMS.get(platform,{}).get('exts') if platform else None
+    for f in meta.get('files') or []:
+        name=str(f.get('name') or '')
+        if not name or name.endswith('/') or len(name)>420: continue
+        ext=Path(name).suffix.lower()
+        if allowed is not None:
+            if ext not in allowed: continue
+            platforms=[platform]
+        else:
+            platforms=list(ROM_EXT_PLATFORMS.get(ext,[]))
+            if not platforms: continue
+        low=name.lower()
+        if any(x in low for x in ('__macosx/','/._','thumb','screenshot','manual')): continue
+        if str(f.get('private') or '').lower() in {'true','1'}: continue
+        out.append({'name':name,'basename':Path(name).name,'ext':ext,'size':intish(f.get('size')),'format':str(f.get('format') or '')[:120],'platforms':platforms})
+    out.sort(key=lambda x:(len(x['platforms'])!=1,-x['size'],x['name'].lower()))
+    return out[:120]
+
+def rom_item(identifier, platform=''):
+    meta=metadata(identifier); m=meta.get('metadata') or {}; rights=rom_rights_status(meta)
+    return {'identifier':identifier,'title':str(m.get('title') or identifier)[:240],'creator':flatten(m.get('creator'))[:200],'description':flatten(m.get('description'))[:700],'rights':rights,'platform':platform,'files':rom_candidates(meta,platform),'archive_url':'https://archive.org/details/'+identifier}
+
+def write_rom_provenance(dest, meta, identifier, source_name, rights, platform):
+    prov_root=STATE.root/'media/library/console-games/.pcga-source'/platform; prov_root.mkdir(parents=True,exist_ok=True)
+    key=re.sub(r'[^A-Za-z0-9._-]+','_',dest.name)[:180]+'.json'
+    record={'source':'archive.org','identifier':identifier,'file':source_name,'platform':platform,'destination':str(dest),'rights':rights,'imported_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())}
+    (prov_root/key).write_text(json.dumps(record,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+
+def start_rom_import(payload):
+    identifier=str(payload.get('identifier') or ''); source_name=str(payload.get('file') or ''); platform=str(payload.get('platform') or '').strip().lower()
+    if not SAFE_ID.fullmatch(identifier) or platform not in ROM_PLATFORMS: raise ValueError('invalid identifier or platform')
+    if not source_name or len(source_name)>420 or source_name.startswith('/') or '..' in Path(source_name).parts: raise ValueError('invalid ROM file')
+    jid=uuid.uuid4().hex[:16]
+    job={'id':jid,'kind':'rom','identifier':identifier,'file':source_name,'platform':platform,'state':'queued','progress':0,'bytes_done':0,'bytes_total':0,'title':Path(source_name).stem,'message':'Queued for ROM collection','created_at':time.time()}
+    with STATE.lock: STATE.jobs[jid]=job; STATE.save_job(job)
+    threading.Thread(target=run_rom_import,args=(jid,),daemon=True).start(); return job
+
+def request_romm_rescan():
+    req=urllib.request.Request('http://127.0.0.1:8098/api/games/rescan',data=b'{}',headers={'Content-Type':'application/json','User-Agent':UA},method='POST')
+    try:
+        with urllib.request.urlopen(req,timeout=8) as r:
+            data=json.loads(r.read().decode('utf-8','replace') or '{}')
+            return bool(data.get('ok')), str(data.get('detail') or data.get('state') or '')[:240]
+    except Exception as exc:
+        return False, type(exc).__name__
+
+def run_rom_import(jid):
+    j=STATE.jobs[jid]; tmp=None
+    try:
+        update_job(jid,state='metadata',message='Validating Archive.org ROM metadata and rights')
+        meta=metadata(j['identifier']); rights=rom_rights_status(meta)
+        if not rights['allowed']: raise RuntimeError('Rights review required: '+rights['detail'])
+        candidates={x['name']:x for x in rom_candidates(meta,j['platform'])}; cand=candidates.get(j['file'])
+        if not cand: raise RuntimeError('The selected file is not a supported ROM for this platform.')
+        folder=STATE.root/'media/library/console-games/roms'/j['platform']; folder.mkdir(parents=True,exist_ok=True)
+        dest=folder/safe_name(Path(j['file']).name)
+        prov=STATE.root/'media/library/console-games/.pcga-source'/j['platform']/(re.sub(r'[^A-Za-z0-9._-]+','_',dest.name)[:180]+'.json')
+        if dest.exists() and prov.exists():
+            try:
+                prior=json.loads(prov.read_text(encoding='utf-8'))
+                if prior.get('identifier')==j['identifier'] and prior.get('file')==j['file']:
+                    update_job(jid,state='complete',progress=100,bytes_done=dest.stat().st_size,bytes_total=dest.stat().st_size,message='Already present in the RomM library',destination=str(dest),rights=rights); return
+            except Exception: pass
+        if dest.exists(): raise RuntimeError(f'Destination already exists: {dest.name}')
+        tmp=dest.with_name(dest.name+'.part')
+        url='https://archive.org/download/'+urllib.parse.quote(j['identifier'],safe='')+'/'+urllib.parse.quote(j['file'],safe='/')
+        req=urllib.request.Request(url,headers={'User-Agent':UA})
+        update_job(jid,state='downloading',message=f'Downloading {Path(j["file"]).name}',bytes_total=cand['size'] or 0)
+        with urllib.request.urlopen(req,timeout=30) as r, open(tmp,'wb') as out:
+            total=intish(r.headers.get('Content-Length')) or cand['size']; done=0; last=0
+            while True:
+                chunk=r.read(1024*1024)
+                if not chunk: break
+                out.write(chunk); done+=len(chunk); now=time.time()
+                if now-last>.6:
+                    update_job(jid,bytes_done=done,bytes_total=total,progress=round(done*100/total,1) if total else 0); last=now
+            out.flush(); os.fsync(out.fileno())
+        os.replace(tmp,dest); tmp=None
+        try:
+            st=folder.stat(); os.chown(dest,st.st_uid,st.st_gid); os.chmod(dest,0o644)
+        except OSError: pass
+        write_rom_provenance(dest,meta,j['identifier'],j['file'],rights,j['platform'])
+        scan_ok,scan_detail=request_romm_rescan()
+        msg='Imported and queued for RomM indexing' if scan_ok else 'Imported; RomM filesystem watcher will index it automatically'
+        update_job(jid,state='complete',progress=100,bytes_done=dest.stat().st_size,bytes_total=dest.stat().st_size,message=msg,destination=str(dest),rights=rights,rescan_requested=scan_ok,rescan_detail=scan_detail)
+    except Exception as e:
+        if tmp:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
+        try:update_job(jid,state='error',message=str(e)[:700])
+        except Exception:pass
+
+def safe_name(s):
+    s=re.sub(r'[<>:"/\\|?*\x00-\x1f]',' ',str(s or 'Untitled'))
+    s=re.sub(r'\s+',' ',s).strip(' .')
+    return (s or 'Untitled')[:180]
+
+def year_from(meta):
+    m=meta.get('metadata') or {}
+    for v in (m.get('year'),m.get('date')):
+        mm=re.search(r'\b(18|19|20)\d{2}\b',str(v or ''))
+        if mm:return mm.group(0)
+    return ''
+
+def write_nfo(dest: Path, meta, identifier, rights):
+    m=meta.get('metadata') or {}
+    title=safe_name(m.get('title') or identifier); year=year_from(meta); plot=flatten(m.get('description'))[:3000]
+    creator=flatten(m.get('creator'))[:500]
+    xml=['<?xml version="1.0" encoding="UTF-8"?>','<movie>',f'  <title>{xesc(title)}</title>']
+    if year: xml.append(f'  <year>{year}</year>')
+    if plot: xml.append(f'  <plot>{xesc(plot)}</plot>')
+    if creator: xml.append(f'  <studio>{xesc(creator)}</studio>')
+    xml += ['  <tag>Internet Archive</tag>',f'  <tag>{xesc(rights.get("basis","rights-unknown"))}</tag>',f'  <uniqueid type="archiveorg">{xesc(identifier)}</uniqueid>','</movie>']
+    dest.with_suffix('.nfo').write_text('\n'.join(xml)+'\n',encoding='utf-8')
+    dest.with_suffix('.pcga-source.json').write_text(json.dumps({'source':'archive.org','identifier':identifier,'rights':rights,'imported_at':time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime())},indent=2),encoding='utf-8')
+
+def start_import(payload):
+    identifier=str(payload.get('identifier') or '')
+    source=str(payload.get('source') or '')
+    library=str(payload.get('library') or '')
+    quality=str(payload.get('quality') or 'balanced')
+    if source not in SOURCES or not SAFE_ID.fullmatch(identifier): raise ValueError('invalid source or identifier')
+    if library not in {'movies','home-videos'}: library=SOURCES[source]['default']
+    if quality not in {'compact','balanced','best'}: quality='balanced'
+    jid=uuid.uuid4().hex[:16]
+    job={'id':jid,'identifier':identifier,'source':source,'library':library,'quality':quality,'state':'queued','progress':0,'bytes_done':0,'bytes_total':0,'title':identifier,'message':'Queued','created_at':time.time()}
+    with STATE.lock: STATE.jobs[jid]=job; STATE.save_job(job)
+    t=threading.Thread(target=run_import,args=(jid,),daemon=True); t.start()
+    return job
+
+def update_job(jid,**kw):
+    with STATE.lock:
+        j=STATE.jobs[jid]; j.update(kw); STATE.save_job(j); return dict(j)
+
+def run_import(jid):
+    j=STATE.jobs[jid]
+    try:
+        update_job(jid,state='metadata',message='Reading Internet Archive metadata')
+        meta=metadata(j['identifier']); m=meta.get('metadata') or {}
+        title=safe_name(m.get('title') or j['identifier']); year=year_from(meta)
+        rights=rights_status(meta,j['source'])
+        if not rights['allowed']: raise RuntimeError(rights['detail'])
+        score,size,name,fmt=choose_video(meta,j['quality'])
+        final_base=title+(f' ({year})' if year else '')
+        if j['library']=='movies':
+            folder=STATE.root/'media/library/movies'/final_base; folder.mkdir(parents=True,exist_ok=True)
+            dest=folder/(final_base+Path(name).suffix.lower())
+        else:
+            folder=STATE.root/'media/library/home-videos'/'Internet Archive'; folder.mkdir(parents=True,exist_ok=True)
+            dest=folder/(final_base+Path(name).suffix.lower())
+        if dest.exists(): raise RuntimeError(f'Destination already exists: {dest.name}')
+        tmp=dest.with_name(dest.name+'.part')
+        url='https://archive.org/download/'+urllib.parse.quote(j['identifier'],safe='')+'/'+urllib.parse.quote(name,safe='')
+        req=urllib.request.Request(url,headers={'User-Agent':UA})
+        update_job(jid,state='downloading',title=title,filename=name,format=fmt,message=f'Downloading {name}',bytes_total=size or 0)
+        with urllib.request.urlopen(req,timeout=30) as r, open(tmp,'wb') as out:
+            total=intish(r.headers.get('Content-Length')) or size
+            done=0; last=0
+            while True:
+                chunk=r.read(1024*1024)
+                if not chunk: break
+                out.write(chunk); done+=len(chunk)
+                now=time.time()
+                if now-last>.6:
+                    update_job(jid,bytes_done=done,bytes_total=total,progress=round(done*100/total,1) if total else 0); last=now
+            out.flush(); os.fsync(out.fileno())
+        os.replace(tmp,dest)
+        write_nfo(dest,meta,j['identifier'],rights)
+        helper=Path('/usr/local/sbin/pcga-jellyfin-refresh')
+        if helper.exists(): subprocess.run([str(helper)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+        update_job(jid,state='complete',progress=100,bytes_done=dest.stat().st_size,bytes_total=dest.stat().st_size,message=f'Imported to {j["library"]}',destination=str(dest),rights=rights)
+    except Exception as e:
+        try:
+            update_job(jid,state='error',message=str(e)[:700])
+        except Exception: pass
+
+
+def _session_dir(session_id):
+    if not UPLOAD_SESSION_RE.fullmatch(str(session_id or '')): raise ValueError('invalid upload session')
+    return STATE.upload_staging/str(session_id)
+
+def _session_meta_path(session_id): return _session_dir(session_id)/'session.json'
+
+def _read_session(session_id):
+    p=_session_meta_path(session_id)
+    try: data=json.loads(p.read_text(encoding='utf-8'))
+    except Exception as exc: raise ValueError('unknown upload session') from exc
+    if not isinstance(data,dict) or data.get('id')!=session_id: raise ValueError('invalid upload session')
+    return data
+
+def _write_session(data):
+    d=_session_dir(data['id']); d.mkdir(parents=True,exist_ok=True)
+    p=d/'session.json'; tmp=p.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data,indent=2,sort_keys=True)+'\n',encoding='utf-8'); os.replace(tmp,p)
+
+def _clean_relative_path(value):
+    raw=str(value or '').replace('\\','/').strip('/')
+    parts=[x for x in raw.split('/') if x not in {'','.'}]
+    if not parts or len(parts)>24 or any(x=='..' for x in parts): raise ValueError('invalid upload path')
+    cleaned=[]
+    for part in parts:
+        name=safe_name(part)
+        if name in {'','.','..'}: raise ValueError('invalid upload filename')
+        cleaned.append(name)
+    rel=Path(*cleaned)
+    if len(str(rel))>900: raise ValueError('upload path is too long')
+    return rel
+
+def start_user_upload_session(payload):
+    hint=str(payload.get('hint') or 'auto').strip().lower()
+    platform=str(payload.get('platform') or '').strip().lower()
+    if hint not in UPLOAD_HINTS: raise ValueError('invalid content type')
+    if hint in {'rom','bios'} and platform and platform not in ROM_PLATFORMS: raise ValueError('invalid console platform')
+    session_id=uuid.uuid4().hex
+    data={'id':session_id,'kind':'user-upload','hint':hint,'platform':platform,'state':'open','created_at':time.time(),'files':[],'bytes_total':0}
+    d=_session_dir(session_id); (d/'files').mkdir(parents=True,exist_ok=False); _write_session(data)
+    return {'ok':True,'session':session_id,'hint':hint,'platform':platform,'max_file_bytes':MAX_UPLOAD_BYTES}
+
+def receive_user_upload(handler, session_id, relative_path, length):
+    if length<=0 or length>MAX_UPLOAD_BYTES: raise ValueError(f'file size must be between 1 and {MAX_UPLOAD_BYTES} bytes')
+    with STATE.lock:
+        session=_read_session(session_id)
+        if session.get('state')!='open': raise ValueError('upload session is not open')
+    rel=_clean_relative_path(relative_path)
+    base=(_session_dir(session_id)/'files').resolve()
+    dest=(base/rel).resolve()
+    if base not in dest.parents: raise ValueError('invalid upload destination')
+    dest.parent.mkdir(parents=True,exist_ok=True)
+    if dest.exists() or dest.with_name(dest.name+'.part').exists(): raise ValueError('a file with this path is already in the upload session')
+    tmp=dest.with_name(dest.name+'.part'); h=hashlib.sha256(); remaining=length; written=0
+    try:
+        with tmp.open('xb') as out:
+            while remaining:
+                chunk=handler.rfile.read(min(1024*1024,remaining))
+                if not chunk: raise ConnectionError('upload ended before Content-Length bytes were received')
+                out.write(chunk); h.update(chunk); remaining-=len(chunk); written+=len(chunk)
+            out.flush(); os.fsync(out.fileno())
+        os.replace(tmp,dest)
+    except Exception:
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
+        raise
+    record={'path':rel.as_posix(),'size':written,'sha256':h.hexdigest()}
+    with STATE.lock:
+        session=_read_session(session_id)
+        if session.get('state')!='open':
+            dest.unlink(missing_ok=True); raise ValueError('upload session was closed during transfer')
+        session.setdefault('files',[]).append(record); session['bytes_total']=int(session.get('bytes_total') or 0)+written; _write_session(session)
+    return {'ok':True,'session':session_id,'file':record,'received':written}
+
+def _unit_files(path):
+    if path.is_file(): return [path]
+    return [x for x in path.rglob('*') if x.is_file() and not x.name.startswith('.pcga-')]
+
+def _rom_candidates_for_unit(path):
+    files=_unit_files(path); payload=[]; candidates=None
+    for f in files:
+        ext=f.suffix.lower()
+        plats=set(ROM_EXT_PLATFORMS.get(ext,[]))
+        if plats:
+            payload.append(f); candidates=plats if candidates is None else candidates & plats
+        elif ext in UPLOAD_SIDECAR_EXT:
+            continue
+        else:
+            return set()
+    return set(candidates or ()) if payload else set()
+
+def infer_rom_platform(path):
+    files=_unit_files(path)
+    exts={f.suffix.lower() for f in files}
+    # .bin is far too overloaded to identify Genesis safely: it is also common
+    # in cue/bin optical dumps. Require an explicit platform or folder-name hint.
+    candidates=set() if '.bin' in exts else _rom_candidates_for_unit(path)
+    if len(candidates)==1: return next(iter(candidates))
+    # A top-level folder named for a known platform is a useful local hint for
+    # ambiguous CD images without relying on Internet metadata.
+    low=path.stem.lower().replace('_','-').replace(' ','-')
+    for slug,info in ROM_PLATFORMS.items():
+        aliases={slug,*(str(x).lower().replace(' ','-') for x in info.get('terms',[]))}
+        if any(a and (low==a or low.startswith(a+'-') or low.endswith('-'+a)) for a in aliases): return slug
+    return ''
+
+def _unique_destination(dest):
+    if not dest.exists(): return dest
+    stamp=time.strftime('%Y%m%d-%H%M%S')
+    base=dest.with_name(f'{dest.stem}-upload-{stamp}{dest.suffix}' if dest.is_file() or dest.suffix else f'{dest.name}-upload-{stamp}')
+    candidate=base; i=1
+    while candidate.exists():
+        i+=1; candidate=base.with_name(f'{base.stem}-{i}{base.suffix}') if base.suffix else base.with_name(f'{base.name}-{i}')
+    return candidate
+
+def _move_unit(src,dest):
+    dest.parent.mkdir(parents=True,exist_ok=True); dest=_unique_destination(dest)
+    shutil.move(str(src),str(dest)); return dest
+
+def route_console_artwork_unit(src,platform):
+    if platform not in ROM_PLATFORMS: raise ValueError('console platform is required for artwork')
+    root=STATE.root/'media/library/console-games/artwork'/platform/'Uploads'; root.mkdir(parents=True,exist_ok=True)
+    if src.is_file():
+        dest=root/safe_name(src.name)
+    else:
+        dest=root/safe_name(src.name)
+    return _move_unit(src,dest)
+
+def _eject_rom_artwork(dest, platform):
+    """Move image artwork out of the canonical ROM tree after a folder upload.
+
+    Older upload routing treated images as legal ROM sidecars and then moved the
+    entire folder into roms/<platform>.  Keep folder uploads convenient, but make
+    the ROM tree payload-only by relocating artwork to the managed artwork tree.
+    """
+    if not dest.is_dir(): return []
+    artwork_root=STATE.root/'media/library/console-games/artwork'/platform/'Uploads'/safe_name(dest.name)
+    moved=[]
+    for image in [x for x in dest.rglob('*') if x.is_file() and x.suffix.lower() in IMAGE_EXT]:
+        rel=image.relative_to(dest)
+        target=artwork_root/rel
+        target.parent.mkdir(parents=True,exist_ok=True)
+        target=_unique_destination(target)
+        shutil.move(str(image),str(target)); moved.append(str(target))
+    # Remove directories made empty by moving artwork out, without touching any
+    # payload/metadata files that remain part of the uploaded ROM unit.
+    for d in sorted([x for x in dest.rglob('*') if x.is_dir()], key=lambda x: len(x.parts), reverse=True):
+        try: d.rmdir()
+        except OSError: pass
+    return moved
+
+def route_rom_unit(src,platform):
+    if platform not in ROM_PLATFORMS: raise ValueError('ROM platform is required for this upload')
+    allowed=ROM_PLATFORMS[platform]['exts']
+    files=_unit_files(src)
+    if not any(f.suffix.lower() in allowed for f in files):
+        raise ValueError('upload does not contain a supported ROM payload for the selected platform')
+    root=STATE.root/'media/library/console-games/roms'/platform; root.mkdir(parents=True,exist_ok=True)
+    dest=root/safe_name(src.name); dest=_move_unit(src,dest)
+    _eject_rom_artwork(dest,platform)
+    try:
+        for p in [dest,*list(dest.rglob('*'))] if dest.is_dir() else [dest]:
+            os.chmod(p,0o755 if p.is_dir() else 0o644)
+    except OSError: pass
+    return dest
+
+def route_bios_unit(src,platform):
+    if platform not in ROM_PLATFORMS: raise ValueError('console platform is required for BIOS/firmware')
+    if not src.is_file(): raise ValueError('BIOS upload must be a file; select individual firmware files instead of a folder')
+    if src.suffix.lower() in IMAGE_EXT: raise ValueError('image files are artwork, not emulator BIOS/firmware')
+    root=STATE.root/'media/library/console-games/bios'/platform; root.mkdir(parents=True,exist_ok=True)
+    dest=_move_unit(src,root/safe_name(src.name))
+    try: os.chmod(dest,0o644)
+    except OSError: pass
+    return dest
+
+def route_photo_unit(src):
+    root=STATE.root/'media/library/photos'/'Uploads'; root.mkdir(parents=True,exist_ok=True)
+    if src.is_file():
+        folder=root/time.strftime('%Y-%m',time.localtime())
+        dest=folder/safe_name(src.name)
+    else:
+        dest=root/safe_name(src.name)
+    return _move_unit(src,dest)
+
+def route_explicit_unit(src,hint):
+    mapping={'pc-game':'ingest/inbox/pc-games','software':'ingest/inbox/software','disc-image':'ingest/inbox/disc-images','home-video':'media/library/home-videos/Uploads'}
+    rel=mapping[hint]; root=STATE.root/rel; root.mkdir(parents=True,exist_ok=True)
+    return _move_unit(src,root/safe_name(src.name))
+
+def queue_for_classifier(src,hint='auto'):
+    pending=STATE.root/'media/metadata-pending'; pending.mkdir(parents=True,exist_ok=True)
+    stamp=time.strftime('%Y%m%d-%H%M%S'); dest=_unique_destination(pending/f'{stamp}-upload-{safe_name(src.name)}')
+    shutil.move(str(src),str(dest))
+    source_hint={'movie':'movie','tv':'tv','music':'music','home-video':'home-video','photos':'photos'}.get(hint,'user-upload')
+    hp=dest/'.pcga-source-hint' if dest.is_dir() else dest.with_name(dest.name+'.pcga-source-hint')
+    hp.write_text(source_hint+'\n',encoding='utf-8')
+    env=os.environ.copy(); env['PCGA_ROOT_OVERRIDE']=str(STATE.root); env['PCGA_CLASSIFY_SETTLE_SECONDS']='0'
+    proc=subprocess.run(['/usr/local/sbin/pcga-classify',str(dest)],env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=90,check=False)
+    return dest,proc.returncode,(proc.stdout or '')[-1400:]
+
+def _classify_upload_unit(src,hint,platform):
+    files=_unit_files(src); exts={f.suffix.lower() for f in files}
+    if not files: return {'state':'review','category':'empty','message':'No regular files were found'}
+    if hint=='rom':
+        plat=platform or infer_rom_platform(src)
+        if not plat: return {'state':'review','category':'console-game','message':'Console game platform could not be inferred; choose a platform and upload again'}
+        # A ROM upload can include cover/screenshot files.  Those are useful, but
+        # they must not pollute RomM's canonical ROM directory.
+        if exts and all(x in IMAGE_EXT for x in exts):
+            dest=route_console_artwork_unit(src,plat); return {'state':'imported','category':'console-artwork','platform':plat,'destination':str(dest)}
+        dest=route_rom_unit(src,plat); return {'state':'imported','category':'console-game','platform':plat,'destination':str(dest)}
+    if hint=='bios':
+        if not platform: return {'state':'review','category':'emulator-bios','message':'Choose the console platform for this BIOS/firmware file'}
+        dest=route_bios_unit(src,platform); return {'state':'imported','category':'emulator-bios','platform':platform,'destination':str(dest)}
+    if hint=='photos':
+        if all(x in IMAGE_EXT for x in exts):
+            dest=route_photo_unit(src); return {'state':'imported','category':'photos','destination':str(dest)}
+        return {'state':'review','category':'photos','message':'Photo override contained non-image files; retained for review'}
+    if hint in {'pc-game','software','disc-image','home-video'}:
+        dest=route_explicit_unit(src,hint); return {'state':'imported','category':hint,'destination':str(dest)}
+    if hint=='auto':
+        plat=infer_rom_platform(src)
+        if plat:
+            dest=route_rom_unit(src,plat); return {'state':'imported','category':'console-game','platform':plat,'destination':str(dest)}
+        if exts and all(x in IMAGE_EXT for x in exts):
+            dest=route_photo_unit(src); return {'state':'imported','category':'photos','destination':str(dest)}
+    pending,rc,output=queue_for_classifier(src,hint)
+    if rc!=0: return {'state':'review','category':'classifier','message':'Classifier returned an error','detail':output}
+    if pending.exists(): return {'state':'review','category':'classifier','message':'Queued for Manual Review','destination':str(pending)}
+    return {'state':'imported','category':'classifier','message':'Classified and routed automatically'}
+
+def start_user_upload_commit(payload):
+    sid=str(payload.get('session') or '')
+    with STATE.lock:
+        session=_read_session(sid)
+        if session.get('state')!='open': raise ValueError('upload session is already committed')
+        if not session.get('files'): raise ValueError('upload session has no files')
+        if session.get('hint') in {'rom','bios'} and not session.get('platform'):
+            # Auto inference remains allowed; ambiguous images become review rather
+            # than being guessed into the wrong console library.
+            pass
+        session['state']='committed'; session['committed_at']=time.time(); _write_session(session)
+        jid='upload-'+sid[:20]
+        job={'id':jid,'kind':'user-upload','session':sid,'title':f"User upload ({len(session.get('files') or [])} file(s))",'state':'queued','progress':100,'bytes_done':int(session.get('bytes_total') or 0),'bytes_total':int(session.get('bytes_total') or 0),'message':'Upload complete; sorting and categorizing','created_at':time.time(),'hint':session.get('hint'),'platform':session.get('platform'),'results':[]}
+        STATE.jobs[jid]=job; STATE.save_job(job)
+    threading.Thread(target=run_user_upload_import,args=(jid,),daemon=True).start(); return dict(job)
+
+def run_user_upload_import(jid):
+    j=STATE.jobs[jid]; sid=j['session']; session=_read_session(sid); files_root=_session_dir(sid)/'files'
+    try:
+        units=sorted(list(files_root.iterdir()),key=lambda p:p.name.lower())
+        if not units: raise RuntimeError('Upload session contained no files')
+        results=[]; imported=0; review=0; romm_changed=False; media_changed=False; pc_game_changed=False
+        update_job(jid,state='sorting',progress=100,message=f'Sorting {len(units)} uploaded item(s)')
+        for idx,src in enumerate(units,1):
+            if not src.exists(): continue
+            try: result=_classify_upload_unit(src,str(session.get('hint') or 'auto'),str(session.get('platform') or ''))
+            except Exception as exc: result={'state':'review','category':'error','message':str(exc)[:500]}
+            # A result marked for review may intentionally have left the source
+            # in staging (for example a Photos override containing non-images).
+            # Move that source exactly once into the normal classifier/review
+            # queue before recording the result.
+            if result.get('state')!='imported' and src.exists():
+                try:
+                    pending,_,_ = queue_for_classifier(src,'auto')
+                    result['destination']=str(pending)
+                    result['message']=result.get('message') or 'Queued for Manual Review'
+                except Exception as exc:
+                    result={'state':'error','category':'unrouted','message':str(exc)[:500]}
+            result['name']=src.name; results.append(result)
+            if result.get('state')=='imported': imported+=1
+            else: review+=1
+            if result.get('category') in {'console-game','emulator-bios'} and result.get('state')=='imported': romm_changed=True
+            if result.get('category')=='pc-game' and result.get('state')=='imported': pc_game_changed=True
+            if result.get('category') in {'photos','classifier','home-video'} and result.get('state')=='imported': media_changed=True
+            update_job(jid,results=results,message=f'Sorted {idx}/{len(units)} item(s)')
+        # Safety net for a unit left behind by an unexpected classifier failure.
+        for src in list(files_root.iterdir()) if files_root.exists() else []:
+            if not src.exists(): continue
+            try:
+                pending,_,_ = queue_for_classifier(src,'auto'); review+=1
+                results.append({'name':src.name,'state':'review','category':'classifier','message':'Queued for Manual Review','destination':str(pending)})
+            except Exception as exc:
+                review+=1
+                results.append({'name':src.name,'state':'error','category':'unrouted','message':str(exc)[:500]})
+        if romm_changed: request_romm_rescan()
+        if pc_game_changed:
+            subprocess.run(['systemctl','--no-block','start','pcga-game-orchestrator.service'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+        if media_changed:
+            helper=Path('/usr/local/sbin/pcga-jellyfin-refresh')
+            if helper.exists(): subprocess.run([str(helper)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=False)
+        try: shutil.rmtree(_session_dir(sid))
+        except OSError: pass
+        state='complete' if review==0 else 'review'
+        msg=f'Imported {imported} item(s)' + (f'; {review} item(s) need review' if review else '')
+        update_job(jid,state=state,progress=100,message=msg,results=results,imported=imported,review=review,completed_at=time.time())
+    except Exception as exc:
+        update_job(jid,state='error',message=str(exc)[:700])
+
+def theme_script():
+    # Same storage contract as the main portal; keep intentionally compact.
+    return r"""(()=>{const KEY='pcga-portal-customization-v1';const S={ember:{bg:'#1a110b',deep:'#090604',panel:'#2a190e',accent:'#e8a15e',text:'#fff4e6'},midnight:{bg:'#0b1320',deep:'#04070d',panel:'#111f31',accent:'#62b5ff',text:'#edf7ff'},forest:{bg:'#0d1813',deep:'#050a07',panel:'#13251c',accent:'#78c58f',text:'#edf9f0'},plum:{bg:'#180f1e',deep:'#08050b',panel:'#28152f',accent:'#d291ff',text:'#fbf1ff'},graphite:{bg:'#151719',deep:'#08090a',panel:'#22262b',accent:'#c3ced8',text:'#f3f6f8'},ocean:{bg:'#071a1d',deep:'#031012',panel:'#0d2a2d',accent:'#4fd1c5',text:'#e9fffd'},burgundy:{bg:'#1c0b10',deep:'#0b0406',panel:'#2b1119',accent:'#ef7d9a',text:'#fff0f4'},terminal:{bg:'#07110a',deep:'#020503',panel:'#0d1e12',accent:'#72e68f',text:'#eaffef'}};let r={};try{r=JSON.parse(localStorage.getItem(KEY)||'{}')||{}}catch(_){}const t=S[r.scheme]||S.ember;const root=document.documentElement;root.style.setProperty('--bg',t.bg);root.style.setProperty('--deep',t.deep);root.style.setProperty('--panel',t.panel);root.style.setProperty('--accent',t.accent);root.style.setProperty('--text',t.text);root.style.setProperty('--radius',Math.max(0,Math.min(30,Number(r.radius??26)))+'px');document.body.dataset.pattern=['ambient','solid','grid','dots','diagonal'].includes(r.pattern)?r.pattern:'ambient'})();"""
+
+def page_html():
+    opts=''.join(f'<option value="{html.escape(k)}">{html.escape(v["name"])}</option>' for k,v in SOURCES.items())
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Public Media</title><style>
+:root{{--bg:#1a110b;--deep:#090604;--panel:#2a190e;--accent:#e8a15e;--text:#fff4e6;--radius:26px}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;color:var(--text);background:linear-gradient(180deg,var(--bg),var(--deep));font:18px/1.45 system-ui,sans-serif}}body:before{{content:"";position:fixed;inset:0;pointer-events:none;opacity:.35;background:radial-gradient(circle at 20% 20%,var(--accent),transparent 28%)}}body[data-pattern="grid"]:before{{background-image:linear-gradient(rgba(255,255,255,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.05) 1px,transparent 1px);background-size:32px 32px}}body[data-pattern="dots"]:before{{background-image:radial-gradient(rgba(255,255,255,.12) 1.5px,transparent 1.5px);background-size:28px 28px}}body[data-pattern="diagonal"]:before{{background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.055) 0 2px,transparent 2px 26px)}}main{{position:relative;z-index:1;max-width:1180px;margin:auto;padding:32px}}header{{display:flex;gap:18px;align-items:center;justify-content:space-between;flex-wrap:wrap}}h1{{margin:0;font-size:clamp(30px,5vw,54px)}}a{{color:inherit}}.panel,.card{{border:1px solid color-mix(in srgb,var(--accent) 30%,transparent);background:color-mix(in srgb,var(--panel) 88%,transparent);border-radius:var(--radius);backdrop-filter:blur(15px)}}.panel{{padding:18px;margin-top:22px}}.controls{{display:grid;grid-template-columns:180px 1fr auto;gap:10px}}select,input,button{{min-height:48px;border-radius:calc(var(--radius)*.55);border:1px solid color-mix(in srgb,var(--accent) 34%,transparent);background:rgba(255,255,255,.06);color:var(--text);padding:0 14px;font:inherit}}button{{font-weight:800;cursor:pointer}}button.primary{{background:color-mix(in srgb,var(--accent) 25%,transparent)}}#results{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:14px;margin-top:18px}}.card{{padding:16px;display:flex;flex-direction:column;gap:9px}}.title{{font-size:1.18em;font-weight:900}}.meta,.desc,.rights{{opacity:.76;font-size:.86em}}.desc{{max-height:6em;overflow:hidden}}.actions{{display:flex;gap:8px;flex-wrap:wrap;margin-top:auto}}.badge{{display:inline-block;padding:4px 8px;border-radius:999px;background:rgba(255,255,255,.07);font-size:.74em}}#jobs{{display:grid;gap:9px}}.job{{padding:12px 14px;border-radius:calc(var(--radius)*.65);background:rgba(255,255,255,.05)}}progress{{width:100%}}@media(max-width:680px){{main{{padding:20px}}.controls{{grid-template-columns:1fr}}}}
+</style></head><body><main><header><div><h1>Public Media</h1><div>Rights-aware Internet Archive imports for Jellyfin.</div></div><a href="/">← Media Hub</a></header><section class="panel"><div class="controls"><select id="source">{opts}</select><input id="q" placeholder="Search titles, creators, descriptions"><button id="search" class="primary">Search</button></div><p class="meta">PCGA downloads a local copy into Jellyfin. Feature Films defaults to Movies; Classic TV and Prelinger default to Home Videos until episode metadata can be mapped safely.</p></section><section id="results"></section><section class="panel"><h2>Imports</h2><div id="jobs"><div class="meta">No imports started in this session.</div></div></section></main><script>{theme_script()}</script><script>
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));let items=[];
+async function search(){{const s=document.getElementById('source').value,q=document.getElementById('q').value;const r=await fetch(`/public-media/api/search?source=${{encodeURIComponent(s)}}&q=${{encodeURIComponent(q)}}`);const d=await r.json();if(!r.ok)throw Error(d.error||r.status);items=d.items||[];render()}}
+function render(){{const box=document.getElementById('results');if(!items.length){{box.innerHTML='<div class="panel">No matching items.</div>';return}}box.innerHTML=items.map((x,i)=>`<article class="card"><div><span class="badge">${{esc(x.rights_hint)}}</span></div><div class="title">${{esc(x.title)}}</div><div class="meta">${{esc(x.creator)}} ${{x.date?'• '+esc(x.date):''}}</div><div class="desc">${{esc(x.description)}}</div><div class="actions"><button data-import="${{i}}" data-lib="movies">Movies</button><button data-import="${{i}}" data-lib="home-videos">Home Videos</button><a href="https://archive.org/details/${{encodeURIComponent(x.identifier)}}" target="_blank" rel="noopener">Archive page</a></div></article>`).join('')}}
+async function doImport(i,lib){{const x=items[i];if(!x)return;const r=await fetch('/public-media/api/import',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{identifier:x.identifier,source:x.source,library:lib,quality:'balanced'}})}});const d=await r.json();if(!r.ok)alert(d.error||r.status);pollJobs()}}
+async function pollJobs(){{try{{const r=await fetch('/public-media/api/jobs',{{cache:'no-store'}}),d=await r.json();const js=d.jobs||[];document.getElementById('jobs').innerHTML=js.length?js.map(j=>`<div class="job"><b>${{esc(j.title||j.identifier)}}</b> — ${{esc(j.state)}}<div class="meta">${{esc(j.message||'')}}</div><progress max="100" value="${{Number(j.progress||0)}}"></progress></div>`).join(''):'<div class="meta">No imports started in this session.</div>'}}catch(_){{}}}}
+document.getElementById('search').onclick=()=>search().catch(e=>alert(e.message));document.getElementById('q').addEventListener('keydown',e=>{{if(e.key==='Enter')search().catch(x=>alert(x.message))}});document.addEventListener('click',e=>{{const b=e.target.closest('[data-import]');if(b)doImport(Number(b.dataset.import),b.dataset.lib)}});setInterval(pollJobs,1500);pollJobs();search().catch(()=>{{}});
+</script></body></html>'''
+
+class Handler(BaseHTTPRequestHandler):
+    server_version=f'PCGAPublicMedia/{VERSION}'
+    def log_message(self,fmt,*args):
+        if urllib.parse.urlparse(self.path).path not in {'/health','/api/rom/jobs'}: super().log_message(fmt,*args)
+    def send_json(self,status,obj):
+        body=json.dumps(obj,separators=(',',':')).encode(); self.send_response(status); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.send_header('Cache-Control','no-store'); self.end_headers(); self.wfile.write(body)
+    def do_GET(self):
+        u=urllib.parse.urlparse(self.path); p=u.path
+        if p=='/health': return self.send_json(200,{'ok':True,'version':VERSION})
+        if p in {'/','/index.html'}:
+            b=page_html().encode(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(b))); self.send_header('Content-Security-Policy',"default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data: https://archive.org; media-src 'self'"); self.end_headers(); self.wfile.write(b); return
+        if p=='/api/search':
+            q=urllib.parse.parse_qs(u.query); source=(q.get('source') or ['feature_films'])[0]; term=(q.get('q') or [''])[0]
+            if source not in SOURCES:return self.send_json(400,{'error':'unknown source'})
+            try:return self.send_json(200,search_archive(source,term))
+            except Exception as e:return self.send_json(502,{'error':str(e)})
+        if p=='/api/jobs':
+            with STATE.lock: jobs=sorted((dict(x) for x in STATE.jobs.values()),key=lambda x:x.get('created_at',0),reverse=True)[:40]
+            return self.send_json(200,{'jobs':jobs})
+        if p in {'/api/rom/platforms','/api/user-upload/platforms'}:
+            return self.send_json(200,{'items':[{'slug':k,'name':v['name'],'extensions':sorted(v['exts'])} for k,v in ROM_PLATFORMS.items()]})
+        if p=='/api/user-upload/jobs':
+            with STATE.lock: jobs=sorted((dict(x) for x in STATE.jobs.values() if x.get('kind')=='user-upload'),key=lambda x:x.get('created_at',0),reverse=True)[:24]
+            return self.send_json(200,{'jobs':jobs})
+        if p=='/api/rom/jobs':
+            with STATE.lock: jobs=sorted((dict(x) for x in STATE.jobs.values() if x.get('kind')=='rom'),key=lambda x:x.get('created_at',0),reverse=True)[:24]
+            return self.send_json(200,{'jobs':jobs})
+        if p=='/api/rom/search':
+            q=urllib.parse.parse_qs(u.query); term=(q.get('q') or [''])[0]; platform=(q.get('platform') or [''])[0]; page=intish((q.get('page') or ['1'])[0]) or 1
+            try:return self.send_json(200,search_archive_roms(term,platform,page))
+            except Exception as e:return self.send_json(502,{'error':str(e)})
+        if p=='/api/rom/item':
+            q=urllib.parse.parse_qs(u.query); ident=(q.get('identifier') or [''])[0]; platform=(q.get('platform') or [''])[0]
+            try:return self.send_json(200,rom_item(ident,platform))
+            except Exception as e:return self.send_json(400,{'error':str(e)})
+        return self.send_json(404,{'error':'not found'})
+    def do_POST(self):
+        u=urllib.parse.urlparse(self.path); post_path=u.path
+        if post_path=='/api/user-upload/file':
+            try:
+                n=int(self.headers.get('Content-Length','0'))
+                q=urllib.parse.parse_qs(u.query); sid=(q.get('session') or [''])[0]; rel=(q.get('path') or [''])[0]
+                result=receive_user_upload(self,sid,rel,n); return self.send_json(201,result)
+            except Exception as e:
+                # A rejected raw-body upload may still have unread bytes on the
+                # connection. Do not allow those bytes to be parsed as a second
+                # HTTP request on this socket.
+                self.close_connection=True
+                return self.send_json(400,{'error':str(e)})
+        if post_path not in {'/api/import','/api/rom/import','/api/user-upload/session','/api/user-upload/commit'}: return self.send_json(404,{'error':'not found'})
+        try:
+            n=int(self.headers.get('Content-Length','0')); assert 0<n<=65536
+            payload=json.loads(self.rfile.read(n))
+            if post_path=='/api/rom/import': job=start_rom_import(payload)
+            elif post_path=='/api/user-upload/session': return self.send_json(201,start_user_upload_session(payload))
+            elif post_path=='/api/user-upload/commit': job=start_user_upload_commit(payload)
+            else: job=start_import(payload)
+            return self.send_json(202,job)
+        except Exception as e:return self.send_json(400,{'error':str(e)})
+
+def main():
+    global STATE
+    ap=argparse.ArgumentParser(); ap.add_argument('command',nargs='?',default='serve'); ap.add_argument('--root',default=os.environ.get('PCGA_ARCHIVE_ROOT') or (Path('/etc/pc-game-archive/archive-root').read_text().strip() if Path('/etc/pc-game-archive/archive-root').exists() else '')); ap.add_argument('--bind',default='127.0.0.1'); ap.add_argument('--port',type=int,default=8099)
+    a=ap.parse_args(); root=Path(a.root)
+    if not root.is_absolute(): raise SystemExit('archive root must be absolute')
+    STATE=State(root)
+    if a.command=='serve': ThreadingHTTPServer((a.bind,a.port),Handler).serve_forever()
+    elif a.command=='search': print(json.dumps(search_archive('feature_films',''),indent=2))
+    else: raise SystemExit('unknown command')
+if __name__=='__main__': main()

@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry pending PCGA classification and metadata enrichment
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=pcga-metadata-classify.service
+
+[Install]
+WantedBy=timers.target

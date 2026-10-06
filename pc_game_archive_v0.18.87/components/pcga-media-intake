@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse,datetime as dt,json,os,re,shutil,uuid
+from pathlib import Path
+STATE=Path('/var/lib/pc-game-archive/media-intake');ITEMS=STATE/'items';DISCS=STATE/'discs';COLLECTIONS=STATE/'collections'
+def now():return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+def norm(v):return ' '.join(re.sub(r'[^a-z0-9]+',' ',str(v or '').casefold()).split())
+def load(p):
+    try:d=json.loads(p.read_text());return d if isinstance(d,dict) else {}
+    except Exception:return {}
+def all_json(p):return [load(x) for x in sorted(p.glob('*.json')) if load(x)] if p.exists() else []
+def save(p,d):p.parent.mkdir(parents=True,exist_ok=True);q=p.with_suffix(p.suffix+'.tmp');q.write_text(json.dumps(d,indent=2,sort_keys=True)+'\n');os.replace(q,p)
+def req_item(i):
+    d=load(ITEMS/f'{i}.json');
+    if not d:raise SystemExit('media item not found')
+    return d
+def main():
+    ap=argparse.ArgumentParser(description='Manage PCGA movie/TV optical intake relationships')
+    sp=ap.add_subparsers(dest='cmd',required=True)
+    for c in ('list-items','list-discs','list-collections'):sp.add_parser(c)
+    s=sp.add_parser('show-disc');s.add_argument('fingerprint')
+    ci=sp.add_parser('create-item');ci.add_argument('--kind',choices=('movie','tv'),required=True);ci.add_argument('--title',required=True);ci.add_argument('--series');ci.add_argument('--season',type=int);ci.add_argument('--release-year',type=int);ci.add_argument('--edition');ci.add_argument('--confirm',action='store_true')
+    cc=sp.add_parser('create-collection');cc.add_argument('--title',required=True);cc.add_argument('--release-year',type=int);cc.add_argument('--edition');cc.add_argument('--confirm',action='store_true')
+    ui=sp.add_parser('update-item');ui.add_argument('item_id');ui.add_argument('--title');ui.add_argument('--series');ui.add_argument('--season',type=int);ui.add_argument('--release-year',type=int);ui.add_argument('--edition');ui.add_argument('--confirm',action='store_true')
+    uc=sp.add_parser('update-collection');uc.add_argument('collection_id');uc.add_argument('--title');uc.add_argument('--release-year',type=int);uc.add_argument('--edition');uc.add_argument('--confirm',action='store_true')
+    ai=sp.add_parser('assign-disc');ai.add_argument('fingerprint');ai.add_argument('item_id');ai.add_argument('--number',type=int);ai.add_argument('--count',type=int);ai.add_argument('--role');ai.add_argument('--confirm',action='store_true')
+    ac=sp.add_parser('assign-collection');ac.add_argument('fingerprint');ac.add_argument('collection_id');ac.add_argument('--confirm',action='store_true')
+    sl=sp.add_parser('set-disc-layout');sl.add_argument('fingerprint');sl.add_argument('layout',choices=('single-title','multi-disc-title','multi-title','multi-title-candidate','tv-season-disc','collection','unknown'));sl.add_argument('--confirm',action='store_true')
+    add=sp.add_parser('add-item-to-disc');add.add_argument('fingerprint');add.add_argument('item_id');add.add_argument('--title-index',type=int,action='append',default=[]);add.add_argument('--role',default='feature');add.add_argument('--episode-start',type=int);add.add_argument('--episode-end',type=int);add.add_argument('--confirm',action='store_true')
+    rem=sp.add_parser('remove-item-from-disc');rem.add_argument('fingerprint');rem.add_argument('item_id')
+    mr=sp.add_parser('mark-rip');mr.add_argument('fingerprint');mr.add_argument('status',choices=('started','complete','failed'));mr.add_argument('--drive');mr.add_argument('--error')
+    aa=sp.add_parser('attach-artifact');aa.add_argument('path')
+    ns=ap.parse_args()
+    if ns.cmd=='list-items':print(json.dumps({'items':all_json(ITEMS)},indent=2));return
+    if ns.cmd=='list-discs':print(json.dumps({'discs':all_json(DISCS)},indent=2));return
+    if ns.cmd=='list-collections':print(json.dumps({'collections':all_json(COLLECTIONS)},indent=2));return
+    if ns.cmd=='show-disc':
+        d=load(DISCS/f'{ns.fingerprint}.json');
+        if not d:raise SystemExit('disc not found')
+        print(json.dumps(d,indent=2));return
+    if ns.cmd=='create-item':
+        iid=str(uuid.uuid4());ts=now();d={'schema':1,'id':iid,'kind':ns.kind,'title':ns.title,'sort_title':ns.title,'normalized_title':norm(ns.title),'series':ns.series or (ns.title if ns.kind=='tv' else None),'season':ns.season,'release_year':ns.release_year,'edition':ns.edition,'external_ids':{},'provisional':not ns.confirm,'created_at':ts,'updated_at':ts};save(ITEMS/f'{iid}.json',d);print(json.dumps(d,indent=2));return
+    if ns.cmd=='create-collection':
+        cid=str(uuid.uuid4());ts=now();d={'schema':1,'id':cid,'title':ns.title,'sort_title':ns.title,'normalized_title':norm(ns.title),'release_year':ns.release_year,'edition':ns.edition,'media_item_ids':[],'external_ids':{},'provisional':not ns.confirm,'created_at':ts,'updated_at':ts};save(COLLECTIONS/f'{cid}.json',d);print(json.dumps(d,indent=2));return
+    if ns.cmd=='update-item':
+        p=ITEMS/f'{ns.item_id}.json';d=load(p)
+        if not d:raise SystemExit('media item not found')
+        for key in ('title','series','season','release_year','edition'):
+            v=getattr(ns,key,None)
+            if v is not None:d[key]=v
+        if ns.title is not None:d['sort_title']=ns.title;d['normalized_title']=norm(ns.title)
+        if ns.confirm:d['provisional']=False
+        d['updated_at']=now();save(p,d);print(json.dumps(d,indent=2));return
+    if ns.cmd=='update-collection':
+        p=COLLECTIONS/f'{ns.collection_id}.json';d=load(p)
+        if not d:raise SystemExit('collection not found')
+        for key in ('title','release_year','edition'):
+            v=getattr(ns,key,None)
+            if v is not None:d[key]=v
+        if ns.title is not None:d['sort_title']=ns.title;d['normalized_title']=norm(ns.title)
+        if ns.confirm:d['provisional']=False
+        d['updated_at']=now();save(p,d);print(json.dumps(d,indent=2));return
+    if ns.cmd=='attach-artifact':
+        path=Path(ns.path);cands=[];ts=dt.datetime.now(dt.timezone.utc)
+        pname=norm(path.name)
+        for d in all_json(DISCS):
+            if d.get('rip_status')!='complete':continue
+            try:age=(ts-dt.datetime.fromisoformat(str(d.get('rip_completed_at')).replace('Z','+00:00'))).total_seconds()
+            except Exception:continue
+            if age<0 or age>21600:continue
+            labels=[d.get('title'),d.get('collection_title'),d.get('volume_label')]
+            match=max([4.0 if norm(x)==pname and pname else 0.0 for x in labels]+[0.0])
+            toks=set(pname.split())
+            for x in labels:
+                nt=set(norm(x).split());match=max(match,(len(toks&nt)/max(1,len(toks|nt)))*3.0)
+            # With no name evidence, only the immediate post-ARM handoff window is
+            # safe enough to associate by time alone. This avoids attaching a disc
+            # record to an unrelated upload or later sorter pass hours afterward.
+            if match<=0 and age>300:continue
+            score=match+max(0,1.0-age/21600)
+            if not d.get('artifact_paths'):score+=0.8
+            cands.append((score,d))
+        cands.sort(key=lambda x:-x[0])
+        if not cands or (len(cands)>1 and cands[0][0]-cands[1][0]<0.35):raise SystemExit(2)
+        d=cands[0][1];dest=(path/'.pcga-media.json') if path.is_dir() else path.with_name(path.name+'.pcga-media.json');shutil.copyfile(DISCS/f"{d['fingerprint']}.json",dest)
+        aps=list(d.get('artifact_paths') or []);sp=str(path)
+        if sp not in aps:aps.append(sp)
+        d['artifact_paths']=aps;d['updated_at']=now();save(DISCS/f"{d['fingerprint']}.json",d);print(json.dumps({'attached':sp,'fingerprint':d['fingerprint'],'score':cands[0][0]},indent=2));return
+    fp=getattr(ns,'fingerprint','');p=DISCS/f'{fp}.json';d=load(p)
+    if not d:raise SystemExit('disc not found')
+    if ns.cmd=='mark-rip':
+        d['rip_status']=ns.status;d['rip_drive']=ns.drive or d.get('device');d['updated_at']=now()
+        if ns.status=='started':d['rip_started_at']=d['updated_at']
+        if ns.status in ('complete','failed'):d['rip_completed_at']=d['updated_at']
+        if ns.error:d['rip_error']=ns.error
+        save(p,d);print(json.dumps(d,indent=2));return
+    if ns.cmd=='assign-disc':
+        item=req_item(ns.item_id);d['contents']=[{'media_item_id':item['id'],'title':item['title'],'kind':item['kind'],'season':item.get('season'),'source_title_indexes':[],'role':ns.role or ('episodes' if item['kind']=='tv' else 'feature'),'status':'confirmed' if ns.confirm else 'provisional'}];d['media_item_ids']=[item['id']];d['media_item_id']=item['id'];d['kind']=item['kind'];d['layout']='multi-disc-title' if (ns.number or ns.count or d.get('disc_number')) else 'single-title'
+        if ns.number is not None:d['disc_number']=ns.number
+        if ns.count is not None:d['disc_count']=ns.count
+        if ns.role:d['disc_role']=ns.role
+        if ns.confirm:d['metadata_status']='confirmed'
+    elif ns.cmd=='assign-collection':
+        c=load(COLLECTIONS/f'{ns.collection_id}.json');
+        if not c:raise SystemExit('collection not found')
+        d['collection_id']=c['id'];d['collection_title']=c['title'];d['layout']='collection';
+        mids=list(c.get('media_item_ids') or [])
+        for iid in d.get('media_item_ids') or []:
+            if iid not in mids:mids.append(iid)
+        c['media_item_ids']=mids;c['updated_at']=now();save(COLLECTIONS/f"{c['id']}.json",c)
+        if ns.confirm:d['metadata_status']='confirmed'
+    elif ns.cmd=='set-disc-layout':
+        d['layout']=ns.layout
+        if ns.confirm:d['metadata_status']='confirmed'
+    elif ns.cmd=='add-item-to-disc':
+        item=req_item(ns.item_id);rows=list(d.get('contents') or []);row=next((x for x in rows if x.get('media_item_id')==item['id']),None)
+        if row is None:row={'media_item_id':item['id'],'title':item['title'],'kind':item['kind'],'season':item.get('season'),'source_title_indexes':ns.title_index,'role':ns.role,'episode_start':ns.episode_start,'episode_end':ns.episode_end,'status':'confirmed' if ns.confirm else 'provisional'};rows.append(row)
+        else:
+            row.update({'source_title_indexes':ns.title_index or row.get('source_title_indexes',[]),'role':ns.role})
+            if ns.episode_start is not None:row['episode_start']=ns.episode_start
+            if ns.episode_end is not None:row['episode_end']=ns.episode_end
+            row['status']='confirmed' if ns.confirm else row.get('status','provisional')
+        d['contents']=rows;ids=[]
+        for x in rows:
+            i=str(x.get('media_item_id') or '')
+            if i and i not in ids:ids.append(i)
+        d['media_item_ids']=ids;d['media_item_id']=ids[0] if len(ids)==1 else None
+        if len(ids)>1:d['layout']='multi-title'
+        if d.get('collection_id'):
+            c=load(COLLECTIONS/f"{d['collection_id']}.json")
+            if c:
+                mids=list(c.get('media_item_ids') or [])
+                for iid in ids:
+                    if iid not in mids:mids.append(iid)
+                c['media_item_ids']=mids;c['updated_at']=now();save(COLLECTIONS/f"{c['id']}.json",c)
+        if ns.confirm:d['metadata_status']='confirmed'
+    elif ns.cmd=='remove-item-from-disc':
+        rows=[x for x in d.get('contents') or [] if x.get('media_item_id')!=ns.item_id];d['contents']=rows;ids=[]
+        for x in rows:
+            i=str(x.get('media_item_id') or '')
+            if i and i not in ids:ids.append(i)
+        d['media_item_ids']=ids;d['media_item_id']=ids[0] if len(ids)==1 else None
+    d['updated_at']=now();save(p,d);print(json.dumps(d,indent=2))
+if __name__=='__main__':main()
