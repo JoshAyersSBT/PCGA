@@ -1,8 +1,0 @@
-[Unit]
-Description=PC Game Archive optical dispatcher for /dev/%I
-After=systemd-udevd.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/pcga-optical-dispatch %I
-TimeoutStartSec=90

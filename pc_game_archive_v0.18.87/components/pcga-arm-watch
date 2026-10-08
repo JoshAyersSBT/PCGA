@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# Compatibility entry point retained for upgrades and operator muscle memory.
-exec /usr/local/sbin/pcga-optical-watch "$@"

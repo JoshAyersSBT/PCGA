@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""PCGA appliance-wide PC game compatibility sweep.
+
+The sweep is deliberately isolated from player data.  It removes stale transient
+Wolf child containers, reconciles the current game catalog, probes every canonical launchable
+ready/setup title in a disposable Wolf-equivalent home/install workspace, captures the exact
+container logs/window state/exit status, and writes a JSON report suitable for
+later automatic compatibility repair work.
+
+This is a smoke/launch compatibility test, not a gameplay benchmark.  A ready
+game passes when its generated runtime reaches a non-error Xwayland window.  An
+interactive setup title passes when its disposable installer probe reaches a
+non-error installer window without mutating the persistent install prefix.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+
+VERSION = "0.19.0"
+STATE_ROOT = Path("/var/lib/pc-game-archive/game-installs")
+SETS_ROOT = Path("/var/lib/pc-game-archive/game-intake/sets")
+REPORT_ROOT = Path("/var/lib/pc-game-archive/game-compat-tests")
+WOLF_CONFIG = Path("/etc/wolf/cfg/config.toml")
+ORCHESTRATOR = Path("/usr/local/sbin/pcga-game-orchestrator")
+LOCK_PATH = Path("/run/pcga-game-compat-test.lock")
+MAX_LOG_CHARS = 64000
+ERROR_RE = re.compile(
+    r"(?i)(traceback|unhandled (?:exception|page fault)|starting debugger|winedbg|"
+    r"could not load kernel32|nodrv_createwindow|wine mono is not installed|"
+    r"unable to find a version of the runtime|invalid volume specification|"
+    r"permission denied|access denied|no such file or directory|"
+    r"primary .* exited rc=[1-9]|launcher exited rc=[1-9]|"
+    r"\berror\b|\bfatal\b|segmentation fault|core dumped|failed)"
+)
+SUSPICIOUS_WINDOW_RE = re.compile(
+    r"(?i)(program error|wine debugger|runtime error|unable to find|exception|fatal|crash|winedbg)"
+)
+AUXILIARY_GAME_WINDOW_RE = re.compile(
+    r"(?i)^(electronic registration|registration|register|configuration|configurator|updater|update|patcher|cd[ -]?key|serial(?: number)?)$"
+)
+
+SUSPICIOUS_LAUNCH_BASENAMES = {
+    "idriver.exe", "ikernel.exe", "cdkey.exe", "fpupdate.exe", "syscheck.exe",
+    "dxsetup.exe", "directx.exe", "dotnetfx.exe", "vcredist.exe", "vcredist_x86.exe",
+    "vcredist_x64.exe", "unins000.exe", "uninstall.exe",
+}
+BUNDLED_PATH_RE = re.compile(r"(?i)(^|/)(adobe|acrobat|reader|directx|redist|redistributable|prereq|prerequisite|support|manual|drivers?)(/|$)")
+
+
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def run(args: list[str], *, timeout: int | float = 30, check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=check)
+
+
+def load_json(path: Path) -> dict:
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def atomic_json(path: Path, obj: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def docker_inspect(cid: str) -> dict:
+    p = run(["docker", "inspect", cid], timeout=12)
+    if p.returncode:
+        return {}
+    try:
+        rows = json.loads(p.stdout or "[]")
+        return rows[0] if isinstance(rows, list) and rows else {}
+    except Exception:
+        return {}
+
+
+def env_map(raw: dict) -> dict[str, str]:
+    config = raw.get("Config") if isinstance(raw.get("Config"), dict) else {}
+    out: dict[str, str] = {}
+    for item in config.get("Env") or []:
+        if isinstance(item, str) and "=" in item:
+            k, v = item.split("=", 1)
+            out[k] = v
+    return out
+
+
+def managed_pcga_child(raw: dict) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    name = str(raw.get("Name") or "").lstrip("/")
+    config = raw.get("Config") if isinstance(raw.get("Config"), dict) else {}
+    image = str(config.get("Image") or "")
+    env = env_map(raw)
+    return (
+        name.startswith("PCGA-")
+        and (image.startswith("pcga/game-") or image.startswith("pcga/setup-"))
+        and bool(env.get("PCGA_GAME_SET_ID"))
+    )
+
+
+def clean_wolf_children() -> dict:
+    """Force-remove only validated transient PCGA game/setup children."""
+    summary = {"removed": [], "failed": []}
+    p = run(["docker", "ps", "-aq", "--filter", "name=PCGA-"], timeout=15)
+    if p.returncode:
+        summary["failed"].append({"stage": "list", "detail": (p.stderr or p.stdout)[-1200:]})
+        return summary
+    for cid in [x.strip() for x in p.stdout.splitlines() if x.strip()]:
+        raw = docker_inspect(cid)
+        if not managed_pcga_child(raw):
+            continue
+        name = str(raw.get("Name") or "").lstrip("/")
+        sid = env_map(raw).get("PCGA_GAME_SET_ID", "")
+        rm = run(["docker", "rm", "-f", cid], timeout=20)
+        row = {"container_id": cid, "name": name, "game_set_id": sid}
+        if rm.returncode == 0 or "No such container" in ((rm.stderr or "") + (rm.stdout or "")):
+            summary["removed"].append(row)
+        else:
+            row["detail"] = (rm.stderr or rm.stdout)[-1200:]
+            summary["failed"].append(row)
+    return summary
+
+
+def clean_compat_probes() -> dict:
+    """Remove only containers explicitly labeled as compatibility probes."""
+    summary={"removed": [], "failed": []}
+    p=run(["docker","ps","-aq","--filter","label=pcga.compat.probe=1"], timeout=15)
+    if p.returncode:
+        summary["failed"].append({"stage":"list","detail":(p.stderr or p.stdout)[-1200:]})
+        return summary
+    for cid in [x.strip() for x in p.stdout.splitlines() if x.strip()]:
+        raw=docker_inspect(cid)
+        labels=((raw.get("Config") or {}).get("Labels") or {}) if isinstance(raw.get("Config"),dict) else {}
+        if str(labels.get("pcga.compat.probe") or "") != "1":
+            continue
+        name=str(raw.get("Name") or "").lstrip("/")
+        rm=run(["docker","rm","-f",cid],timeout=20)
+        row={"container_id":cid,"name":name}
+        if rm.returncode==0 or "No such container" in ((rm.stderr or "")+(rm.stdout or "")):
+            summary["removed"].append(row)
+        else:
+            row["detail"]=(rm.stderr or rm.stdout)[-1200:]; summary["failed"].append(row)
+    return summary
+
+
+def reconcile_catalog() -> dict:
+    if not ORCHESTRATOR.exists():
+        return {"ok": False, "detail": "pcga-game-orchestrator is missing"}
+    try:
+        p = run([str(ORCHESTRATOR), "--metadata-only", "--no-network"], timeout=420)
+    except subprocess.TimeoutExpired as exc:
+        return {"ok": False, "detail": "catalog reconciliation timed out", "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]}
+    return {
+        "ok": p.returncode == 0,
+        "returncode": p.returncode,
+        "stdout": (p.stdout or "")[-6000:],
+        "stderr": (p.stderr or "")[-6000:],
+    }
+
+
+def restart_wolf() -> dict:
+    result = {"requested": ["wolf", "wolf-den"], "results": {}}
+    for name in ("wolf-den", "wolf"):
+        p = run(["docker", "restart", name], timeout=45)
+        result["results"][name] = {
+            "ok": p.returncode == 0,
+            "returncode": p.returncode,
+            "detail": ((p.stderr or p.stdout) or "").strip()[-1200:],
+        }
+    # Give Wolf time to recreate its API/RTSP listeners before catalog checks.
+    time.sleep(3)
+    return result
+
+
+def canonical_games(only: str = "") -> tuple[list[tuple[str, dict, dict]], list[dict]]:
+    """Return launchable canonical titles and separately classify source-only records.
+
+    The intake registry intentionally retains optical/source identities after
+    ownership has moved to a canonical title.  Those records are useful
+    preservation evidence, but treating them as games made the compatibility
+    pass rate meaningless (for example Cod2Cd3/Cod2Cd5/Eaw/Eawx).  Only current
+    ready/setup-required states are executable compatibility targets.
+    """
+    sids = {p.stem for p in STATE_ROOT.glob("*.json")} | {p.stem for p in SETS_ROOT.glob("*.json")}
+    rows: list[tuple[str, dict, dict]] = []
+    ignored: list[dict] = []
+    for sid in sorted(sids):
+        if only and sid != only:
+            continue
+        state = load_json(STATE_ROOT / f"{sid}.json")
+        game = load_json(SETS_ROOT / f"{sid}.json")
+        if state.get("catalog_hidden") or state.get("duplicate_of") or game.get("catalog_hidden") or game.get("superseded_by"):
+            continue
+        if not state and not game:
+            continue
+        status = str(state.get("status") or "unknown")
+        title = str(game.get("title") or state.get("title") or sid)
+        if status not in {"ready", "setup-required"}:
+            ignored.append({
+                "game_set_id": sid,
+                "title": title,
+                "catalog_status": status,
+                "reason": "source-or-metadata record is not a launchable canonical runtime",
+            })
+            continue
+        rows.append((sid, game, state))
+    return rows, ignored
+
+
+def internal_title(sid: str, setup: bool) -> str:
+    token = re.sub(r"[^A-Za-z0-9]+", "", sid)[:12] or "unknown"
+    return ("PCGA Setup " if setup else "PCGA Game ") + token
+
+
+def wolf_registration(sid: str, setup: bool) -> dict:
+    text = ""
+    try:
+        text = WOLF_CONFIG.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "detail": f"cannot read Wolf config: {exc}"}
+    begin = f"# BEGIN PCGA MANAGED APP {sid}"
+    end = f"# END PCGA MANAGED APP {sid}"
+    if begin not in text or end not in text:
+        return {"ok": False, "detail": "managed Wolf app block is missing", "expected_title": internal_title(sid, setup)}
+    block = text.split(begin, 1)[1].split(end, 1)[0]
+    expected = internal_title(sid, setup)
+    title_ok = f'title = "{expected}"' in block
+    unsafe = bool(re.search(r'title\s*=\s*"[^"\n]*[:•/\\][^"\n]*"', block))
+    return {
+        "ok": title_ok and not unsafe,
+        "expected_title": expected,
+        "title_match": title_ok,
+        "unsafe_display_title_in_runtime_id": unsafe,
+        "block_tail": block.strip()[-5000:],
+    }
+
+
+def extract_windows(cid: str) -> list[str]:
+    """Return visible Xwayland/Sway window names from a running probe."""
+    cmd = [
+        "docker", "exec", cid, "bash", "-lc",
+        "SWAYSOCK=/run/user/wolf/sway.socket swaymsg -t get_tree -r 2>/dev/null || true",
+    ]
+    try:
+        p = run(cmd, timeout=5)
+    except Exception:
+        return []
+    if not p.stdout.strip():
+        return []
+    try:
+        tree = json.loads(p.stdout)
+    except Exception:
+        return []
+    names: list[str] = []
+    def walk(node):
+        if isinstance(node, dict):
+            window = node.get("window")
+            name = str(node.get("name") or "").strip()
+            if isinstance(window, int) and window > 0 and name:
+                names.append(name[:300])
+            for key in ("nodes", "floating_nodes"):
+                for child in node.get(key) or []:
+                    walk(child)
+    walk(tree)
+    # Stable order without duplicate decoration windows.
+    return list(dict.fromkeys(names))[:32]
+
+
+def error_trace(log_text: str, windows: list[str]) -> str:
+    """Extract current-probe evidence only.
+
+    Older versions appended historical state.installer_log/runtime_build_log
+    fields to a new probe failure.  That could make a harness bootstrap error
+    look like an old Wine c0000135 failure.  Historical state remains in the
+    catalog; the failure traceback here is deliberately scoped to this run.
+    """
+    lines = log_text.splitlines()
+    interesting: list[str] = []
+    for i, line in enumerate(lines):
+        if ERROR_RE.search(line):
+            lo = max(0, i - 2)
+            hi = min(len(lines), i + 4)
+            interesting.extend(lines[lo:hi])
+    if windows and any(SUSPICIOUS_WINDOW_RE.search(x) for x in windows):
+        interesting.append("Suspicious X11/Sway windows: " + " | ".join(windows))
+    if not interesting and lines:
+        interesting = lines[-40:]
+    out = list(dict.fromkeys(x for x in interesting if x.strip()))
+    return "\n".join(out)[-MAX_LOG_CHARS:]
+
+
+def _device_nodes_for_probe() -> list[Path]:
+    """Return host devices Wolf normally exposes to a streamed child."""
+    nodes: list[Path] = []
+    for root in (Path("/dev/dri"), Path("/dev/input"), Path("/dev/snd")):
+        if not root.is_dir():
+            continue
+        for dev in sorted(root.iterdir()):
+            try:
+                if stat.S_ISCHR(dev.stat().st_mode):
+                    nodes.append(dev)
+            except OSError:
+                continue
+    uinput = Path("/dev/uinput")
+    try:
+        if uinput.exists() and stat.S_ISCHR(uinput.stat().st_mode):
+            nodes.append(uinput)
+    except OSError:
+        pass
+    return nodes
+
+
+def _device_group_ids(paths: list[Path]) -> list[int]:
+    gids: set[int] = set()
+    for dev in paths:
+        try:
+            gids.add(int(dev.stat().st_gid))
+        except OSError:
+            continue
+    return sorted(gid for gid in gids if gid >= 0)
+
+
+def add_common_docker_args(args: list[str], sid: str, home: Path, x11_dir: Path, runtime_dir: Path) -> None:
+    device_nodes = _device_nodes_for_probe()
+    args += [
+        "--ipc", "host",
+        "--cap-add", "SYS_ADMIN", "--cap-add", "SYS_NICE", "--cap-add", "SYS_PTRACE",
+        "--cap-add", "NET_RAW", "--cap-add", "MKNOD", "--cap-add", "NET_ADMIN",
+        "--security-opt", "seccomp=unconfined", "--security-opt", "apparmor=unconfined",
+        "--ulimit", "nofile=524288:524288",
+        "-e", "RUN_SWAY=1", "-e", "RUN_GAMESCOPE=", "-e", "WAYBAR_HIDDEN=1",
+        "-e", "WLR_BACKENDS=headless", "-e", "WLR_LIBINPUT_NO_DEVICES=1",
+        # These are injected by Wolf in production.  v0.18.48 omitted them in
+        # direct probes, leaving the retro user outside the render/input groups
+        # and setting XDG_RUNTIME_DIR to the world-writable X11 socket directory.
+        "-e", "XDG_RUNTIME_DIR=/run/user/wolf",
+        "-e", "GOW_REQUIRED_DEVICES=/dev/input/event* /dev/dri/* /dev/snd/* /dev/nvidia* /dev/pcga-media-disc*",
+        "-e", "PCGA_GAME_WINDOW_START_TICKS=300",
+        "-e", "PCGA_GAME_HANDOFF_WINDOW_TICKS=200",
+        "-e", "PCGA_GAME_WINDOW_GONE_TICKS=30",
+        "-e", "PCGA_GAME_FAILURE_GRACE_SECONDS=0",
+        "-e", "PCGA_SETUP_FAILURE_GRACE_SECONDS=0",
+        "-e", "PCGA_SETUP_WINESERVER_WAIT_SECONDS=60",
+        "-e", f"PCGA_GAME_SET_ID={sid}",
+        "-v", f"{home}:/home/retro:rw",
+        "-v", f"{x11_dir}:/tmp/.X11-unix:rw",
+        "-v", f"{runtime_dir}:/run/user/wolf:rw",
+    ]
+    # Docker supplementary groups are a deterministic fallback for GoW's
+    # device-group helper and also cover unusual render-node group numbers.
+    for gid in _device_group_ids(device_nodes):
+        args += ["--group-add", str(gid)]
+    net = run(["docker", "network", "inspect", "legacy-games"], timeout=6)
+    if net.returncode == 0:
+        args += ["--network", "legacy-games"]
+    for dev in device_nodes:
+        args += ["--device", f"{dev}:{dev}"]
+
+
+def add_media_args(args: list[str], state: dict) -> list[dict]:
+    findings: list[dict] = []
+    for row in (state.get("runtime_media") if isinstance(state.get("runtime_media"), list) else [])[:8]:
+        if not isinstance(row, dict):
+            continue
+        disc = row.get("disc")
+        mountpoint = Path(str(row.get("mountpoint") or ""))
+        iso = Path(str(row.get("iso") or ""))
+        device = str(row.get("device") or "")
+        if mountpoint.is_dir():
+            args += ["-v", f"{mountpoint}:/pcga-media/disc{disc}:ro"]
+        else:
+            findings.append({"type": "missing-media-mount", "disc": disc, "path": str(mountpoint)})
+        if iso.is_file():
+            args += ["-v", f"{iso}:/pcga-media/disc{disc}.iso:ro"]
+        else:
+            findings.append({"type": "missing-media-image", "disc": disc, "path": str(iso)})
+        if device.startswith("/dev/loop") and Path(device).exists():
+            dev_path = Path(device)
+            try:
+                args += ["--group-add", str(int(dev_path.stat().st_gid))]
+            except OSError:
+                pass
+            args += ["--device", f"{device}:/dev/pcga-media-disc{disc}:r"]
+    return findings
+
+
+def static_preflight(sid: str, game: dict, state: dict) -> tuple[list[dict], str, str, bool]:
+    status = str(state.get("status") or "unknown")
+    setup = status == "setup-required"
+    raw_image = state.get("setup_runtime_image") if setup else state.get("runtime_image")
+    image = str(raw_image or "")
+    findings: list[dict] = []
+    if status not in {"ready", "setup-required"}:
+        findings.append({"type": "not-launchable", "detail": f"catalog state is {status}"})
+    if not image:
+        findings.append({"type": "missing-runtime-image-reference"})
+    else:
+        p = run(["docker", "image", "inspect", image], timeout=10)
+        if p.returncode:
+            findings.append({"type": "missing-runtime-image", "image": image, "detail": (p.stderr or p.stdout)[-1000:]})
+    if setup:
+        src_text = str(state.get("setup_source") or "").strip()
+        src = Path(src_text) if src_text else Path("/__pcga_missing_setup_source__")
+        rel = str(state.get("setup_installer") or "")
+        if not src_text or not src.is_dir():
+            findings.append({"type": "missing-setup-source", "path": str(src)})
+        elif not rel or not (src / rel).is_file():
+            findings.append({"type": "missing-setup-installer", "path": str(src / rel)})
+        else:
+            rel_norm = rel.replace("\\", "/").lstrip("./")
+            if BUNDLED_PATH_RE.search(rel_norm):
+                findings.append({"type": "suspicious-bundled-installer", "path": rel_norm})
+            if "/" in rel_norm and Path(rel_norm).name.casefold() in {"setup.exe", "install.exe", "installer.exe"}:
+                roots = [src / name for name in ("Setup.exe", "setup.exe", "Install.exe", "install.exe", "Installer.exe", "installer.exe")]
+                root_candidates = [str(x) for x in roots if x.is_file()]
+                if root_candidates:
+                    findings.append({"type": "shadowed-nested-installer", "selected": rel_norm, "root_candidates": root_candidates})
+    else:
+        install_text = str(state.get("install_root") or "").strip()
+        install = Path(install_text) if install_text else Path("/__pcga_missing_install_root__")
+        rel = str(state.get("launch_executable") or "")
+        if not install_text or not install.is_dir():
+            findings.append({"type": "missing-install-root", "path": str(install)})
+        elif not rel or not (install / rel).is_file():
+            findings.append({"type": "missing-launch-executable", "path": str(install / rel)})
+        else:
+            rel_norm = rel.replace("\\", "/").lstrip("./")
+            base = Path(rel_norm).name.casefold()
+            if base in SUSPICIOUS_LAUNCH_BASENAMES or BUNDLED_PATH_RE.search(rel_norm):
+                findings.append({"type": "suspicious-launch-target", "path": rel_norm})
+        kernel = install / "prefix/drive_c/windows/system32/kernel32.dll"
+        if str(state.get("install_method") or "") != "portable-copy" and not kernel.is_file():
+            findings.append({"type": "invalid-wine-prefix", "path": str(kernel)})
+    reg = wolf_registration(sid, setup)
+    if not reg.get("ok"):
+        findings.append({"type": "wolf-registration", "detail": reg})
+    return findings, status, image, setup
+
+
+def probe_game(run_id: str, sid: str, game: dict, state: dict, timeout_seconds: int) -> dict:
+    started = time.monotonic()
+    title = str(game.get("title") or state.get("title") or sid)
+    findings, status, image, setup = static_preflight(sid, game, state)
+    result = {
+        "game_set_id": sid,
+        "title": title,
+        "catalog_status": status,
+        "install_method": state.get("install_method"),
+        "launch_executable": state.get("launch_executable"),
+        "setup_installer": state.get("setup_installer"),
+        "runtime_image": image,
+        "wolf": wolf_registration(sid, setup),
+        "static_findings": findings,
+        "probe_mode": "isolated-wolf-equivalent-runtime",
+        "started_at": utc_now(),
+        "outcome": "fail",
+        "stage": "preflight",
+        "exit_code": None,
+        "windows": [],
+        "auxiliary_windows": [],
+        "failure_reason": "",
+        "failure_traceback": "",
+        "docker_log": "",
+    }
+    fatal_types = {"not-launchable", "missing-runtime-image-reference", "missing-runtime-image", "missing-setup-source", "missing-setup-installer", "missing-install-root", "missing-launch-executable", "invalid-wine-prefix", "wolf-registration", "suspicious-bundled-installer", "shadowed-nested-installer", "suspicious-launch-target"}
+    fatal = [x for x in findings if x.get("type") in fatal_types]
+    if fatal:
+        result["failure_reason"] = "; ".join(str(x.get("type")) for x in fatal)
+        result["failure_traceback"] = json.dumps(fatal, indent=2)[-MAX_LOG_CHARS:]
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    work = REPORT_ROOT / "work" / run_id / sid
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    home = work / "home"
+    logs = work / "runtime-logs"
+    install = work / "setup-install"
+    x11_dir = work / "x11-unix"
+    runtime_dir = work / "run-user-wolf"
+    for p in (home, logs, install, runtime_dir):
+        p.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chown(p, 1000, 1000)
+        except OSError:
+            pass
+    try:
+        runtime_dir.chmod(0o700)
+    except OSError:
+        pass
+    x11_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        x11_dir.chmod(0o1777)
+    except OSError:
+        pass
+    token = re.sub(r"[^A-Za-z0-9]", "", sid)[:12] or "game"
+    # Do not use the production PCGA-* name prefix.  The periodic orchestrator
+    # intentionally reaps stopped PCGA child containers; v0.18.49 could therefore
+    # delete a fast-crashing probe before this harness collected its traceback.
+    name = f"pcga-compat-{token}-{os.getpid()}"
+    create = ["docker", "create", "--name", name, "--label", "pcga.compat.probe=1"]
+    add_common_docker_args(create, sid, home, x11_dir, runtime_dir)
+    result["static_findings"].extend(add_media_args(create, state))
+    if setup:
+        src = Path(str(state.get("setup_source")))
+        create += ["-v", f"{install}:/pcga-install:rw", "-v", f"{src}:/pcga-source:ro"]
+    else:
+        template = Path(str(state.get("install_root")))
+        create += ["-v", f"{template}:/pcga-template:ro", "-v", f"{logs}:/pcga-runtime-logs:rw"]
+    create.append(image)
+
+    c = run(create, timeout=25)
+    if c.returncode:
+        result["stage"] = "docker-create"
+        result["failure_reason"] = "runtime container creation failed"
+        result["failure_traceback"] = ((c.stderr or "") + "\n" + (c.stdout or ""))[-MAX_LOG_CHARS:]
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+    cid = (c.stdout or "").strip()
+    result["container_id"] = cid
+    start = run(["docker", "start", cid], timeout=20)
+    if start.returncode:
+        result["stage"] = "docker-start"
+        result["failure_reason"] = "runtime container failed to start"
+        result["failure_traceback"] = ((start.stderr or "") + "\n" + (start.stdout or ""))[-MAX_LOG_CHARS:]
+        run(["docker", "rm", "-f", cid], timeout=15)
+        result["duration_seconds"] = round(time.monotonic() - started, 3)
+        return result
+
+    result["stage"] = "runtime"
+    success = False
+    failure_reason = ""
+    last_logs = ""
+    last_windows: list[str] = []
+    auxiliary_seen: list[str] = []
+    deadline = time.monotonic() + timeout_seconds
+    setup_boundary_at: float | None = None
+    game_window_at: float | None = None
+    try:
+        while time.monotonic() < deadline:
+            lp = run(["docker", "logs", "--tail", "500", cid], timeout=6)
+            last_logs = ((lp.stdout or "") + (lp.stderr or ""))[-MAX_LOG_CHARS:]
+            last_windows = extract_windows(cid)
+            suspicious = [x for x in last_windows if SUSPICIOUS_WINDOW_RE.search(x)]
+            auxiliary = [x for x in last_windows if AUXILIARY_GAME_WINDOW_RE.search(x)] if not setup else []
+            for name in auxiliary:
+                if name not in auxiliary_seen:
+                    auxiliary_seen.append(name)
+            usable_windows = [x for x in last_windows if x not in auxiliary]
+            result["auxiliary_windows"] = list(auxiliary_seen)
+            if suspicious:
+                failure_reason = "runtime displayed an error/debugger window: " + " | ".join(suspicious)
+                break
+            if setup:
+                if "Wine GUI launch boundary ready" in last_logs and setup_boundary_at is None:
+                    setup_boundary_at = time.monotonic()
+                # Interactive setup is compatible once the real installer has
+                # remained alive with a visible non-error window for 3 seconds.
+                if setup_boundary_at is not None and last_windows and time.monotonic() - setup_boundary_at >= 3.0:
+                    success = True
+                    break
+            else:
+                if "Wine debugger detected" in last_logs or "starting debugger" in last_logs:
+                    failure_reason = "Wine crash/debugger detected"
+                    break
+                if "first game window visible" in last_logs and usable_windows:
+                    if game_window_at is None:
+                        game_window_at = time.monotonic()
+                    # Keep observing long enough to catch the common legacy-game
+                    # pattern of mapping one frame/window and crashing seconds
+                    # later during renderer/audio initialization.
+                    if time.monotonic() - game_window_at >= 15.0:
+                        success = True
+                        break
+                else:
+                    game_window_at = None
+            ins = docker_inspect(cid)
+            state_row = ins.get("State") if isinstance(ins.get("State"), dict) else {}
+            if not ins:
+                failure_reason = "probe container disappeared before traceback collection"
+                break
+            if not state_row.get("Running"):
+                result["exit_code"] = state_row.get("ExitCode")
+                failure_reason = f"runtime exited before a usable {'installer' if setup else 'game'} window appeared"
+                break
+            time.sleep(1)
+        else:
+            failure_reason = f"runtime probe timed out after {timeout_seconds}s without a usable {'installer' if setup else 'game'} window"
+    except Exception as exc:
+        failure_reason = f"probe exception: {type(exc).__name__}: {exc}"
+        last_logs = (last_logs + "\n" + traceback.format_exc())[-MAX_LOG_CHARS:]
+    finally:
+        ins = docker_inspect(cid)
+        st = ins.get("State") if isinstance(ins.get("State"), dict) else {}
+        if result.get("exit_code") is None and st and not st.get("Running"):
+            result["exit_code"] = st.get("ExitCode")
+        # Keep the test disposable even if the game/installer is healthy and
+        # would otherwise wait forever for user input.
+        run(["docker", "rm", "-f", cid], timeout=20)
+
+    result["windows"] = last_windows
+    result["docker_log"] = last_logs
+    if not success and not setup and result.get("auxiliary_windows") and not any(SUSPICIOUS_WINDOW_RE.search(x) for x in last_windows):
+        result["outcome"] = "attention"
+        result["stage"] = "auxiliary-window"
+        result["failure_reason"] = "launch reached an auxiliary window but not a confirmed game window: " + " | ".join(result.get("auxiliary_windows") or [])
+        result["failure_traceback"] = error_trace(last_logs, last_windows)
+    elif success:
+        result["outcome"] = "pass"
+        result["stage"] = "installer-window" if setup else "game-window"
+        result["failure_reason"] = ""
+        result["failure_traceback"] = ""
+    else:
+        result["outcome"] = "fail"
+        result["failure_reason"] = failure_reason or "unknown runtime launch failure"
+        result["failure_traceback"] = error_trace(last_logs, last_windows)
+    result["duration_seconds"] = round(time.monotonic() - started, 3)
+    return result
+
+
+def portal_candidate(row: dict) -> dict:
+    """Compact compatibility result suitable for choosing portal smoke tests."""
+    stage = str(row.get("stage") or "")
+    portal_action = "install" if stage == "installer-window" else "play" if stage == "game-window" else "inspect"
+    return {
+        "game_set_id": str(row.get("game_set_id") or ""),
+        "title": str(row.get("title") or row.get("game_set_id") or "Unknown game"),
+        "stage": stage,
+        "portal_action": portal_action,
+        "windows": [str(x) for x in (row.get("windows") or []) if str(x).strip()],
+    }
+
+
+def populate_candidate_lists(report: dict) -> None:
+    games = report.get("games") if isinstance(report.get("games"), list) else []
+    report["portal_test_candidates"] = [portal_candidate(x) for x in games if isinstance(x, dict) and x.get("outcome") == "pass"]
+    report["attention_candidates"] = [portal_candidate(x) for x in games if isinstance(x, dict) and x.get("outcome") == "attention"]
+
+
+def print_portal_test_summary(report: dict, *, prefix: str = "[pcga-compat-test]") -> None:
+    """Print the human-facing list of titles worth testing in the portal next."""
+    games = report.get("games") if isinstance(report.get("games"), list) else []
+    passed = report.get("portal_test_candidates") if isinstance(report.get("portal_test_candidates"), list) else []
+    attention = report.get("attention_candidates") if isinstance(report.get("attention_candidates"), list) else []
+    failed = [portal_candidate(x) for x in games if isinstance(x, dict) and x.get("outcome") == "fail"]
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+
+    print(f"{prefix} === PORTAL MANUAL TEST CANDIDATES ===")
+    if passed:
+        for index, row in enumerate(passed, 1):
+            window = ", ".join(row.get("windows") or []) or row.get("stage") or "compatible window"
+            action = str(row.get("portal_action") or "inspect").upper()
+            print(f"{prefix} PASS {index}: [{action}] {row.get('title')} | {row.get('game_set_id')} | {window}")
+    else:
+        print(f"{prefix} PASS: none")
+
+    if attention:
+        print(f"{prefix} === NEEDS MANUAL ATTENTION ===")
+        for index, row in enumerate(attention, 1):
+            window = ", ".join(row.get("windows") or []) or row.get("stage") or "attention"
+            print(f"{prefix} ATTENTION {index}: {row.get('title')} | {row.get('game_set_id')} | {window}")
+
+    if failed:
+        print(f"{prefix} === NOT READY FOR PORTAL TESTING ===")
+        for index, row in enumerate(failed, 1):
+            print(f"{prefix} FAIL {index}: {row.get('title')} | {row.get('game_set_id')}")
+
+    print(
+        f"{prefix} portal-ready={len(passed)} attention={len(attention)} failed={len(failed)} "
+        f"tested={summary.get('tested', len(games))}"
+    )
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Clean Wolf transient instances and smoke-test every canonical PCGA game")
+    ap.add_argument("--output", help="Write the report to this path in addition to latest.json")
+    ap.add_argument("--timeout", type=int, default=45, help="Per-game runtime probe timeout in seconds (default: 45)")
+    ap.add_argument("--set-id", help="Test only one canonical game set ID")
+    ap.add_argument("--no-clean", action="store_true", help="Do not stop existing PCGA child sessions or restart Wolf")
+    ap.add_argument("--no-reconcile", action="store_true", help="Do not run the metadata-only orchestrator reconciliation before testing")
+    ap.add_argument("--pretty", action="store_true", help="Print the completed JSON report to stdout")
+    ap.add_argument("--summary-report", metavar="PATH", help=argparse.SUPPRESS)
+    ns = ap.parse_args()
+    if ns.summary_report:
+        report_path = Path(ns.summary_report)
+        report = load_json(report_path)
+        if not report:
+            print(f"compatibility report is missing or invalid: {report_path}", file=sys.stderr)
+            return 66
+        populate_candidate_lists(report)
+        print_portal_test_summary(report, prefix="[pcga-compat-report]")
+        return 0
+    if os.geteuid() != 0:
+        print("pcga-game-compat-test must run as root", file=sys.stderr)
+        return 77
+    if ns.timeout < 10 or ns.timeout > 300:
+        ap.error("--timeout must be between 10 and 300 seconds")
+
+    REPORT_ROOT.mkdir(parents=True, exist_ok=True)
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another PCGA compatibility sweep is already running", file=sys.stderr)
+            return 75
+
+        run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        report = {
+            "schema": 4,
+            "pcga_version": VERSION,
+            "run_id": run_id,
+            "started_at": utc_now(),
+            "probe_mode": "isolated-wolf-equivalent-runtime",
+            "destructive_scope": "transient Wolf child containers only; preserved media/install templates/player homes are not modified",
+            "ignored_records": [],
+            "clean": {},
+            "reconcile": {},
+            "wolf_restart": {},
+            "games": [],
+            "summary": {},
+            "portal_test_candidates": [],
+            "attention_candidates": [],
+        }
+        if not ns.no_clean:
+            report["clean"] = {"wolf_children": clean_wolf_children(), "compat_probes": clean_compat_probes()}
+            # Start from a clean Wolf/Wolf-Den pair *before* writing the managed
+            # app catalog.  v0.18.48 reconciled first and then restarted Wolf-Den,
+            # which could reload stale API state and make a freshly repaired app
+            # block disappear before the probe (observed with swfoc).
+            report["wolf_restart"] = restart_wolf()
+        if not ns.no_reconcile:
+            report["reconcile"] = reconcile_catalog()
+
+        games, ignored = canonical_games(ns.set_id or "")
+        report["ignored_records"] = ignored
+        for index, (sid, game, state) in enumerate(games, 1):
+            title = str(game.get("title") or state.get("title") or sid)
+            print(f"[pcga-compat-test] [{index}/{len(games)}] {title} ({sid})", flush=True)
+            try:
+                row = probe_game(run_id, sid, game, state, ns.timeout)
+            except Exception as exc:
+                row = {
+                    "game_set_id": sid,
+                    "title": title,
+                    "outcome": "fail",
+                    "stage": "harness",
+                    "failure_reason": f"compatibility harness exception: {type(exc).__name__}: {exc}",
+                    "failure_traceback": traceback.format_exc()[-MAX_LOG_CHARS:],
+                }
+            report["games"].append(row)
+            # Persist partial progress so a host reboot/test crash still leaves a
+            # useful report rather than losing all previous game traces.
+            atomic_json(REPORT_ROOT / "latest.partial.json", report)
+
+        # A test itself should never leave a transient child behind.
+        report["post_clean"] = {"wolf_children": clean_wolf_children(), "compat_probes": clean_compat_probes()}
+        passed = sum(1 for x in report["games"] if x.get("outcome") == "pass")
+        failed = sum(1 for x in report["games"] if x.get("outcome") == "fail")
+        attention = sum(1 for x in report["games"] if x.get("outcome") == "attention")
+        report["summary"] = {
+            "tested": len(report["games"]),
+            "passed": passed,
+            "failed": failed,
+            "attention": attention,
+            "ignored_source_records": len(report.get("ignored_records") or []),
+            "pass_rate": round((passed / len(report["games"]) * 100.0), 2) if report["games"] else 0.0,
+        }
+        populate_candidate_lists(report)
+        report["finished_at"] = utc_now()
+        reports = REPORT_ROOT / "reports"
+        reports.mkdir(parents=True, exist_ok=True)
+        dated = reports / f"pcga-game-compat-{run_id}.json"
+        atomic_json(dated, report)
+        atomic_json(REPORT_ROOT / "latest.json", report)
+        (REPORT_ROOT / "latest.partial.json").unlink(missing_ok=True)
+        if ns.output:
+            atomic_json(Path(ns.output), report)
+        print(f"[pcga-compat-test] report: {dated}")
+        print(f"[pcga-compat-test] summary: {passed} passed, {failed} failed, {attention} attention, {len(report['games'])} tested, {len(report.get('ignored_records') or [])} source-only records ignored")
+        print_portal_test_summary(report)
+        if ns.pretty:
+            print(json.dumps(report, indent=2, sort_keys=True))
+        return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import ipaddress, json, os, shutil, subprocess, sys, tempfile, urllib.request
+
+VERSION="0.19.0"
+PORTAL_PORT=8443
+MOONLIGHT_BASE=int(os.environ.get("PCGA_MOONLIGHT_WEB_PORT","8101"))
+MOONLIGHT_LANES=max(1,min(8,int(os.environ.get("PCGA_MOONLIGHT_WEB_LANES","4"))))
+
+def run(args, timeout=45, input_text=None):
+    try:
+        return subprocess.run(args,text=True,input=input_text,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+    except Exception as exc:
+        return subprocess.CompletedProcess(args,127,"",str(exc))
+
+def valid_ip(value):
+    try: return str(ipaddress.ip_address(str(value).split('/')[0]))
+    except Exception: return ""
+
+def read_payload():
+    try:
+        obj=json.loads(sys.stdin.read() or "{}")
+        return obj if isinstance(obj,dict) else {}
+    except Exception: return {}
+
+def status():
+    out={"ok":True,"provider":"netbird","version":VERSION,"available":False,"configured":False,"state":"unavailable","ip":"","ips":[],"portal_url":"","moonlight_url":"","moonlight_urls":[],"p2p_peers":0,"relayed_peers":0,"detail":"NetBird CLI is not installed on this appliance."}
+    if not shutil.which("netbird"): return out
+    out["available"]=True
+    p=run(["netbird","status","--json"],15)
+    data={}
+    if p.returncode==0:
+        try: data=json.loads(p.stdout or "{}")
+        except Exception: data={}
+    p4=run(["netbird","status","--ipv4"],10)
+    ip=valid_ip((p4.stdout or "").strip()) if p4.returncode==0 else ""
+    blob=json.dumps(data).lower()
+    connected=(p.returncode==0 and ('"connected": true' in blob or '"status": "connected"' in blob or '"management"' in blob))
+    if not connected:
+        human=run(["netbird","status"],10)
+        text=(human.stdout+human.stderr).lower()
+        connected=(human.returncode==0 and "management: connected" in text)
+    def walk(v):
+        if isinstance(v,dict):
+            typ=str(v.get("connectionType") or v.get("connection_type") or v.get("type") or "").lower()
+            direct=v.get("direct")
+            if typ=="p2p" or direct is True: out["p2p_peers"]+=1
+            elif typ=="relayed" or (direct is False and str(v.get("status") or "").lower()=="connected"): out["relayed_peers"]+=1
+            for x in v.values(): walk(x)
+        elif isinstance(v,list):
+            for x in v: walk(x)
+    walk(data)
+    if connected:
+        out.update(configured=True,state="ready",ip=ip,ips=[ip] if ip else [])
+        if ip:
+            out["portal_url"]=f"https://{ip}:{PORTAL_PORT}/"
+            out["moonlight_urls"]=[f"https://{ip}:{MOONLIGHT_BASE+i}/" for i in range(MOONLIGHT_LANES)]
+            out["moonlight_url"]=out["moonlight_urls"][0]
+        mode=[]
+        if out["p2p_peers"]: mode.append(f"{out['p2p_peers']} direct")
+        if out["relayed_peers"]: mode.append(f"{out['relayed_peers']} relayed")
+        out["detail"]="NetBird is connected"+(" • "+", ".join(mode) if mode else "")+". PCGA uses the encrypted overlay directly; no public portal is exposed."
+    else:
+        out.update(state="disconnected",detail=(p.stderr or p.stdout or "NetBird is installed but not connected. Provide a setup key to join NetBird Cloud or an existing self-hosted NetBird deployment.").strip()[:700])
+    return out
+
+def install_client():
+    if shutil.which("netbird"): return status()
+    url="https://pkgs.netbird.io/install.sh"
+    try:
+        with urllib.request.urlopen(url,timeout=25) as r: script=r.read(2_000_000)
+        install_dir="/var/lib/pc-game-archive/control/installers"; os.makedirs(install_dir,exist_ok=True)
+        fd,path=tempfile.mkstemp(prefix="pcga-netbird-",suffix=".sh",dir=install_dir)
+        os.write(fd,script); os.close(fd); os.chmod(path,0o700)
+        if shutil.which("systemd-run"):
+            p=run(["systemd-run","--quiet","--wait","--pipe","--collect", "/bin/bash",path],240)
+        else:
+            p=run(["bash",path],180)
+        os.unlink(path)
+    except Exception as exc:
+        return {"ok":False,"provider":"netbird","error":"netbird-install-failed","detail":str(exc)[:900]}
+    if p.returncode!=0: return {"ok":False,"provider":"netbird","error":"netbird-install-failed","detail":(p.stderr or p.stdout)[-1200:]}
+    return status()
+
+def reconcile_tls():
+    helper="/usr/local/sbin/pcga-network-identity"
+    if os.path.isfile(helper): run([helper],150)
+
+def main():
+    cmd=sys.argv[1] if len(sys.argv)>1 else "status"
+    if cmd=="status": obj=status()
+    elif cmd=="install": obj=install_client()
+    elif cmd=="connect":
+        req=read_payload(); key=str(req.get("setup_key") or "").strip(); management=str(req.get("management_url") or "").strip()
+        if not shutil.which("netbird"): obj={"ok":False,"provider":"netbird","error":"netbird-not-installed","detail":"Install the NetBird client first."}
+        elif not key: obj={"ok":False,"provider":"netbird","error":"setup-key-required","detail":"A NetBird setup key is required for unattended PCGA enrollment."}
+        else:
+            args=["netbird","up","--setup-key",key]
+            if management: args += ["--management-url",management]
+            p=run(args,90)
+            if p.returncode!=0: obj={"ok":False,"provider":"netbird","error":"netbird-connect-failed","detail":(p.stderr or p.stdout)[-1200:]}
+            else:
+                reconcile_tls(); obj=status()
+    elif cmd=="disconnect":
+        if shutil.which("netbird"):
+            p=run(["netbird","down"],45)
+            if p.returncode!=0: obj={"ok":False,"provider":"netbird","error":"netbird-disconnect-failed","detail":(p.stderr or p.stdout)[-1000:]}
+            else: reconcile_tls(); obj=status()
+        else: obj=status()
+    else:
+        obj={"ok":False,"provider":"netbird","error":"invalid-command","detail":"usage: pcga-netbird-remote {status|install|connect|disconnect}"}
+    print(json.dumps(obj,separators=(",",":")))
+    raise SystemExit(0 if obj.get("ok",False) else 2)
+if __name__=="__main__": main()

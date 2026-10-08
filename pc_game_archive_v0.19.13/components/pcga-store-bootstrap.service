@@ -1,0 +1,16 @@
+[Unit]
+Description=PCGA headless PC-store backend bootstrap
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+ConditionPathExists=/etc/pc-game-archive/archive-root
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-store-bootstrap
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target
