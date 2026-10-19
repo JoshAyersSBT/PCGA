@@ -1,0 +1,13 @@
+[Unit]
+Description=PC Game Archive conservative duplicate-media pruning
+After=local-fs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/pc-game-archive/dedupe.conf
+ExecStart=/usr/local/sbin/pcga-dedupe run --scheduled
+Nice=19
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUWeight=10
+IOWeight=10

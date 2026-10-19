@@ -1,0 +1,12 @@
+[Unit]
+Description=Reconcile completed PC-store game installations
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=2min
+AccuracySec=20s
+Persistent=true
+Unit=pcga-store-ingest.service
+
+[Install]
+WantedBy=timers.target

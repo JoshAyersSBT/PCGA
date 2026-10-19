@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""PCGA optical-video job provenance and logical-title inventory.
+
+Do not infer disc identity from completed path, volume label, or timestamps.
+The global ARM writer lock (pcga-arm-rip) must cover begin -> rip -> finish.
+Disc navigation is reported by existing MakeMKV title records, supplemented
+by lsdvd's IFO-backed navigation for DVD-Video when available. No raw VOB joins.
+"""
+from __future__ import annotations
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import uuid
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+STATE = Path(os.environ.get('PCGA_DISC_JOB_STATE','/var/lib/pc-game-archive/optical-jobs'))
+DISCS = Path(os.environ.get('PCGA_MEDIA_DISC_STATE','/var/lib/pc-game-archive/media-intake/discs'))
+VIDEO_EXT = {'.mkv','.mp4','.m4v','.avi','.mov','.mpg','.mpeg','.ts','.m2ts','.vob','.webm'}
+
+
+def timestamp():
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+
+
+def read_json(path:Path) -> dict:
+    try:
+        value=json.loads(path.read_text(encoding='utf-8'))
+        return value if isinstance(value,dict) else {}
+    except (ValueError,OSError):
+        return {}
+
+
+def atomic_json(path:Path, value:dict, *, exclusive=False):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    if exclusive:
+        with path.open('x',encoding='utf-8') as out:
+            json.dump(value,out,indent=2,sort_keys=True)
+            out.write('\n')
+        return
+    temporary=path.with_name(path.name+'.tmp-'+uuid.uuid4().hex)
+    try:
+        temporary.write_text(json.dumps(value,indent=2,sort_keys=True)+'\n',encoding='utf-8')
+        os.replace(temporary,path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def artifacts(root:Path):
+    """Only immediate, independently movable ARM artifacts, not nested chapters.
+
+    Direct child paths of completed/<category> and raw/<title>. A previously
+    existing artifact is never claimed, including when ARM appends new data.
+    """
+    stage=root/'media/arm/work'
+    found={}
+    completed=stage/'completed'
+    if completed.is_dir():
+        for category in completed.iterdir():
+            if category.is_dir():
+                for item in category.iterdir():
+                    if item.name.startswith('.'):continue
+                    found[str(item)]=item
+            elif category.is_file() and category.suffix.lower() in VIDEO_EXT:
+                found[str(category)]=category
+    raw=stage/'raw'
+    if raw.is_dir():
+        for item in raw.iterdir():
+            if not item.name.startswith('.'):
+                found[str(item)]=item
+    return found
+
+
+def has_video(path:Path):
+    if path.is_file():return path.suffix.lower() in VIDEO_EXT
+    if not path.is_dir():return False
+    return any(f.suffix.lower() in VIDEO_EXT for f in path.rglob('*') if f.is_file())
+
+
+def dvd_navigation(xml_text:str):
+    """Extract lsdvd IFO navigation safely; titles, chapters, cell lengths only."""
+    root=ET.fromstring(xml_text)
+    if root.tag!='lsdvd':raise ValueError('not an lsdvd document')
+    rows=[]
+    for track in root.findall('./track')[:1000]:
+        def one(key):return (track.findtext(key) or '').strip()
+        cells=[]
+        for cell in track.findall('./cell')[:1000]:
+            cells.append({'length': (cell.findtext('length') or '').strip(),
+                          'ix': (cell.findtext('ix') or '').strip()})
+        chapters=[]
+        for chapter in track.findall('./chapter')[:1000]:
+            chapters.append({'length': (chapter.findtext('length') or '').strip(),
+                             'ix': (chapter.findtext('ix') or '').strip()})
+        rows.append({'dvd_title':one('ix'),'vts_id':one('vts_id'),
+                     'pgc':one('pgc'), 'duration_seconds':one('length'),
+                     'chapters':chapters,'cells':cells})
+    return rows
+
+
+def dvd_probe(device:str, enabled:bool=True):
+    if not enabled:return {'status':'disabled','titles':[]}
+    try:
+        p=subprocess.run(['lsdvd','-x','-Ox',device],capture_output=True,timeout=45)
+    except FileNotFoundError:return {'status':'lsdvd-not-installed','titles':[]}
+    except subprocess.TimeoutExpired:return {'status':'timeout','titles':[]}
+    if p.returncode!=0:return {'status':'navigation-read-failed','titles':[]}
+    if len(p.stdout)>8*1024*1024:return {'status':'navigation-too-large','titles':[]}
+    try:return {'status':'ok','titles':dvd_navigation(p.stdout.decode('utf-8','replace'))}
+    except (ET.ParseError,ValueError):return {'status':'navigation-parse-failed','titles':[]}
+
+
+def title_inventory(media:dict):
+    out=[]
+    for row in (media.get('title_table') or [])[:2000]:
+        if not isinstance(row,dict):continue
+        try:
+            idx=int(row['index'])
+        except (KeyError,TypeError,ValueError):continue
+        source=str(row.get('source_file') or '')
+        duration=row.get('duration_seconds')
+        try:duration=int(duration) if duration is not None else None
+        except (TypeError,ValueError):duration=None
+        out.append({'makemkv_index':idx,'name':row.get('name'),
+                    'duration_seconds':duration,'chapter_count':row.get('chapters'),
+                    'source_file':source or None,
+                    'bluray_playlist':Path(source).name if source.lower().endswith('.mpls') else None})
+    return out
+
+
+def begin(root:Path,device:str,fingerprint:str,kind:str,*,scan_dvd=True):
+    if not root.is_absolute() or not re.fullmatch(r'/dev/sr\d+',device):
+        raise ValueError('archive root or optical drive invalid')
+    if not re.fullmatch(r'[0-9a-f]{64}',fingerprint):
+        raise ValueError('missing verified disc fingerprint; refuse unidentified optical job')
+    if kind not in ('dvd-video','bluray-video'):
+        raise ValueError('disc is not a supported optical video format')
+    media=read_json(DISCS/f'{fingerprint}.json')
+    if media and media.get('fingerprint')!=fingerprint:
+        raise ValueError('source disc identity mismatch')
+    job_id=uuid.uuid4().hex
+    dvd=dvd_probe(device,scan_dvd) if kind=='dvd-video' else {'status':'not-dvd','titles':[]}
+    titles=title_inventory(media)
+    warnings=[]
+    if not titles:warnings.append('MakeMKV title table unavailable; operator review required')
+    if kind=='dvd-video' and dvd['status']!='ok':warnings.append('IFO navigation not available; require review')
+    record={'schema':1,'job_id':job_id,'drive':device,'disc_fingerprint':fingerprint,
+            'kind':kind,'created_at':timestamp(), 'source':'MakeMKV logical titles and optional DVD IFO navigation',
+            'makemkv_probe_status':media.get('title_probe_status') or 'unavailable',
+            'logical_titles':titles,'dvd_navigation':dvd,
+            'requires_review':True,'warnings':warnings,
+            'preexisting_artifacts':sorted(artifacts(root))}
+    atomic_json(STATE/job_id/'start.json',record,exclusive=True)
+    return record
+
+
+
+def extracted_title_evidence(path:Path, logical_titles:list[dict]):
+    """Verify extracted file media independently of ARM's folder/category name.
+
+    Only a uniquely encoded MakeMKV title suffix can bind file-to-title index.
+    Duration mismatch is evidence for review, NEVER permission to assemble.
+    """
+    files=[path] if path.is_file() else sorted(f for f in path.rglob('*') if f.is_file() and f.suffix.lower() in VIDEO_EXT)
+    out=[]
+    titles={int(t['makemkv_index']):t for t in logical_titles if t.get('makemkv_index') is not None}
+    for f in files[:32]:
+        match=re.search(r'(?i)(?:^|[._ -])t(\d{1,3})(?=$|[._ -])',f.stem)
+        idx=int(match.group(1)) if match else None
+        rec={'file':str(f.relative_to(path)) if path.is_dir() else f.name,
+             'makemkv_index':idx if idx in titles else None,
+             'duration_seconds':None,'chapter_count':None,'verification':'needs-review'}
+        try:
+            result=subprocess.run(['ffprobe','-v','error','-show_entries',
+                     'format=duration:chapter=id','-of','json',str(f)],
+                     capture_output=True,text=True,timeout=8,check=False)
+            if result.returncode==0:
+                data=json.loads(result.stdout)
+                rec['duration_seconds']=round(float((data.get('format') or {}).get('duration') or 0),2)
+                rec['chapter_count']=len(data.get('chapters') or [])
+                expected=titles.get(idx if idx is not None else -1,{}).get('duration_seconds')
+                if expected is not None and rec['duration_seconds']>0:
+                    gap=abs(float(expected)-rec['duration_seconds'])
+                    rec['verification']='duration-aligned' if gap<=max(15,0.02*float(expected)) else 'duration-mismatch'
+        except (OSError,ValueError,subprocess.TimeoutExpired,TypeError):pass
+        out.append(rec)
+    return out
+
+
+def annotate(item:Path,disc_record:dict,job:dict):
+    """Attach only when new artifact is provably exclusive to one ARM run."""
+    if item.is_dir():
+        dest=item/'.pcga-media.json'
+    elif item.is_file() and item.suffix.lower() in VIDEO_EXT:
+        dest=item.with_name(item.name+'.pcga-media.json')
+    else:
+        return False
+    if dest.exists():return False
+    if disc_record.get('fingerprint')!=job['disc_fingerprint']:
+        return False
+    # Retain the existing media metadata API schema for manual-review/classifier.
+    manifest=dict(disc_record)
+    manifest['pcga_disc_structure']={k:job[k] for k in
+        ('job_id','drive','disc_fingerprint','kind','logical_titles','dvd_navigation','requires_review','warnings')}
+    manifest['provenance_method']='exclusive-optical-job-new-artifact'
+    manifest['optical_reconciliation_blocked']=True
+    manifest['pcga_disc_structure']['extracted_title_checks']=extracted_title_evidence(item,job['logical_titles'])
+    atomic_json(dest,manifest,exclusive=True)
+    return True
+
+
+def finish(root:Path,job_id:str,rc:int):
+    if not re.fullmatch('[0-9a-f]{32}',job_id):raise ValueError('invalid job ID')
+    source=read_json(STATE/job_id/'start.json')
+    if not source:raise ValueError('missing optical job start record')
+    result_path=STATE/job_id/'result.json'
+    if result_path.exists():return read_json(result_path)
+    before=set(source['preexisting_artifacts'])
+    current=artifacts(root)
+    new_paths=sorted(set(current)-before)
+    claimed=[];unclaimed=[]
+    disc=read_json(DISCS/f"{source['disc_fingerprint']}.json")
+    for name in new_paths:
+        item=current[name]
+        if not has_video(item):continue
+        if rc==0 and annotate(item,disc,source):claimed.append(name)
+        else:unclaimed.append(name)
+    result={'schema':1,'job_id':job_id,'drive':source['drive'],
+            'disc_fingerprint':source['disc_fingerprint'],'completed_at':timestamp(),
+            'rip_exit_code':rc,'new_artifacts':new_paths,'claimed_artifacts':claimed,
+            'unclaimed_artifacts':unclaimed,
+            'review_required':True}
+    atomic_json(result_path,result,exclusive=True)
+    return result
+
+
+def main():
+    parser=argparse.ArgumentParser(description='PCGA structure-aware video-disc job inventory')
+    subs=parser.add_subparsers(dest='cmd',required=True)
+    b=subs.add_parser('begin');b.add_argument('--root',type=Path,required=True)
+    b.add_argument('--drive',required=True);b.add_argument('--fingerprint',required=True)
+    b.add_argument('--kind',choices=['dvd-video','bluray-video'],required=True)
+    b.add_argument('--no-dvd-probe',action='store_true')
+    f=subs.add_parser('finish');f.add_argument('--root',type=Path,required=True)
+    f.add_argument('--job',required=True);f.add_argument('--exit-code',type=int,required=True)
+    s=subs.add_parser('show');s.add_argument('--job',required=True)
+    subs.add_parser('list')
+    args=parser.parse_args()
+    try:
+        if args.cmd=='begin':out=begin(args.root,args.drive,args.fingerprint,args.kind,scan_dvd=not args.no_dvd_probe)
+        elif args.cmd=='finish':out=finish(args.root,args.job,args.exit_code)
+        elif args.cmd=='list':out={'jobs':[{'job_id':p.parent.name,'drive':read_json(p).get('drive'),'created_at':read_json(p).get('created_at'),'finished':(p.parent/'result.json').is_file()} for p in sorted(STATE.glob('*/start.json'),reverse=True)[:100]]}
+        else:
+            if not re.fullmatch('[0-9a-f]{32}',args.job):raise ValueError('invalid job ID')
+            out={'start':read_json(STATE/args.job/'start.json'),'result':read_json(STATE/args.job/'result.json')}
+        print(json.dumps(out,indent=2,sort_keys=True))
+    except (ValueError,OSError) as exc:
+        parser.exit(1,f'[disc-structure] {exc}\n')
+
+if __name__=='__main__':main()

@@ -1,0 +1,19 @@
+[Unit]
+Description=PCGA persistent PC-store acquisition queue
+Wants=docker.service network-online.target
+After=docker.service network-online.target
+ConditionPathExists=/etc/pc-game-archive/archive-root
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/pcga-store-jobs init
+ExecStart=/usr/local/sbin/pcga-store-jobs worker
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+Nice=8
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=multi-user.target

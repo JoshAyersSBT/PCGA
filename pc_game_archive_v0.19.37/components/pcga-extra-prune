@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""PCGA exact-duplicate extras cleanup: audit -> quarantine -> restore / explicit purge.
+
+Never classifies by title, duration, artwork or perceived similarity. Operates only
+within a single Movie/TV title tree and only when an entry lives in an extras folder.
+"""
+from __future__ import annotations
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import stat
+import sys
+import time
+import uuid
+from collections import defaultdict
+from pathlib import Path
+
+VERSION = "0.19.34"
+VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mov", ".webm", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".wmv"}
+EXTRAS_NAMES = {"extras", "extra", "behind the scenes", "behind-the-scenes", "behind_the_scenes",
+                "featurettes", "featurette", "deleted scenes", "deleted-scenes", "interviews",
+                "trailers", "trailer", "shorts", "clips", "scenes", "samples", "other",
+                "bonus features", "bonus", "special features"}
+DEFAULT_STATE = Path("/var/lib/pc-game-archive/extra-prune")
+MIN_AGE = 600  # An ingest still writing must never be considered settled.
+MIN_PURGE_AGE = 7 * 86400
+
+
+def optical_jobs_active() -> bool:
+    """Do not touch extras while the optical pipeline may be writing media."""
+    try:
+        cmd = subprocess.run(["systemctl", "list-units", "--all", "--plain", "--no-legend",
+                              "--state=active,activating", "pcga-arm-rip@*.service"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=5)
+        if "pcga-arm-rip@" in cmd.stdout:
+            return True
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        cmd = subprocess.run(["docker", "exec", "arm-rippers", "sh", "-lc",
+                              "ps -eo args | grep -Eq '[m]akemkvcon|[H]andBrakeCLI|[p]ython3 /opt/arm/arm/ripper/main.py'"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+        return cmd.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def archive_root() -> Path:
+    path = Path("/etc/pc-game-archive/archive-root")
+    if not path.exists():
+        raise ValueError("PCGA archive root is not configured")
+    return Path(path.read_text().strip()).resolve(strict=True)
+
+
+def state_write(file: Path, obj: dict):
+    file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = file.with_name("." + file.name + "." + uuid.uuid4().hex)
+    try:
+        with tmp.open("x", encoding="utf8") as f:
+            json.dump(obj, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, file)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def state_read(file: Path, default=None):
+    try:
+        return json.loads(file.read_text(encoding="utf8"))
+    except (OSError, ValueError):
+        return default if default is not None else {}
+
+
+def content_hash(p: Path):
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_child(base: Path, rel: str, *, present=True) -> Path:
+    """Refuse symlink components and any escape from the archive root."""
+    r = Path(rel)
+    if r.is_absolute() or not r.parts or any(x in {"..", "."} for x in r.parts):
+        raise ValueError("unsafe relative media path")
+    base = base.resolve(strict=True)
+    p = base
+    for segment in r.parts:
+        p = p / segment
+        try:
+            st = p.lstat()
+            if stat.S_ISLNK(st.st_mode):
+                raise ValueError("symlink in media path")
+        except FileNotFoundError:
+            if present:
+                raise ValueError("media path missing")
+    if not p.is_relative_to(base):
+        raise ValueError("media path outside archive")
+    return p
+
+
+def title_roots(root: Path):
+    lib = root / "media/library"
+    for folder in ("movies", "tv"):
+        home = lib / folder
+        if not home.is_dir() or home.is_symlink():
+            continue
+        for title in sorted(home.iterdir()):
+            if title.is_dir() and not title.is_symlink():
+                yield title
+
+
+def title_files(root: Path, title: Path, now: float, min_age: int):
+    """Only settled regular files; original structure stays untouched."""
+    out = []
+    for directory, dirs, filenames in os.walk(title, followlinks=False):
+        dirs[:] = [x for x in dirs if not (Path(directory) / x).is_symlink() and not x.startswith(".")]
+        for name in filenames:
+            p = Path(directory) / name
+            if p.suffix.lower() not in VIDEO_EXT:
+                continue
+            try:
+                rel = str(p.relative_to(root))
+                p = verify_child(root, rel)
+                s = p.stat(follow_symlinks=False)
+                if not stat.S_ISREG(s.st_mode) or s.st_size < 1_048_576 or (now - s.st_mtime) < min_age:
+                    continue
+            except (OSError, ValueError):
+                continue
+            inner = p.relative_to(title).parts
+            is_extra = any(x.lower().replace('_', ' ') in EXTRAS_NAMES for x in inner[:-1])
+            # Ordinary season directories and main-feature files can be the keeper.
+            out.append({"path": rel, "size": s.st_size, "mtime_ns": s.st_mtime_ns,
+                        "device": s.st_dev, "inode": s.st_ino, "extra": is_extra})
+    return out
+
+
+def make_candidate(keep, duplicate, digest, title):
+    identity = (duplicate["path"] + "\0" + keep["path"] + "\0" + digest).encode()
+    return {"id": hashlib.sha256(identity).hexdigest()[:24],
+            "title": title, "keep": keep["path"], "duplicate": duplicate["path"],
+            "sha256": digest, "size": duplicate["size"],
+            "saved_bytes_after_purge": 0 if (keep["device"], keep["inode"]) == (duplicate["device"], duplicate["inode"]) else duplicate["size"],
+            "keeper_is_main": not keep["extra"]}
+
+
+def scan(root: Path, state: Path, min_age=MIN_AGE) -> dict:
+    if optical_jobs_active():
+        raise ValueError("optical rip active; scan after ingest finishes")
+    started = int(time.time())
+    out = state / "scan.json"
+    state_write(out, {"state": "scanning", "started_at": started, "version": VERSION})
+    result = {"state": "ready", "version": VERSION, "started_at": started, "finished_at": 0,
+              "titles_checked": 0, "files_checked": 0, "candidates": [], "potential_savings": 0,
+              "message": "Only byte-for-byte identical files in a shared movie/series are candidates."}
+    try:
+        now = time.time()
+        for title in title_roots(root):
+            result["titles_checked"] += 1
+            files = title_files(root, title, now, min_age)
+            result["files_checked"] += len(files)
+            by_size = defaultdict(list)
+            for item in files:
+                by_size[item["size"]].append(item)
+            for group in by_size.values():
+                if len(group) < 2 or not any(x["extra"] for x in group):
+                    continue
+                hashes = defaultdict(list)
+                for rec in group:
+                    # Hash a settled file and verify it stayed settled throughout reading.
+                    try:
+                        p = verify_child(root, rec["path"])
+                        digest = content_hash(p)
+                        s = p.stat(follow_symlinks=False)
+                        if s.st_size != rec["size"] or s.st_mtime_ns != rec["mtime_ns"] or (s.st_dev, s.st_ino) != (rec["device"], rec["inode"]):
+                            continue
+                        hashes[digest].append(rec)
+                    except (OSError, ValueError):
+                        continue
+                for digest, same in hashes.items():
+                    if len(same) < 2 or not any(x["extra"] for x in same):
+                        continue
+                    # Main feature must always be preferred over a byte-identical extra.
+                    same.sort(key=lambda x: (x["extra"], len(Path(x["path"]).parts), x["path"].casefold()))
+                    keep = same[0]
+                    for duplicate in same[1:]:
+                        if not duplicate["extra"]:
+                            continue  # Never remove a main feature, even if two are identical.
+                        candidate = make_candidate(keep, duplicate, digest, str(title.relative_to(root)))
+                        result["candidates"].append(candidate)
+                        result["potential_savings"] += candidate["saved_bytes_after_purge"]
+        result["finished_at"] = int(time.time())
+        state_write(out, result)
+        return result
+    except Exception as exc:
+        state_write(out, {"state": "error", "error": str(exc)[:350], "started_at": started})
+        raise
+
+
+
+# v0.19.34: optional visual-content evidence. This path has NO mutation operation.
+# Hashes sample decoded video frames (NOT audio, subtitle streams, chapters or edition).
+VISUAL_SAMPLES = (0.08, 0.19, 0.30, 0.42, 0.55, 0.68, 0.81, 0.92)
+MIN_VISUAL_DURATION = 12.0
+MAX_TITLE_FILES = 64  # protect against excessive exploratory decoding
+
+
+def video_duration(path: Path) -> float | None:
+    """Return reliable format duration or refuse the candidate without guessing."""
+    try:
+        cp = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                             "-show_entries", "stream=codec_type:format=duration",
+                             "-of", "json", str(path)], capture_output=True, timeout=18, check=True)
+        info = json.loads(cp.stdout)
+        if not info.get("streams"):
+            return None
+        duration = float(info.get("format", {}).get("duration", 0))
+        return duration if MIN_VISUAL_DURATION <= duration <= 43200 and duration == duration else None
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return None
+
+
+def frame_dhash(frame: bytes) -> int | None:
+    """9 x 8 grayscale pixel block -> 64 horizontal brightness comparisons."""
+    if len(frame) != 72:
+        return None
+    result = 0
+    for row in range(8):
+        for x in range(8):
+            result = (result << 1) | int(frame[row * 9 + x] > frame[row * 9 + x + 1])
+    return result
+
+
+def decoded_frame_hashes(path: Path, duration: float) -> list[int | None]:
+    frames = []
+    for fraction in VISUAL_SAMPLES:
+        timestamp = max(0.0, duration * fraction)
+        try:
+            cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-ss", f"{timestamp:.3f}",
+                   "-i", str(path), "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
+                   "-vf", "scale=9:8:flags=bicubic,format=gray", "-f", "rawvideo", "pipe:1"]
+            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
+            frames.append(frame_dhash(cp.stdout) if cp.returncode == 0 else None)
+        except (OSError, subprocess.SubprocessError):
+            frames.append(None)
+    return frames
+
+
+def visual_evidence(a: list, b: list) -> dict | None:
+    """Avoid a false match from blank/monochrome frames and weak partial overlap."""
+    comparable = []
+    for av, bv in zip(a, b):
+        if not isinstance(av, int) or not isinstance(bv, int):
+            continue
+        # Flat/dark frames all have similar dHash regardless of the movie.
+        if not (6 <= av.bit_count() <= 58 and 6 <= bv.bit_count() <= 58):
+            continue
+        comparable.append((av ^ bv).bit_count())
+    if len(comparable) < 5:
+        return None
+    matching = sum(dist <= 11 for dist in comparable)
+    mean = sum(comparable) / len(comparable)
+    if matching < max(5, (len(comparable) * 4 + 4) // 5) or mean > 9.0:
+        return None
+    return {"frames_compared": len(comparable), "frames_matching": matching,
+            "mean_hamming_distance": round(mean, 2), "sample_count": len(VISUAL_SAMPLES)}
+
+
+def scan_visual(root: Path, state: Path, min_age: int = MIN_AGE) -> dict:
+    """Read-only, within-title video-frame similarity scan. NEVER queues deletions."""
+    if optical_jobs_active():
+        raise ValueError("optical rip active; visual scan deferred until ingestion completes")
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise ValueError("ffmpeg and ffprobe are required for optional visual scanning")
+    state_path = state / "visual-scan.json"
+    started = int(time.time())
+    state_write(state_path, {"state": "scanning", "version": VERSION, "started_at": started, "candidates": []})
+    report = {"state": "ready", "version": VERSION, "started_at": started,
+              "finished_at": 0, "titles_checked": 0, "files_probed": 0, "files_fingerprinted": 0,
+              "skipped_titles": 0, "candidates": [],
+              "message": "Read-only visual hints. No quarantine, offload, purge or automatic classification."}
+    try:
+        now = time.time()
+        fingerprints = {}  # within this run; no stale cache or provenance shortcuts
+        for title in title_roots(root):
+            report["titles_checked"] += 1
+            entries = title_files(root, title, now, min_age)
+            if len(entries) > MAX_TITLE_FILES:
+                report["skipped_titles"] += 1
+                continue
+            if len(entries) < 2 or not any(x["extra"] for x in entries):
+                continue
+            records = []
+            for rec in entries:
+                path = verify_child(root, rec["path"])
+                duration = video_duration(path)
+                report["files_probed"] += 1
+                if duration is not None:
+                    records.append((rec, duration))
+            for i, (a, adur) in enumerate(records):
+                for b, bdur in records[i + 1:]:
+                    if not (a["extra"] or b["extra"]):
+                        continue
+                    if abs(adur - bdur) > max(2.0, min(7.0, min(adur, bdur) * 0.005)):
+                        continue
+                    # The previous exact SHA-256 scanner handles truly identical bytes.
+                    if a["size"] == b["size"]:
+                        if content_hash(verify_child(root, a["path"])) == content_hash(verify_child(root, b["path"])):
+                            continue
+                    for rec, dur in ((a, adur), (b, bdur)):
+                        if rec["path"] not in fingerprints:
+                            path = verify_child(root, rec["path"])
+                            fingerprints[rec["path"]] = decoded_frame_hashes(path, dur)
+                            report["files_fingerprinted"] += 1
+                    evidence = visual_evidence(fingerprints[a["path"]], fingerprints[b["path"]])
+                    if not evidence:
+                        continue
+                    # Reject any changed file after expensive reads, including replacements.
+                    if any(not unchanged_media(root, rec) for rec in (a, b)):
+                        continue
+                    keep, extra = (a, b) if not a["extra"] else (b, a) if not b["extra"] else (a, b)
+                    report["candidates"].append({
+                        "id": hashlib.sha256((keep["path"] + "\0" + extra["path"]).encode()).hexdigest()[:24],
+                        "title": str(title.relative_to(root)), "reference": keep["path"],
+                        "possibly_duplicate": extra["path"], "reference_is_main": not keep["extra"],
+                        "duration_seconds": round((adur + bdur) / 2, 1),
+                        "evidence": evidence, "status": "review_only", "action_allowed": False,
+                        "warning": "Visual similarity is not proof of identical editions, audio, subtitles or chapters."
+                    })
+        report["finished_at"] = int(time.time())
+        state_write(state_path, report)
+        return report
+    except Exception as exc:
+        state_write(state_path, {"state": "error", "error": str(exc)[:350],
+                                 "started_at": started, "candidates": []})
+        raise
+
+
+def unchanged_media(root: Path, rec: dict) -> bool:
+    try:
+        st = verify_child(root, rec["path"]).stat(follow_symlinks=False)
+        return (stat.S_ISREG(st.st_mode) and st.st_size == rec["size"] and
+                st.st_mtime_ns == rec["mtime_ns"] and (st.st_dev, st.st_ino) == (rec["device"], rec["inode"]))
+    except (OSError, ValueError):
+        return False
+
+
+def manifest_path(state: Path, item_id: str):
+    if not re.fullmatch(r"[0-9a-f]{24}", item_id):
+        raise ValueError("invalid candidate id")
+    return state / "quarantined" / (item_id + ".json")
+
+
+def quarantine(root: Path, state: Path, item_id: str) -> dict:
+    if optical_jobs_active():
+        raise ValueError("optical rip active; finish media ingest before pruning")
+    report = state_read(state / "scan.json")
+    if report.get("state") != "ready":
+        raise ValueError("run a successful scan first")
+    item = next((x for x in report.get("candidates", []) if x.get("id") == item_id), None)
+    if not item:
+        raise ValueError("candidate not found in latest scan")
+    manifest = manifest_path(state, item_id)
+    if manifest.exists():
+        raise ValueError("already quarantined")
+    # Require a current fresh scan, rather than acting on an old list.
+    if time.time() - report.get("finished_at", 0) > 4 * 3600:
+        raise ValueError("scan is more than four hours old; scan again")
+    keep = verify_child(root, item["keep"])
+    dup = verify_child(root, item["duplicate"])
+    if not keep.is_file() or not dup.is_file() or keep == dup:
+        raise ValueError("source/keeper is missing or invalid")
+    if keep.stat().st_size != item["size"] or dup.stat().st_size != item["size"]:
+        raise ValueError("media size changed; scan again")
+    # Never take action on in-flight files. Never trust a stale hash alone.
+    if time.time() - max(keep.stat().st_mtime, dup.stat().st_mtime) < MIN_AGE:
+        raise ValueError("media was modified recently; try later")
+    if content_hash(keep) != item["sha256"] or content_hash(dup) != item["sha256"]:
+        raise ValueError("media bytes changed; scan again")
+    # Reconfirm correct title folder and that duplicate is actually an extra.
+    def rel_title(p):
+        rel = p.relative_to(root / "media/library")
+        if len(rel.parts) < 3 or rel.parts[0] not in {"movies", "tv"}:
+            raise ValueError("not inside a title extras folder")
+        return rel.parts[0:2]
+    if rel_title(keep) != rel_title(dup):
+        raise ValueError("files are not in the same title")
+    inner = dup.relative_to(root / "media/library" / rel_title(dup)[0] / rel_title(dup)[1]).parts
+    if not any(x.lower().replace('_', ' ') in EXTRAS_NAMES for x in inner[:-1]):
+        raise ValueError("duplicate is not in a recognized extras folder")
+    dest_base = root / "media/quarantine/extra-duplicates"
+    dest_base.mkdir(parents=True, exist_ok=True)
+    verify_child(root, str(dest_base.relative_to(root)))
+    if dest_base.stat().st_dev != dup.stat().st_dev:
+        raise ValueError("quarantine must be on the same local filesystem")
+    dest = dest_base / item_id
+    if dest.exists():
+        raise ValueError("quarantine destination exists")
+    # Atomic rename keeps source recoverable. Do not overwrite anything.
+    dup.rename(dest)
+    entry = {"id": item_id, "source": item["duplicate"],
+             "quarantine": str(dest.relative_to(root)), "keep": item["keep"],
+             "sha256": item["sha256"], "size": item["size"], "created_at": int(time.time())}
+    try:
+        state_write(manifest, entry)
+    except Exception:
+        dup_exists = dup.exists()
+        if not dup_exists and dest.exists():
+            dest.rename(dup)
+        raise
+    return {"ok": True, "state": "quarantined", "item": entry}
+
+
+def quarantined_items(state: Path) -> list:
+    folder = state / "quarantined"
+    if not folder.exists():
+        return []
+    return [state_read(p) for p in sorted(folder.glob("*.json")) if state_read(p).get("id")]
+
+
+def restore(root: Path, state: Path, item_id: str) -> dict:
+    if optical_jobs_active():
+        raise ValueError("optical rip active; finish before restoring")
+    manifest = manifest_path(state, item_id)
+    entry = state_read(manifest)
+    if entry.get("id") != item_id:
+        raise ValueError("quarantined item not found")
+    current = verify_child(root, entry["quarantine"])
+    original = verify_child(root, entry["source"], present=False)
+    if original.exists() or not current.is_file():
+        raise ValueError("original path already exists or quarantined file is missing")
+    if content_hash(current) != entry["sha256"]:
+        raise ValueError("quarantined media failed checksum verification")
+    original.parent.mkdir(parents=True, exist_ok=True)
+    current.rename(original)
+    manifest.unlink()
+    return {"ok": True, "state": "restored", "source": entry["source"]}
+
+
+def purge(root: Path, state: Path, item_id: str) -> dict:
+    if optical_jobs_active():
+        raise ValueError("optical rip active; finish before purging")
+    manifest = manifest_path(state, item_id)
+    entry = state_read(manifest)
+    if entry.get("id") != item_id:
+        raise ValueError("quarantined item not found")
+    if time.time() - int(entry.get("created_at") or 0) < MIN_PURGE_AGE:
+        raise ValueError("seven-day quarantine period has not elapsed")
+    path = verify_child(root, entry["quarantine"])
+    if not path.is_file() or content_hash(path) != entry["sha256"]:
+        raise ValueError("quarantine checksum mismatch; refusing to permanently delete")
+    path.unlink()
+    manifest.unlink()
+    return {"ok": True, "state": "purged", "source": entry["source"]}
+
+
+def status(state: Path):
+    report = state_read(state / "scan.json", {"state": "not-scanned"})
+    return {"ok": True, "scan": report, "visual_scan": state_read(state / "visual-scan.json", {"state": "not-scanned", "candidates": []}), "quarantined": quarantined_items(state)}
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Safely quarantine byte-identical bonus feature copies")
+    ap.add_argument("operation", choices=["scan", "scan-visual", "status", "quarantine", "restore", "purge"])
+    ap.add_argument("--id", default="")
+    ap.add_argument("--confirm", action="store_true", help="confirm a quarantine, restore or permanent purge")
+    ap.add_argument("--root", type=Path, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--state-dir", type=Path, default=DEFAULT_STATE, help=argparse.SUPPRESS)
+    ap.add_argument("--min-age", type=int, default=MIN_AGE, help=argparse.SUPPRESS)
+    args = ap.parse_args()
+    root = args.root.resolve(strict=True) if args.root else archive_root()
+    state = args.state_dir
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_file = state / "run.lock"
+    if args.operation == "status":
+        print(json.dumps(status(state), indent=2))
+        return 0
+    with lock_file.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if args.operation in {"quarantine", "restore", "purge"} and not args.confirm:
+            raise ValueError("explicit --confirm required")
+        if args.operation not in {"scan", "scan-visual"}:
+            state_write(state / "operation.json", {"state": "running", "operation": args.operation, "id": args.id, "started_at": int(time.time())})
+        try:
+            if args.operation == "scan":
+                data = scan(root, state, args.min_age)
+            elif args.operation == "scan-visual":
+                data = scan_visual(root, state, args.min_age)
+            elif args.operation == "quarantine":
+                data = quarantine(root, state, args.id)
+            elif args.operation == "restore":
+                data = restore(root, state, args.id)
+            else:
+                data = purge(root, state, args.id)
+        except Exception as exc:
+            if args.operation not in {"scan", "scan-visual"}:
+                state_write(state / "operation.json", {"state": "error", "operation": args.operation, "id": args.id, "error": str(exc)[:350], "finished_at": int(time.time())})
+            raise
+        if args.operation not in {"scan", "scan-visual"}:
+            state_write(state / "operation.json", {"state": "finished", "operation": args.operation, "id": args.id, "finished_at": int(time.time())})
+        print(json.dumps(data, indent=2))
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, BlockingIOError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}), file=sys.stderr)
+        sys.exit(1)

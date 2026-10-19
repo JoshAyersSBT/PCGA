@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""PCGA store game Wine/Proton compatibility preferences; no arbitrary commands."""
+from __future__ import annotations
+import argparse, hashlib, json, os, re, tempfile, tarfile, shutil, urllib.request
+from pathlib import Path
+ROOT_FILE=Path(os.environ.get('PCGA_ARCHIVE_ROOT_FILE','/etc/pc-game-archive/archive-root'))
+STATE=Path(os.environ.get('PCGA_STORE_UMU_STATE','/var/lib/pc-game-archive/store-umu'))
+UMU_VERSION='1.4.4'
+UMU_URL=f'https://github.com/Open-Wine-Components/umu-launcher/releases/download/{UMU_VERSION}/umu-launcher-{UMU_VERSION}-zipapp.tar'
+UMU_SHA256='eb590691841f7fad3fc3ad8fd5db4ccb87849fe7948e62b28ece7a4ee48cc851'
+ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9._:+-]{0,179}\Z')
+MODES=('auto','umu','wine')
+PROTONS=('UMU-Proton','GE-Proton')
+DEFAULT={'schema':1,'default':{'mode':'auto','proton':'UMU-Proton'},'games':{}}
+
+def root():
+    p=Path(ROOT_FILE.read_text().strip()).resolve()
+    if not p.is_dir(): raise ValueError('PCGA storage is not mounted')
+    return p
+
+def store_file(): return root()/'games/stores/compatibility.json'
+
+def read():
+    try: value=json.loads(store_file().read_text())
+    except (OSError,ValueError): value={}
+    if not isinstance(value,dict): value={}
+    default=value.get('default') if isinstance(value.get('default'),dict) else {}
+    games=value.get('games') if isinstance(value.get('games'),dict) else {}
+    safe_games={}
+    for key,v in games.items():
+        if not isinstance(key,str) or not ID.fullmatch(key) or not isinstance(v,dict):continue
+        safe_games[key]=clean(v)
+    return {'schema':1,'default':clean(default),'games':safe_games}
+
+def clean(v):
+    mode=v.get('mode') if v.get('mode') in MODES else 'auto'
+    proton=v.get('proton') if v.get('proton') in PROTONS else 'UMU-Proton'
+    gameid=str(v.get('gameid') or 'umu-default')
+    if not re.fullmatch(r'(?:umu-[A-Za-z0-9_-]{1,64}|[0-9]{1,15})',gameid):gameid='umu-default'
+    return {'mode':mode,'proton':proton,'gameid':gameid}
+
+def save(value):
+    target=store_file(); target.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix='.store-compat-',dir=target.parent)
+    try:
+        with os.fdopen(fd,'w') as out:
+            json.dump(value,out,indent=2,sort_keys=True);out.write('\n');out.flush();os.fsync(out.fileno())
+        os.chmod(tmp,0o600);os.replace(tmp,target)
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+
+def settings_for(game_id,provider='',archive=None):
+    cfg=read() if archive is None else read_from(archive)
+    default=cfg['default'];over=cfg['games'].get(game_id,{})
+    effective=clean({**default,**over})
+    ready=prepared()
+    # Never silently switch an existing Wine prefix to a different prefix:
+    # legacy installs retain their saves/config while auto mode stays on Wine.
+    base=(archive or root())/'games/stores/prefixes'/game_id
+    previous_wine=(base/'drive_c').exists() or (base/'system.reg').exists()
+    mode=effective['mode']
+    runner='wine' if mode=='wine' or (mode=='auto' and (not ready or previous_wine)) else 'umu'
+    return {**effective,'effective_runner':runner,'umu_prepared':ready,'legacy_wine_prefix':previous_wine}
+
+def read_from(archive):
+    try: value=json.loads((archive/'games/stores/compatibility.json').read_text())
+    except (OSError,ValueError): value={}
+    default=value.get('default') if isinstance(value,dict) and isinstance(value.get('default'),dict) else {}
+    games=value.get('games') if isinstance(value,dict) and isinstance(value.get('games'),dict) else {}
+    return {'default':clean(default),'games':{k:clean(v) for k,v in games.items() if isinstance(k,str) and ID.fullmatch(k) and isinstance(v,dict)}}
+
+def prepared():
+    path=STATE/'umu-run'
+    return path.is_file() and path.stat().st_size>10000 and os.access(path,os.X_OK)
+
+def status(game=''):
+    out={'ok':True,'version':'0.19.12','umu_version':UMU_VERSION,'umu_prepared':prepared(), 'default':read()['default']}
+    if game:
+        if not game.startswith('store-') or not ID.fullmatch(game):raise ValueError('Invalid PCGA store game identity')
+        out['game_id']=game;out['settings']=settings_for(game)
+    return out
+
+def prepare():
+    # Opt-in lazy download, integrity pinned; never required for appliance boot.
+    if prepared():return status()
+    STATE.mkdir(parents=True,exist_ok=True)
+    cache=STATE/'umu-launcher-1.4.4-zipapp.tar'
+    if not cache.is_file() or hashlib.sha256(cache.read_bytes()).hexdigest()!=UMU_SHA256:
+        temp=STATE/'.umu-download.part'
+        try:
+            with urllib.request.urlopen(urllib.request.Request(UMU_URL,headers={'User-Agent':'PCGA/0.19.12'}),timeout=40) as response, temp.open('wb') as output:
+                # Cap untrusted downloads; the pinned archive is below 1 MiB.
+                length=0
+                while True:
+                    block=response.read(65536)
+                    if not block:break
+                    length+=len(block)
+                    if length>6*1024*1024:raise ValueError('UMU distribution exceeded size limit')
+                    output.write(block)
+            if hashlib.sha256(temp.read_bytes()).hexdigest()!=UMU_SHA256:raise ValueError('UMU distribution SHA256 mismatch')
+            os.replace(temp,cache)
+        finally:temp.unlink(missing_ok=True)
+    # Extract only one expected regular file, never archive paths or links.
+    with tarfile.open(cache,'r:*') as tar:
+        members=[m for m in tar.getmembers() if m.isfile() and Path(m.name).name=='umu-run']
+        if len(members)!=1 or members[0].size>8*1024*1024:raise ValueError('Unexpected UMU distribution layout')
+        stream=tar.extractfile(members[0]);assert stream is not None
+        data=stream.read(8*1024*1024+1)
+        if len(data)!=members[0].size or not data.startswith(b'#!'):raise ValueError('Invalid UMU zipapp')
+    fd,tmp=tempfile.mkstemp(prefix='.umu-run-',dir=STATE)
+    try:
+        with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+        os.chmod(tmp,0o755);os.replace(tmp,STATE/'umu-run')
+    finally:
+        if os.path.exists(tmp):os.unlink(tmp)
+    return status()
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('action',choices=('status','set-default','set-game','reset-game','prepare'))
+    ap.add_argument('--game-id',default='');ap.add_argument('--mode',choices=MODES);ap.add_argument('--proton',choices=PROTONS);ap.add_argument('--umu-gameid',default=None)
+    a=ap.parse_args()
+    if a.action=='prepare':out=prepare()
+    elif a.action in ('set-default','set-game','reset-game'):
+        if a.action!='set-default' and (not a.game_id.startswith('store-') or not ID.fullmatch(a.game_id)):raise ValueError('Invalid store game ID')
+        doc=read()
+        if a.action=='set-default':
+            doc['default']=clean({**doc['default'],**({'mode':a.mode} if a.mode else {}),**({'proton':a.proton} if a.proton else {})})
+        elif a.action=='reset-game':doc['games'].pop(a.game_id,None)
+        else:
+            old=doc['games'].get(a.game_id,{})
+            if a.umu_gameid is not None and not re.fullmatch(r'(?:umu-[A-Za-z0-9_-]{1,64}|[0-9]{1,15})',a.umu_gameid):raise ValueError('Invalid UMU game ID')
+            doc['games'][a.game_id]=clean({**old,**({'mode':a.mode} if a.mode else {}),**({'proton':a.proton} if a.proton else {}),**({'gameid':a.umu_gameid} if a.umu_gameid is not None else {})})
+        save(doc);out=status(a.game_id)
+    else:out=status(a.game_id)
+    print(json.dumps(out,sort_keys=True))
+if __name__=='__main__':
+    try:main()
+    except (ValueError,OSError,TimeoutError) as exc:
+        print(json.dumps({'ok':False,'error':str(exc)[:300]}));raise SystemExit(1)

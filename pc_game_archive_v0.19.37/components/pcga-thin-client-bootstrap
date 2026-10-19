@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse, hashlib, ipaddress, json, os, socket, ssl, subprocess
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+VERSION="0.19.0"
+TLS_DIR=Path("/etc/pc-game-archive/tls")
+CA_CERT=TLS_DIR/"pcga-ca.crt"
+SERVER_CERT=TLS_DIR/"pcga-server.crt"
+SECURE_STATE=Path("/var/lib/pc-game-archive/bootstrap/secure-context.json")
+REMOTE_HELPER=Path("/usr/local/sbin/pcga-tailscale-remote")
+NETBIRD_HELPER=Path("/usr/local/sbin/pcga-netbird-remote")
+ZEROTIER_HELPER=Path("/usr/local/sbin/pcga-zerotier-remote")
+MAX_BODY=16384
+
+
+def load_json(path: Path):
+    try:
+        v=json.loads(path.read_text(encoding="utf-8"))
+        return v if isinstance(v,dict) else {}
+    except Exception:
+        return {}
+
+
+def cert_sha256(path: Path) -> str:
+    if not path.is_file(): return ""
+    try:
+        pem=path.read_text(encoding="utf-8",errors="strict")
+        der=ssl.PEM_cert_to_DER_cert(pem)
+        return hashlib.sha256(der).hexdigest()
+    except Exception:
+        return ""
+
+
+def _provider_status(helper: Path, provider: str) -> dict:
+    if not helper.is_file():
+        return {"provider":provider,"available":False,"configured":False,"state":"unavailable","ips":[],"portal_url":"","moonlight_url":""}
+    try:
+        p=subprocess.run([str(helper),"status"],text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=15)
+        obj=json.loads(p.stdout or "{}")
+        return obj if isinstance(obj,dict) else {}
+    except Exception as exc:
+        return {"provider":provider,"available":False,"configured":False,"state":"error","detail":str(exc)[:240]}
+
+
+def remote_status() -> dict:
+    return _provider_status(REMOTE_HELPER,"tailscale")
+
+
+def remote_providers() -> dict:
+    return {
+        "tailscale": _provider_status(REMOTE_HELPER,"tailscale"),
+        "netbird": _provider_status(NETBIRD_HELPER,"netbird"),
+        "zerotier": _provider_status(ZEROTIER_HELPER,"zerotier"),
+    }
+
+
+def allowed_source(addr: str) -> bool:
+    try: ip=ipaddress.ip_address(addr)
+    except ValueError: return False
+    try:
+        route=subprocess.run(["ip","route","get",addr],text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=2).stdout
+        parts=route.split(); dev=parts[parts.index("dev")+1] if "dev" in parts else ""
+        if dev.startswith(("tailscale","wt","zt","tun","tap","wg")):
+            return False
+    except Exception:
+        pass
+    # The thin client must establish first trust on the physical/local network.
+    # Tailscale IPv4 addresses live in 100.64.0.0/10; explicitly reject that
+    # range even though some libraries treat it as non-global/shared address.
+    if isinstance(ip,ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10"):
+        return False
+    if isinstance(ip,ipaddress.IPv6Address) and ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
+        return False
+    return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+
+
+def payload() -> dict:
+    sec=load_json(SECURE_STATE)
+    lan_ip=str(sec.get("lan_ip") or "")
+    host=str(sec.get("hostname") or socket.gethostname())
+    http_port=int(sec.get("portal_http_port") or 8098)
+    portal_port=int(sec.get("portal_https_port") or 8443)
+    moon_port=int(sec.get("moonlight_https_port") or 8101)
+    providers=remote_providers()
+    remote=providers["tailscale"]
+    preferred=next((providers[k] for k in ("tailscale","netbird","zerotier") if providers[k].get("configured") and providers[k].get("portal_url")), remote)
+    ca_pem=CA_CERT.read_text(encoding="utf-8",errors="replace") if CA_CERT.is_file() else ""
+    ca_fp=cert_sha256(CA_CERT)
+    leaf_fp=cert_sha256(SERVER_CERT)
+    control_url=f"http://{lan_ip}:{http_port}/" if lan_ip else ""
+    portal_url=f"https://{lan_ip}:{portal_port}/" if lan_ip else ""
+    named_portal_url=str(sec.get("lan_portal_url") or "").strip()
+    moonlight_url=f"https://{lan_ip}:{moon_port}/" if lan_ip else ""
+    # Keep both snake_case wire fields and the camelCase state names used by the
+    # Electron thin client. This makes the bootstrap additive/backward compatible.
+    remote.setdefault("ips", remote.get("tailscale_ips") or [])
+    obj={
+        "ok": True,
+        "version": VERSION,
+        "name": host,
+        "host": lan_ip,
+        "port": http_port,
+        "control_url": control_url,
+        "portal_url": portal_url,
+        "moonlight_url": moonlight_url,
+        "controlUrl": control_url,
+        "portalUrl": portal_url,
+        "moonlightUrl": moonlight_url,
+        "named_portal_url": named_portal_url,
+        "namedPortalUrl": named_portal_url,
+        "lan_dns_name": str(sec.get("lan_dns_name") or ""),
+        "ca_url": f"http://{lan_ip}:{http_port}/pcga-ca.crt" if lan_ip else "/pcga-ca.crt",
+        "ca_pem": ca_pem,
+        "ca_sha256": ca_fp,
+        "caSha256": ca_fp,
+        "leaf_fingerprint256": leaf_fp,
+        "leafFingerprint256": leaf_fp,
+        "moonlight_leaf_fingerprint256": leaf_fp,
+        "moonlightLeafFingerprint256": leaf_fp,
+        "ca_source": "pcga-bootstrap",
+        "bootstrap_source": "pcga-bootstrap",
+        "bootstrapSource": "pcga-bootstrap",
+        "gamestream_pairing": "appliance-managed",
+        "tailscale": remote,
+        "netbird": providers["netbird"],
+        "zerotier": providers["zerotier"],
+        "remote_providers": providers,
+        "remoteProviders": providers,
+        # Flat aliases keep older/newer thin-client parsers interoperable.
+        "tailscale_state": remote.get("state",""),
+        "tailscale_configured": bool(remote.get("configured")),
+        "tailscale_dns_name": remote.get("dns_name","") or "",
+        "tailscaleDnsName": remote.get("dns_name","") or "",
+        "tailscale_ips": remote.get("tailscale_ips") or [],
+        "tailscaleIPs": remote.get("tailscale_ips") or [],
+        "remote_portal_url": preferred.get("portal_url","") or "",
+        "remotePortalUrl": preferred.get("portal_url","") or "",
+        "remote_moonlight_url": preferred.get("moonlight_url","") or "",
+        "remoteMoonlightUrl": preferred.get("moonlight_url","") or "",
+        "remote_provider": preferred.get("provider","") or "tailscale",
+        "remoteProvider": preferred.get("provider","") or "tailscale",
+    }
+    return obj
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version=f"PCGAThinClientBootstrap/{VERSION}"
+    def log_message(self, fmt, *args):
+        if self.path!="/health": super().log_message(fmt,*args)
+    def send_json(self,status,obj):
+        body=(json.dumps(obj,separators=(",",":"))+"\n").encode()
+        self.send_response(status); self.send_header("Content-Type","application/json; charset=utf-8")
+        self.send_header("Content-Length",str(len(body))); self.send_header("Cache-Control","no-store")
+        self.send_header("X-Content-Type-Options","nosniff"); self.end_headers(); self.wfile.write(body)
+    def source_allowed(self): return allowed_source(self.client_address[0])
+    def do_GET(self):
+        if self.path=="/health":
+            self.send_json(HTTPStatus.OK,{"ok":True,"version":VERSION,"lan_only":True}); return
+        self.send_json(HTTPStatus.NOT_FOUND,{"ok":False,"error":"not-found"})
+    def do_POST(self):
+        if self.path!="/v1/bootstrap":
+            self.send_json(HTTPStatus.NOT_FOUND,{"ok":False,"error":"not-found"}); return
+        if not self.source_allowed():
+            self.send_json(HTTPStatus.FORBIDDEN,{"ok":False,"error":"lan-pairing-required","detail":"Initial PCGA thin-client pairing is LAN-only. Pair locally first, then use a learned Tailscale, NetBird, or ZeroTier pathway for remote access."}); return
+        try: length=int(self.headers.get("Content-Length","0"))
+        except ValueError: length=-1
+        if length<0 or length>MAX_BODY:
+            self.send_json(HTTPStatus.BAD_REQUEST,{"ok":False,"error":"invalid-request-size"}); return
+        if length:
+            try:
+                req=json.loads(self.rfile.read(length).decode("utf-8","replace"))
+                if not isinstance(req,dict): raise ValueError
+            except Exception:
+                self.send_json(HTTPStatus.BAD_REQUEST,{"ok":False,"error":"invalid-json"}); return
+        self.send_json(HTTPStatus.OK,payload())
+
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument("--bind",default="0.0.0.0"); ap.add_argument("--port",type=int,default=8093); args=ap.parse_args()
+    server=ThreadingHTTPServer((args.bind,args.port),Handler); server.daemon_threads=True
+    print(f"PCGA thin-client bootstrap v{VERSION} listening on {args.bind}:{args.port} (LAN-only trust)",flush=True)
+    try: server.serve_forever(.5)
+    except KeyboardInterrupt: pass
+    finally: server.server_close()
+if __name__=="__main__": main()

@@ -1,0 +1,13 @@
+[Unit]
+Description=PCGA completed Epic/GOG game ingestion and Wolf reconciliation
+After=docker.service pcga-store-jobs.service
+Wants=docker.service
+ConditionPathExists=/etc/pc-game-archive/archive-root
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-store-ingest --reconcile
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+TimeoutStartSec=600

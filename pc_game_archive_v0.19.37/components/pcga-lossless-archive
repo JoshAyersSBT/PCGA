@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""PCGA cold archive: opt-in reversible Zstandard compression of *offline* media.
+
+The Jellyfin library is left playable unless an operator expressly requests
+`archive --offline`.  An archive is verified against the original SHA-256 before
+that original is removed.  This is not video transcoding and provides no promise
+of useful space savings on already-compressed Blu-ray streams.
+"""
+from __future__ import annotations
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+ROOT_FILE = Path(os.environ.get('PCGA_ARCHIVE_ROOT_FILE', '/etc/pc-game-archive/archive-root'))
+VIDEO_EXT = {'.mkv', '.mp4', '.m2ts', '.vob', '.iso', '.ts'}
+LIBRARIES = ('movies', 'tv', 'home-videos')
+MIN_AGE = int(os.environ.get('PCGA_LOSSLESS_MIN_AGE_SECONDS', '3600'))
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def root_dir():
+    value = ROOT_FILE.read_text().strip()
+    p = Path(value).resolve(strict=True)
+    if not p.is_dir(): fail('invalid archive root')
+    return p
+
+
+def layout(root):
+    return root / 'media/library', root / 'media/cold-archive/lossless'
+
+
+def safe_rel(value):
+    p = Path(str(value))
+    if p.is_absolute() or not p.parts or '..' in p.parts or '\\' in str(value):
+        fail('path must be a library-relative filename')
+    if p.parts[0] not in LIBRARIES or p.suffix.lower() not in VIDEO_EXT:
+        fail('only approved video files in the media library can be archived')
+    return p
+
+
+def validate_source(root, rel, require_age=True):
+    library, _ = layout(root)
+    src = library / rel
+    if src.is_symlink(): fail('symlink source refused')
+    try: st = src.stat()
+    except FileNotFoundError: fail('source file is missing')
+    if not stat.S_ISREG(st.st_mode): fail('source must be a regular file')
+    if not src.resolve().is_relative_to(library.resolve()): fail('library escape refused')
+    if require_age and time.time()-st.st_mtime < MIN_AGE:
+        fail('recently modified source is not eligible; wait for ingestion to settle')
+    return src, st
+
+
+def paths(root, rel):
+    _, cold = layout(root)
+    packed = cold / (str(rel)+'.zst')
+    return packed, Path(str(packed)+'.json')
+
+
+def sha256(path):
+    h=hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            data=f.read(4*1024*1024)
+            if not data: break
+            h.update(data)
+    return h.hexdigest()
+
+
+def decoded_sha256(packed):
+    proc = subprocess.Popen(['zstd', '-q', '-d', '-c', str(packed)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    h=hashlib.sha256(); length=0
+    assert proc.stdout is not None
+    try:
+        for data in iter(lambda:proc.stdout.read(4*1024*1024), b''):
+            h.update(data); length+=len(data)
+    finally:
+        proc.stdout.close()
+    stderr=proc.stderr.read(12000) if proc.stderr else b''
+    if proc.stderr: proc.stderr.close()
+    if proc.wait()!=0: raise RuntimeError('archive decompression failed: '+stderr.decode(errors='replace')[:600])
+    return h.hexdigest(), length
+
+
+def atomic_record(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp=path.with_name(path.name+'.tmp.'+uuid.uuid4().hex)
+    try:
+        with open(tmp, 'x', encoding='utf-8') as f:
+            json.dump(obj,f,indent=2,sort_keys=True);f.write('\n');f.flush();os.fsync(f.fileno())
+        os.replace(tmp,path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def with_lock(root):
+    lock=root/'media/cold-archive/.pcga-media-storage.lock'
+    lock.parent.mkdir(parents=True,exist_ok=True)
+    f=open(lock,'a+')
+    fcntl.flock(f,fcntl.LOCK_EX)
+    return f
+
+
+def archive(root, source, *, offline=False, min_savings=2.0):
+    if not offline: fail('cold archival removes Jellyfin access; explicit --offline required')
+    rel=safe_rel(source)
+    with with_lock(root):
+        src, st=validate_source(root,rel)
+        packed, record=paths(root,rel)
+        if packed.exists() or record.exists(): fail('archive already exists; inspect or restore before retrying')
+        if not shutil.which('zstd'): fail('zstd binary missing')
+        free=shutil.disk_usage(packed.parent if packed.parent.exists() else root).free
+        if free < st.st_size + (512 << 20): fail('not enough free space to safely build and verify compressed archive')
+        packed.parent.mkdir(parents=True,exist_ok=True)
+        tmp=packed.with_name(packed.name+'.partial.'+uuid.uuid4().hex)
+        try:
+            source_hash=sha256(src)
+            with open(tmp,'xb') as out:
+                p=subprocess.run(['zstd','-q','-T1','-6','-c',str(src)],stdout=out,stderr=subprocess.PIPE,check=False)
+                out.flush();os.fsync(out.fileno())
+            if p.returncode: raise RuntimeError('zstd compression failed: '+p.stderr.decode(errors='replace')[-600:])
+            saved=(1-tmp.stat().st_size/st.st_size)*100 if st.st_size else 0
+            if saved < min_savings:
+                return {'ok':True,'state':'skipped','source':str(rel),'savings_percent':round(saved,3),'detail':'compression below the minimum savings threshold; playable source retained'}
+            if src.stat().st_mtime_ns!=st.st_mtime_ns or src.stat().st_size!=st.st_size or sha256(src)!=source_hash:
+                fail('source changed during compression; nothing has been removed')
+            restored_hash,restored_size=decoded_sha256(tmp)
+            if restored_hash!=source_hash or restored_size!=st.st_size: fail('decompressed SHA-256 mismatch; source retained')
+            compressed_hash=sha256(tmp)
+            os.replace(tmp,packed)
+            atomic_record(record,{'schema':1,'source':str(rel),'original_bytes':st.st_size,'compressed_bytes':packed.stat().st_size,'source_sha256':source_hash,'compressed_sha256':compressed_hash,'created_at':time.time(),'compression':'zstd-level6','state':'offline'})
+            # A completed archive and its manifest are durable before offloading.
+            # Revalidate source immediately before unlink; fail safely on changes.
+            if src.stat().st_size!=st.st_size or sha256(src)!=source_hash:
+                fail('source changed before offload; verified archive retained and source left untouched')
+            src.unlink()
+            return {'ok':True,'state':'archived','source':str(rel),'original_bytes':st.st_size,'compressed_bytes':packed.stat().st_size,'saved_bytes':st.st_size-packed.stat().st_size,'savings_percent':round(saved,3),'playable':False}
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def restore(root, source):
+    rel=safe_rel(source)
+    with with_lock(root):
+        library,_=layout(root); src=library/rel; packed,record=paths(root,rel)
+        if not packed.is_file() or not record.is_file(): fail('no complete archived media at this path')
+        meta=json.loads(record.read_text())
+        if meta.get('source')!=str(rel): fail('archive metadata path mismatch')
+        if src.exists() or src.is_symlink(): fail('playable destination already exists; refusing overwrite')
+        if packed.is_symlink() or record.is_symlink(): fail('symlink archive refused')
+        if sha256(packed)!=meta['compressed_sha256']: fail('compressed checksum mismatch')
+        src.parent.mkdir(parents=True,exist_ok=True)
+        if not src.parent.resolve().is_relative_to(library.resolve()): fail('restore destination escapes managed library')
+        tmp=src.with_name(src.name+'.restoring.'+uuid.uuid4().hex)
+        try:
+            with open(tmp,'xb') as out:
+                p=subprocess.run(['zstd','-q','-d','-c',str(packed)],stdout=out,stderr=subprocess.PIPE,check=False)
+                out.flush();os.fsync(out.fileno())
+            if p.returncode: raise RuntimeError('decompression failed: '+p.stderr.decode(errors='replace')[-600:])
+            if tmp.stat().st_size!=meta['original_bytes'] or sha256(tmp)!=meta['source_sha256']:
+                fail('restored source checksum mismatch; archive retained')
+            os.replace(tmp,src)
+            # Reclaim compressed copy *only after* byte-identical restoration.
+            packed.unlink();record.unlink()
+            return {'ok':True,'state':'restored','source':str(rel),'sha256':meta['source_sha256'],'playable':True}
+        finally:
+            tmp.unlink(missing_ok=True)
+
+
+def inventory(root):
+    library,cold=layout(root)
+    items=[]
+    if cold.exists():
+        for p in sorted(cold.rglob('*.zst.json'))[:250]:
+            try:
+                obj=json.loads(p.read_text())
+                rel=safe_rel(obj.get('source',''))
+                packed,expected=paths(root,rel)
+                if expected!=p or not packed.is_file(): continue
+                items.append({'source':str(rel),'original_bytes':obj.get('original_bytes',0),'compressed_bytes':obj.get('compressed_bytes',0),'state':'offline','saved_bytes':max(0,obj.get('original_bytes',0)-obj.get('compressed_bytes',0))})
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError): continue
+    candidates=[]
+    for lib in LIBRARIES:
+        directory=library/lib
+        if not directory.exists(): continue
+        for base,dirs,files in os.walk(directory,followlinks=False):
+            dirs[:]=[x for x in dirs if not (Path(base)/x).is_symlink()]
+            for name in files:
+                p=Path(base)/name
+                if p.suffix.lower() not in VIDEO_EXT or p.is_symlink(): continue
+                try:
+                    st=p.stat()
+                    if not stat.S_ISREG(st.st_mode) or st.st_size<1<<20 or time.time()-st.st_mtime<MIN_AGE: continue
+                    candidates.append({'source':str(p.relative_to(library)),'bytes':st.st_size})
+                except (OSError,ValueError): continue
+    candidates.sort(key=lambda x:-x['bytes'])
+    return {'ok':True,'available':bool(shutil.which('zstd')),'compression':'zstd','live_jellyfin_files_unchanged':True,'candidates':candidates[:60],'offline_archives':items,'offline_count':len(items),'total_saved_bytes':sum(x['saved_bytes'] for x in items)}
+
+
+def job(root, job_id, operation, source):
+    if not job_id.replace('-','').isalnum() or len(job_id)>65: fail('invalid job ID')
+    states=Path(os.environ.get('PCGA_LOSSLESS_JOB_DIR','/var/lib/pc-game-archive/lossless-jobs'))
+    statefile=states/(job_id+'.json')
+    atomic_record(statefile, {'ok':True,'job_id':job_id,'operation':operation,'source':source,'state':'running','started_at':time.time()})
+    try:
+        result=archive(root,source,offline=True) if operation=='archive' else restore(root,source) if operation=='restore' else fail('unsupported operation')
+        result.update({'job_id':job_id,'operation':operation,'finished_at':time.time()})
+        atomic_record(statefile,result)
+        return result
+    except Exception as e:
+        atomic_record(statefile,{'ok':False,'job_id':job_id,'operation':operation,'source':source,'state':'error','detail':str(e)[:500],'finished_at':time.time()})
+        raise
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    sub=p.add_subparsers(dest='cmd',required=True)
+    sub.add_parser('inventory')
+    a=sub.add_parser('archive');a.add_argument('source');a.add_argument('--offline',action='store_true');a.add_argument('--min-savings',type=float,default=2.)
+    r=sub.add_parser('restore');r.add_argument('source')
+    j=sub.add_parser('job');j.add_argument('operation',choices=('archive','restore'));j.add_argument('source');j.add_argument('job_id')
+    s=p.parse_args()
+    try:
+        root=root_dir()
+        if s.cmd=='inventory': result=inventory(root)
+        elif s.cmd=='archive': result=archive(root,s.source,offline=s.offline,min_savings=s.min_savings)
+        elif s.cmd=='restore': result=restore(root,s.source)
+        else: result=job(root,s.job_id,s.operation,s.source)
+        print(json.dumps(result,sort_keys=True))
+    except Exception as exc:
+        print(json.dumps({'ok':False,'error':str(exc)}))
+        return 1
+    return 0
+
+if __name__=='__main__': sys.exit(main())

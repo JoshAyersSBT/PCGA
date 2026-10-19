@@ -1,0 +1,11 @@
+[Unit]
+Description=PCGA Heroic game-library index and Wolf publication
+After=docker.service pcga-game-stack.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-heroic-sync --reconcile-wolf
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

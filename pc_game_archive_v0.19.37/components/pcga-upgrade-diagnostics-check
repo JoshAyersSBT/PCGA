@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""Validate PCGA's secure Diagnostics response, without exposing any sensitive logs.
+
+Called only after HTTPS with PCGA's CA and HTTP 200 are verified by the upgrader.
+"""
+import json
+import sys
+from pathlib import Path
+
+
+def verify(data, jellyfin_enabled=True):
+    if not isinstance(data, dict) or data.get('ok') is not True:
+        raise ValueError('catalog does not report ok=true')
+    services = data.get('services')
+    profiles = data.get('profiles')
+    if not isinstance(services, list) or not isinstance(profiles, dict):
+        raise ValueError('catalog services/profiles have invalid types')
+    if any(not isinstance(s, dict) for s in services):
+        raise ValueError('catalog service entry has invalid type')
+    ids = {s.get('id') for s in services if isinstance(s.get('id'), str)}
+    if not ids.intersection({'docker:wolf', 'docker:pcga-status'}):
+        raise ValueError('streaming or PCGA status service missing')
+    if not isinstance(profiles.get('streaming'), dict):
+        raise ValueError('streaming profile missing')
+    if jellyfin_enabled:
+        if 'docker:jellyfin' not in ids:
+            raise ValueError('Jellyfin service missing from Diagnostics catalog')
+        media = profiles.get('media')
+        if not isinstance(media, dict) or not isinstance(media.get('services'), list):
+            raise ValueError('Media Diagnostics profile missing or invalid')
+        if 'docker:jellyfin' not in media['services']:
+            raise ValueError('Jellyfin is absent from the secure Media Diagnostics profile')
+    return True
+
+
+def main(argv):
+    if len(argv) != 3 or argv[2] not in {'true', 'false'}:
+        print('Usage: pcga-upgrade-diagnostics-check CATALOG_JSON true|false', file=sys.stderr)
+        return 2
+    try:
+        data = json.loads(Path(argv[1]).read_text(encoding='utf-8'))
+        verify(data, argv[2] == 'true')
+    except (OSError, ValueError) as exc:
+        print('Diagnostics verification failed: ' + str(exc)[:240], file=sys.stderr)
+        return 1
+    print('Secure Diagnostics response verified (including enabled Jellyfin Media profile)')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

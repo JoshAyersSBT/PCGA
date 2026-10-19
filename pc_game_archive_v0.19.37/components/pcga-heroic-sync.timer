@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh PCGA Heroic game collection
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=20s
+Persistent=true
+Unit=pcga-heroic-sync.service
+
+[Install]
+WantedBy=timers.target

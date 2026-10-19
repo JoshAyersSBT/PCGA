@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# PCGA opt-in native GUI emulator management. This intentionally does not start
+# graphical apps from a privileged web container or install proprietary firmware.
+IDS=(dolphin pcsx2 rpcs3 shadps4)
+declare -A APP=( [dolphin]=org.DolphinEmu.dolphin-emu [pcsx2]=net.pcsx2.PCSX2 [rpcs3]=net.rpcs3.RPCS3 [shadps4]=net.shadps4.shadPS4 )
+declare -A PLAT=( [dolphin]='ngc wii' [pcsx2]=ps2 [rpcs3]=ps3 [shadps4]=ps4 )
+usage(){ echo 'Usage: pcga-native-emulators {status|install|update} [dolphin|pcsx2|rpcs3|shadps4|all]'; }
+valid(){ [[ -n "${APP[$1]:-}" ]]; }
+ROOT="$(cat /etc/pc-game-archive/archive-root 2>/dev/null || true)"
+[[ "$ROOT" = /* && -d "$ROOT" ]] || { echo 'PCGA archive root not configured' >&2; exit 1; }
+status(){
+  local id state path
+  for id in "${IDS[@]}"; do
+    state=not-installed
+    if command -v flatpak >/dev/null 2>&1 && flatpak info --system "${APP[$id]}" >/dev/null 2>&1; then state=installed; fi
+    printf '%-9s %-16s %-34s platforms=%s\n' "$id" "$state" "${APP[$id]}" "${PLAT[$id]}"
+  done
+  echo 'Native graphics session / remote streaming is NOT configured by this command.'
+}
+cmd="${1:-status}"; target="${2:-all}"
+case "$cmd" in
+  status) status ;;
+  install|update)
+    [[ "$EUID" -eq 0 ]] || { echo 'Run installs with sudo' >&2; exit 1; }
+    if ! command -v flatpak >/dev/null 2>&1; then
+      echo 'Installing Flatpak package manager…'
+      DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      DEBIAN_FRONTEND=noninteractive apt-get install -y flatpak
+    fi
+    [[ "$target" == all ]] || valid "$target" || { usage >&2; exit 2; }
+    flatpak remote-add --system --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+    for id in "${IDS[@]}"; do
+      [[ "$target" == all || "$target" == "$id" ]] || continue
+      if [[ "$cmd" == install ]]; then flatpak install --system --noninteractive -y flathub "${APP[$id]}"; else flatpak update --system --noninteractive -y "${APP[$id]}"; fi
+    done
+    status ;;
+  *) usage >&2; exit 2 ;;
+esac

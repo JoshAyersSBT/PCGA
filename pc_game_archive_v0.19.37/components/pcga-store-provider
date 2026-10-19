@@ -1,0 +1,1195 @@
+#!/usr/bin/env python3
+"""PCGA native PC-store provider foundation (v0.19.6).
+
+This module is deliberately UI-agnostic.  It defines one normalized provider
+contract for Epic/Legendary, GOG/gogdl and Amazon/Nile and executes the bundled
+Heroic helper binaries directly in a headless container.  v0.19.6 keeps native account connection/disconnection flows for Epic, GOG and Amazon while the owned-game catalog remains read-only. Direct provider game mutation stays blocked; v0.19.6 permits Epic and GOG install jobs only through the separate persistent worker.
+
+Security invariants:
+* runner commands are argv arrays; user values are never interpolated into a shell;
+* provider credentials stay inside provider-owned config directories;
+* diagnostics never return token/auth-file contents;
+* catalog refresh may update provider-owned metadata/token caches but never
+  changes account ownership or installed games;
+* direct provider mutation is limited to explicit login/logout; install plans can only run via the Epic-only job worker (update/verify/uninstall blocked);
+* pending device-flow secrets stay server-side and are never returned by diagnostics or the portal.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import time
+import difflib
+import html
+import shutil
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from pathlib import Path
+from typing import Iterable, Mapping
+
+VERSION = "0.19.12"
+HEROIC_VERSION = "2.22.3"
+DEFAULT_IMAGE = f"pcga/heroic-backends:{HEROIC_VERSION}"
+ROOT_FILE = Path(os.environ.get("PCGA_ARCHIVE_ROOT_FILE", "/etc/pc-game-archive/archive-root"))
+STATE_ROOT = Path(os.environ.get("PCGA_STORE_STATE", "/var/lib/pc-game-archive/store-providers"))
+IMAGE = os.environ.get("PCGA_STORE_IMAGE", DEFAULT_IMAGE)
+DOCKER = os.environ.get("PCGA_DOCKER_BIN", "docker")
+
+CONTAINER_CONFIG = Path("/pcga/config")
+CONTAINER_LIBRARY = Path("/pcga/library")
+CONTAINER_CACHE = Path("/pcga/cache")
+BACKEND_DIR = Path("/opt/pcga-store-backends")
+GOG_AUTH = CONTAINER_CONFIG / "gog" / "auth.json"
+CATALOG_CACHE_TTL = int(os.environ.get("PCGA_STORE_CATALOG_TTL", "120"))
+LEGACY_HEROIC_CATALOG = Path(os.environ.get("PCGA_LEGACY_HEROIC_CATALOG", "/var/lib/pc-game-archive/heroic/catalog.json"))
+ACCOUNT_STATE = STATE_ROOT / "accounts.json"
+AUTH_FLOW_ROOT = STATE_ROOT / "auth-flows"
+AUTH_FLOW_TTL = int(os.environ.get("PCGA_STORE_AUTH_FLOW_TTL", "900"))
+EPIC_LOGIN_URL = "https://legendary.gl/epiclogin"
+GOG_LOGIN_URL = "https://login.gog.com/auth?client_id=46899977096215655&layout=galaxy&redirect_uri=https%3A%2F%2Fembed.gog.com%2Fon_login_success%3Forigin%3Dclient&response_type=code"
+ACCOUNT_MUTATIONS = {"login", "login-start", "login-complete", "logout"}
+
+
+@dataclass(frozen=True)
+class OperationPlan:
+    provider: str
+    operation: str
+    runner: str
+    argv: tuple[str, ...]
+    mutating: bool = False
+    network: bool = True
+    secret_args: tuple[int, ...] = ()
+    note: str = ""
+
+    def public(self) -> dict:
+        data = asdict(self)
+        argv = list(self.argv)
+        for i in self.secret_args:
+            if 0 <= i < len(argv):
+                argv[i] = "<secret>"
+        data["argv"] = argv
+        data["secret_args"] = list(self.secret_args)
+        return data
+
+
+class StoreProvider:
+    id = ""
+    display_name = ""
+    runner = ""
+    auth_mode = ""
+
+    @property
+    def binary(self) -> str:
+        return str(BACKEND_DIR / self.runner)
+
+    @property
+    def capabilities(self) -> tuple[str, ...]:
+        return ("status", "login", "logout", "library", "installed", "install", "update", "verify", "uninstall", "launch-metadata")
+
+    def version_plan(self) -> OperationPlan:
+        return OperationPlan(self.id, "version", self.runner, ("--version",), network=False)
+
+    def status_plan(self) -> OperationPlan:
+        return self.version_plan()
+
+    def login_plan(self, **kwargs) -> list[OperationPlan]:
+        raise NotImplementedError
+
+    def logout_plan(self) -> OperationPlan:
+        raise NotImplementedError
+
+    def library_plan(self) -> list[OperationPlan]:
+        raise NotImplementedError
+
+    def installed_plan(self) -> list[OperationPlan]:
+        raise NotImplementedError
+
+    def install_plan(self, app_id: str, title: str = "") -> list[OperationPlan]:
+        raise NotImplementedError
+
+    def update_plan(self, app_id: str, title: str = "") -> list[OperationPlan]:
+        raise NotImplementedError
+
+    def verify_plan(self, app_id: str, title: str = "") -> list[OperationPlan]:
+        raise NotImplementedError
+
+    def uninstall_plan(self, app_id: str, title: str = "") -> list[OperationPlan]:
+        raise NotImplementedError
+
+    def launch_metadata_plan(self, app_id: str) -> list[OperationPlan]:
+        raise NotImplementedError
+
+
+class EpicProvider(StoreProvider):
+    id = "epic"
+    display_name = "Epic Games"
+    runner = "legendary"
+    auth_mode = "authorization-code"
+
+    def status_plan(self):
+        return OperationPlan(self.id, "status", self.runner, ("status", "--offline"), network=False)
+
+    def login_plan(self, **kwargs):
+        code = str(kwargs.get("code") or "")
+        return [OperationPlan(self.id, "login", self.runner, ("auth", "--code", code), mutating=True, secret_args=(2,), note="Epic authorization code")]
+
+    def logout_plan(self):
+        return OperationPlan(self.id, "logout", self.runner, ("auth", "--delete"), mutating=True)
+
+    def library_plan(self):
+        return [OperationPlan(self.id, "library", self.runner, ("list", "--third-party", "--json"))]
+
+    def installed_plan(self):
+        return [OperationPlan(self.id, "installed", self.runner, ("list-installed", "--json", "--show-dirs"), network=False)]
+
+    def install_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "install", self.runner, ("-y", "install", app_id, "--base-path", str(CONTAINER_LIBRARY)), mutating=True)]
+
+    def update_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "update", self.runner, ("-y", "update", app_id, "--base-path", str(CONTAINER_LIBRARY)), mutating=True)]
+
+    def verify_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "verify", self.runner, ("verify", app_id), mutating=True, network=False)]
+
+    def uninstall_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "uninstall", self.runner, ("-y", "uninstall", app_id), mutating=True, network=False)]
+
+    def launch_metadata_plan(self, app_id):
+        return [OperationPlan(self.id, "launch-metadata", self.runner, ("info", app_id, "--json", "--platform", "Windows"))]
+
+
+class GogProvider(StoreProvider):
+    id = "gog"
+    display_name = "GOG"
+    runner = "gogdl"
+    auth_mode = "authorization-code"
+
+    def _auth_prefix(self) -> tuple[str, ...]:
+        return ("--auth-config-path", str(GOG_AUTH))
+
+    def status_plan(self):
+        # gogdl's `auth` command may refresh/write its token file. v0.19.2
+        # diagnostics stay read-only, so authentication state is inferred only
+        # from private config evidence until the account manager lands.
+        return self.version_plan()
+
+    def login_plan(self, **kwargs):
+        code = str(kwargs.get("code") or "")
+        argv = self._auth_prefix() + ("auth", "--code", code)
+        return [OperationPlan(self.id, "login", self.runner, argv, mutating=True, secret_args=(len(argv)-1,), note="GOG OAuth authorization code")]
+
+    def logout_plan(self):
+        # gogdl stores auth in the explicit auth file. v0.19.3 will expose the
+        # safe host-side unlink operation through the account manager. Keep the
+        # plan argv empty so this milestone never implies a nonexistent gogdl
+        # logout command.
+        return OperationPlan(self.id, "logout", self.runner, (), mutating=True, network=False, note="Account manager removes the provider auth file; no generic gogdl logout subcommand is assumed")
+
+    def library_plan(self):
+        # Heroic obtains the owned GOG catalog from GOG's account API after
+        # gogdl refreshes the token. Keep both phases explicit in the provider
+        # contract rather than pretending gogdl itself is the catalog API.
+        return [
+            OperationPlan(self.id, "library-auth", self.runner, self._auth_prefix() + ("auth",), note="Catalog refresh may refresh the provider-owned token file; it never changes ownership or installs"),
+            OperationPlan(self.id, "library", self.runner, (), note="Catalog phase uses the GOG account API with the provider-owned refreshed token"),
+        ]
+
+    def installed_plan(self):
+        return [OperationPlan(self.id, "installed", self.runner, (), network=False, note="PCGA-managed GOG installed manifest; gogdl is intentionally not treated as the install database")]
+
+    def _support_path(self, app_id: str) -> str:
+        return str(CONTAINER_CONFIG / "gogdl" / "heroic_gogdl" / "gog-support" / app_id)
+
+    def _target(self, app_id: str, title: str) -> str:
+        # GOG download's --path is a base destination, not an Epic-style
+        # --base-path. Allocate an immutable per-provider/per-ID root so titles
+        # with identical names cannot overwrite one another and resumption
+        # uses exactly the same destination on every attempt.
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,179}", str(app_id)):
+            raise ValueError("invalid GOG product id")
+        return str(CONTAINER_LIBRARY / "gog" / str(app_id))
+
+    def install_plan(self, app_id, title=""):
+        argv = self._auth_prefix() + ("download", app_id, "--platform", "windows", "--path", self._target(app_id,title), "--support", self._support_path(app_id), "--skip-dlcs", "--lang", "en-US")
+        return [OperationPlan(self.id, "install", self.runner, argv, mutating=True)]
+
+    def update_plan(self, app_id, title=""):
+        argv = self._auth_prefix() + ("update", app_id, "--platform", "windows", "--path", self._target(app_id,title), "--support", self._support_path(app_id), "--skip-dlcs", "--lang", "en-US")
+        return [OperationPlan(self.id, "update", self.runner, argv, mutating=True)]
+
+    def verify_plan(self, app_id, title=""):
+        argv = self._auth_prefix() + ("repair", app_id, "--platform", "windows", "--path", self._target(app_id,title), "--support", self._support_path(app_id), "--skip-dlcs", "--lang", "en-US")
+        return [OperationPlan(self.id, "verify", self.runner, argv, mutating=True)]
+
+    def uninstall_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "uninstall", self.runner, (), mutating=True, network=False, note="PCGA removes the game directory and its managed installed-manifest record; gogdl has no stable cross-version uninstall contract")]
+
+    def launch_metadata_plan(self, app_id):
+        return [OperationPlan(self.id, "launch-metadata", self.runner, self._auth_prefix() + ("info", app_id, "--platform", "windows"))]
+
+
+class AmazonProvider(StoreProvider):
+    id = "amazon"
+    display_name = "Amazon Games"
+    runner = "nile"
+    auth_mode = "device-code"
+
+    def status_plan(self):
+        # Nile exposes a local JSON authentication status command; unlike
+        # library sync this does not refresh the remote catalog.
+        return OperationPlan(self.id, "status", self.runner, ("auth", "--status"), network=False)
+
+    def login_plan(self, **kwargs):
+        # Two-stage flow. The first command emits client_id/code_verifier/
+        # serial/url JSON; the second consumes the user authorization code.
+        code = str(kwargs.get("code") or "")
+        verifier = str(kwargs.get("code_verifier") or "")
+        serial = str(kwargs.get("serial") or "")
+        client = str(kwargs.get("client_id") or "")
+        plans = [OperationPlan(self.id, "login-start", self.runner, ("auth", "--login", "--non-interactive"), mutating=True)]
+        if any((code, verifier, serial, client)):
+            argv=("register","--code",code,"--code-verifier",verifier,"--serial",serial,"--client-id",client)
+            plans.append(OperationPlan(self.id, "login-complete", self.runner, argv, mutating=True, secret_args=(2,4,6,8), note="Amazon device-registration flow"))
+        return plans
+
+    def logout_plan(self):
+        return OperationPlan(self.id, "logout", self.runner, ("auth", "--logout"), mutating=True)
+
+    def library_plan(self):
+        return [
+            OperationPlan(self.id, "library-sync", self.runner, ("library", "sync"), note="Refreshes Nile's provider-owned library cache without changing account ownership or installed games"),
+            OperationPlan(self.id, "library", self.runner, ("library", "list", "--json"), network=False),
+        ]
+
+    def installed_plan(self):
+        return [OperationPlan(self.id, "installed", self.runner, ("library", "list", "--installed", "--json"), network=False)]
+
+    def install_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "install", self.runner, ("install", "--base-path", str(CONTAINER_LIBRARY), app_id), mutating=True)]
+
+    def update_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "update", self.runner, ("update", "--base-path", str(CONTAINER_LIBRARY), app_id), mutating=True)]
+
+    def verify_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "verify", self.runner, ("verify", app_id), mutating=True, network=False)]
+
+    def uninstall_plan(self, app_id, title=""):
+        return [OperationPlan(self.id, "uninstall", self.runner, ("uninstall", app_id), mutating=True, network=False)]
+
+    def launch_metadata_plan(self, app_id):
+        return [OperationPlan(self.id, "launch-metadata", self.runner, ("install", "--info", "--json", app_id))]
+
+
+PROVIDERS: Mapping[str, StoreProvider] = {
+    "epic": EpicProvider(),
+    "gog": GogProvider(),
+    "amazon": AmazonProvider(),
+}
+
+
+def safe_component(value: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._ -]+", "", str(value or "")).strip().rstrip(".")[:96]
+    return value or "Game"
+
+
+def archive_root() -> Path:
+    raw = ROOT_FILE.read_text(encoding="utf-8").strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        raise RuntimeError("invalid PCGA archive root")
+    return p
+
+
+def host_layout() -> dict[str, Path]:
+    root = archive_root()
+    base = root / "games" / "stores"
+    layout = {
+        "base": base,
+        "config": base / "config",
+        "library": base / "library",
+        "cache": base / "cache",
+        "home": base / "home",
+        "state": STATE_ROOT,
+        "catalogs": STATE_ROOT / "catalogs",
+    }
+    for path in layout.values():
+        path.mkdir(parents=True, exist_ok=True)
+    uid, gid = puid_pgid()
+    # Credentials and the synthetic runner HOME are private but must be writable
+    # by the same appliance UID/GID used inside PCGA game containers.
+    for key, mode in (("config",0o700),("home",0o700),("cache",0o700),("library",0o755)):
+        path=layout[key]
+        try:
+            os.chmod(path, mode)
+            if os.geteuid() == 0: os.chown(path, uid, gid)
+        except OSError:
+            pass
+    try:
+        os.chmod(layout["state"], 0o700)
+        os.chmod(layout["catalogs"], 0o700)
+    except OSError: pass
+    for name in ("legendary", "gog", "gogdl", "nile", "xdg"):
+        path = layout["config"] / name
+        path.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(path, 0o700)
+            if os.geteuid() == 0: os.chown(path, uid, gid)
+        except OSError:
+            pass
+    return layout
+
+
+def puid_pgid() -> tuple[int, int]:
+    uid = gid = 1000
+    env = Path("/opt/pc-game-archive/.env")
+    try:
+        for line in env.read_text(encoding="utf-8").splitlines():
+            k, _, v = line.partition("=")
+            v = v.split("#", 1)[0].strip().strip('"')
+            if k == "PUID" and v.isdigit(): uid = int(v)
+            if k == "PGID" and v.isdigit(): gid = int(v)
+    except OSError:
+        pass
+    return uid, gid
+
+
+def docker_image_ready() -> bool:
+    try:
+        p = subprocess.run([DOCKER, "image", "inspect", IMAGE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        return p.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def docker_argv(provider: StoreProvider, argv: Iterable[str]) -> list[str]:
+    layout = host_layout()
+    uid, gid = puid_pgid()
+    return [
+        DOCKER, "run", "--rm", "--network", "bridge", "--user", f"{uid}:{gid}",
+        "-e", "HOME=/pcga/home",
+        "-e", "PYTHONUNBUFFERED=1",
+        "-e", "NO_COLOR=1",
+        "-e", f"LEGENDARY_CONFIG_PATH={CONTAINER_CONFIG / 'legendary'}",
+        "-e", f"GOGDL_CONFIG_PATH={CONTAINER_CONFIG / 'gogdl'}",
+        "-e", f"NILE_CONFIG_PATH={CONTAINER_CONFIG / 'nile'}",
+        "-e", f"XDG_CONFIG_HOME={CONTAINER_CONFIG / 'xdg'}",
+        "-e", f"XDG_CACHE_HOME={CONTAINER_CACHE}",
+        "-v", f"{layout['config']}:{CONTAINER_CONFIG}:rw",
+        "-v", f"{layout['library']}:{CONTAINER_LIBRARY}:rw",
+        "-v", f"{layout['cache']}:{CONTAINER_CACHE}:rw",
+        "-v", f"{layout['home']}:/pcga/home:rw",
+        "--entrypoint", provider.binary,
+        IMAGE,
+        *[str(x) for x in argv],
+    ]
+
+
+def run_plan(plan: OperationPlan, timeout: int = 45, *, allow_account_mutation: bool = False) -> subprocess.CompletedProcess:
+    if plan.mutating and not (allow_account_mutation and plan.operation in ACCOUNT_MUTATIONS):
+        raise RuntimeError("Direct provider execution refuses game-mutating operations; use the persistent PCGA store-job worker")
+    if not plan.argv:
+        raise RuntimeError(f"{plan.provider}/{plan.operation} is a host-side strategy, not a runner command")
+    provider = PROVIDERS[plan.provider]
+    return subprocess.run(docker_argv(provider, plan.argv), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+
+
+def config_evidence(provider_id: str, layout: dict[str, Path]) -> dict:
+    config = layout["config"]
+    if provider_id == "epic":
+        roots = [config / "legendary"]
+    elif provider_id == "gog":
+        roots = [config / "gog" / "auth.json", config / "gogdl"]
+    else:
+        roots = [config / "nile"]
+    present = []
+    for p in roots:
+        if p.is_file():
+            try: present.append({"path": str(p.relative_to(layout['base'])), "present": True, "bytes": p.stat().st_size})
+            except OSError: present.append({"path": str(p), "present": True})
+        elif p.is_dir():
+            try:
+                count = sum(1 for x in p.rglob("*") if x.is_file())
+            except OSError: count = 0
+            present.append({"path": str(p.relative_to(layout['base'])), "present": count > 0, "files": count})
+        else:
+            present.append({"path": str(p.relative_to(layout['base'])), "present": False})
+    return {"auth_material_present": any(x.get("present") for x in present), "evidence": present}
+
+
+def provider_status(provider: StoreProvider, *, probe: bool = False, online: bool = False, runtime_ready: bool | None = None) -> dict:
+    layout = host_layout()
+    ready = docker_image_ready() if runtime_ready is None else bool(runtime_ready)
+    result = {
+        "id": provider.id,
+        "name": provider.display_name,
+        "runner": provider.runner,
+        "auth_mode": provider.auth_mode,
+        "capabilities": list(provider.capabilities),
+        "runtime_ready": ready,
+        "binary_ready": False,
+        "version": "",
+        "probe_ok": None,
+        "probe_detail": "Backend image has not been prepared" if not ready else "Not probed",
+        "config": config_evidence(provider.id, layout),
+    }
+    if not (ready and probe):
+        return result
+    plan = provider.version_plan()
+    try:
+        p = run_plan(plan, timeout=30)
+        detail = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+        result["binary_ready"] = p.returncode == 0
+        result["probe_ok"] = p.returncode == 0
+        result["version"] = (p.stdout or p.stderr or "").strip().splitlines()[0][:240] if detail else ""
+        result["probe_detail"] = detail[-800:] if detail else ("OK" if p.returncode == 0 else f"exit {p.returncode}")
+    except Exception as exc:
+        result["probe_ok"] = False
+        result["probe_detail"] = str(exc)[:800]
+        return result
+    if online and result["probe_ok"]:
+        # Only provider-defined, non-mutating status checks are allowed here.
+        online_plan = provider.status_plan()
+        if not online_plan.mutating and online_plan.argv != plan.argv:
+            try:
+                p = run_plan(online_plan, timeout=60)
+                text = ((p.stdout or "") + "\n" + (p.stderr or "")).strip()
+                result["online_probe_ok"] = p.returncode == 0
+                result["online_probe_detail"] = text[-800:]
+            except Exception as exc:
+                result["online_probe_ok"] = False
+                result["online_probe_detail"] = str(exc)[:800]
+    return result
+
+
+def status_payload(provider_id: str = "all", *, probe: bool = False, online: bool = False) -> dict:
+    chosen = list(PROVIDERS.values()) if provider_id == "all" else [PROVIDERS[provider_id]]
+    ready = docker_image_ready()
+    providers = [provider_status(p, probe=probe, online=online, runtime_ready=ready) for p in chosen]
+    return {
+        "ok": True,
+        "action": "store-providers-status",
+        "version": VERSION,
+        "heroic_bundle_version": HEROIC_VERSION,
+        "image": IMAGE,
+        "prepared": ready,
+        "provider_count": len(providers),
+        "ready_count": sum(1 for p in providers if p.get("binary_ready")),
+        "providers": providers,
+        "detail": (
+            f"Store backend image is ready; {sum(1 for p in providers if p.get('binary_ready'))}/{len(providers)} providers passed the requested probe."
+            if probe and ready else
+            "Store backend image is ready; run diagnostics to probe bundled helper binaries."
+            if ready else
+            "Store backends are not prepared yet. Preparation downloads the pinned Heroic bundle and extracts only its Legendary, gogdl and Nile helper binaries."
+        ),
+    }
+
+
+def plans_for(provider: StoreProvider, operation: str, app_id: str, title: str) -> list[OperationPlan]:
+    if operation == "status": return [provider.status_plan()]
+    if operation == "login": return provider.login_plan(code="<authorization-code>", code_verifier="<code-verifier>", serial="<serial>", client_id="<client-id>")
+    if operation == "logout": return [provider.logout_plan()]
+    if operation == "library": return provider.library_plan()
+    if operation == "installed": return provider.installed_plan()
+    if operation == "install": return provider.install_plan(app_id, title)
+    if operation == "update": return provider.update_plan(app_id, title)
+    if operation == "verify": return provider.verify_plan(app_id, title)
+    if operation == "uninstall": return provider.uninstall_plan(app_id, title)
+    if operation == "launch-metadata": return provider.launch_metadata_plan(app_id)
+    raise ValueError("unsupported provider operation")
+
+
+def capabilities_payload() -> dict:
+    return {
+        "ok": True,
+        "action": "store-providers-capabilities",
+        "version": VERSION,
+        "providers": [
+            {
+                "id": p.id,
+                "name": p.display_name,
+                "runner": p.runner,
+                "auth_mode": p.auth_mode,
+                "capabilities": list(p.capabilities),
+            }
+            for p in PROVIDERS.values()
+        ],
+    }
+
+
+def _atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(value, separators=(",", ":"), ensure_ascii=False), encoding="utf-8")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _read_json(path: Path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {} if default is None else default
+
+
+def _json_stdout(plan: OperationPlan, timeout: int = 90):
+    proc = run_plan(plan, timeout=timeout)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        raise RuntimeError(detail[-1200:])
+    text = (proc.stdout or "").strip()
+    if not text:
+        return None
+    # A few helper versions prepend informational lines. Prefer the complete
+    # payload, then fall back to the last JSON-looking line.
+    try:
+        return json.loads(text)
+    except Exception:
+        for line in reversed(text.splitlines()):
+            line=line.strip()
+            if line.startswith(("{", "[")):
+                try: return json.loads(line)
+                except Exception: pass
+    raise RuntimeError(f"{plan.provider}/{plan.operation} did not return valid JSON")
+
+
+def _https_url(value) -> str:
+    url = str(value or "").strip()
+    if url.startswith("//"):
+        return "https:" + url
+    if url.startswith("http://"):
+        return "https://" + url[7:]
+    return url if url.startswith("https://") else ""
+
+
+def _text(value) -> str:
+    if isinstance(value, str): return value.strip()
+    if isinstance(value, dict):
+        for key in ("name", "title", "value", "*", "en-US", "en"):
+            if isinstance(value.get(key), str) and value.get(key).strip(): return value[key].strip()
+    return ""
+
+
+def _strip_markup(value) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _epic_image(raw: dict) -> str:
+    meta = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else raw
+    images = meta.get("keyImages") or raw.get("keyImages") or []
+    if isinstance(images, list):
+        preferred=("DieselGameBoxTall","OfferImageTall","DieselStoreFrontTall","DieselGameBox","OfferImageWide")
+        for kind in preferred:
+            for image in images:
+                if isinstance(image, dict) and image.get("type") == kind:
+                    url=_https_url(image.get("url"))
+                    if url: return url
+    for key in ("art_square_front","art_square","art_cover","cover_url","image"):
+        url=_https_url(raw.get(key) or meta.get(key))
+        if url: return url
+    return ""
+
+
+def _epic_items() -> list[dict]:
+    provider=PROVIDERS["epic"]
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_lib=ex.submit(_json_stdout, provider.library_plan()[-1], 120)
+        f_inst=ex.submit(_json_stdout, provider.installed_plan()[-1], 45)
+        library=f_lib.result() or []
+        try: installed=f_inst.result() or []
+        except Exception: installed=[]
+    if isinstance(library, dict): library=library.get("games") or library.get("items") or library.get("library") or []
+    if isinstance(installed, dict): installed=installed.get("games") or installed.get("items") or installed.get("installed") or list(installed.values())
+    imap={}
+    for item in installed if isinstance(installed,list) else []:
+        if not isinstance(item,dict): continue
+        aid=str(item.get("app_name") or item.get("appName") or item.get("app_id") or item.get("id") or "")
+        if aid: imap[aid]=item
+    out=[]
+    for raw in library if isinstance(library,list) else []:
+        if not isinstance(raw,dict): continue
+        meta=raw.get("metadata") if isinstance(raw.get("metadata"),dict) else raw
+        aid=str(raw.get("app_name") or raw.get("appName") or raw.get("app_id") or meta.get("app_name") or meta.get("id") or "").strip()
+        if not aid: continue
+        categories=meta.get("categories") or []
+        paths={str(x.get("path")) for x in categories if isinstance(x,dict)}
+        if "mods" in paths: continue
+        if meta.get("mainGameItem") or raw.get("is_dlc"): continue
+        title=_text(raw.get("app_title") or raw.get("title") or meta.get("title")) or aid
+        inst=imap.get(aid) or {}
+        developer=_text(raw.get("developer") or meta.get("developer"))
+        desc=_strip_markup(raw.get("description") or meta.get("shortDescription") or meta.get("description"))
+        out.append({
+            "id":f"store:epic:{aid}","provider":"epic","provider_label":"Epic Games","runner":"legendary","provider_game_id":aid,
+            "title":title,"sort_title":title.casefold(),"description":desc,"developer":developer,"genres":[],"year":"",
+            "art_url":_epic_image(raw),"owned":True,"installed":bool(inst),"install_path":str(inst.get("install_path") or ""),
+            "version":str(inst.get("version") or ""),"status":"installed" if inst else "owned","installable":True,
+        })
+    return out
+
+
+def _amazon_items() -> list[dict]:
+    provider=PROVIDERS["amazon"]
+    plans=provider.library_plan()
+    # Nile's sync only refreshes its provider-owned metadata cache; it does not
+    # change account ownership or install/remove games, so it is valid in this
+    # read-only storefront milestone.
+    if plans and plans[0].argv:
+        p=run_plan(plans[0],timeout=120)
+        if p.returncode != 0:
+            raise RuntimeError((p.stderr or p.stdout or "Nile library sync failed")[-1200:])
+    library=_json_stdout(plans[-1],60) or []
+    try: installed=_json_stdout(provider.installed_plan()[-1],45) or []
+    except Exception: installed=[]
+    if isinstance(library,dict): library=library.get("library") or library.get("items") or library.get("games") or []
+    if isinstance(installed,dict): installed=installed.get("installed") or installed.get("items") or installed.get("games") or []
+    imap={}
+    for item in installed if isinstance(installed,list) else []:
+        if isinstance(item,dict):
+            aid=str(item.get("id") or item.get("app_name") or item.get("product_id") or "")
+            if aid: imap[aid]=item
+    out=[]
+    for raw in library if isinstance(library,list) else []:
+        if not isinstance(raw,dict): continue
+        product=raw.get("product") if isinstance(raw.get("product"),dict) else raw
+        aid=str(product.get("id") or raw.get("id") or "").strip()
+        if not aid: continue
+        detail=product.get("productDetail") if isinstance(product.get("productDetail"),dict) else {}
+        details=detail.get("details") if isinstance(detail.get("details"),dict) else detail
+        title=_text(product.get("title") or raw.get("title")) or aid
+        inst=imap.get(aid) or {}
+        art=_https_url(details.get("backgroundUrl2") or detail.get("iconUrl") or details.get("backgroundUrl1") or details.get("logoUrl"))
+        release=str(details.get("releaseDate") or "")
+        year=re.search(r"(?:19|20)\d{2}",release)
+        genres=details.get("genres") or []
+        if isinstance(genres,list): genres=[_text(x) for x in genres if _text(x)]
+        else: genres=[]
+        out.append({
+            "id":f"store:amazon:{aid}","provider":"amazon","provider_label":"Amazon Games","runner":"nile","provider_game_id":aid,
+            "title":title,"sort_title":title.casefold(),"description":_strip_markup(details.get("shortDescription")),"developer":_text(details.get("developer")),
+            "genres":genres,"year":year.group(0) if year else "","art_url":art,"owned":True,"installed":bool(inst),
+            "install_path":str(inst.get("path") or inst.get("install_path") or ""),"version":str(inst.get("version") or ""),
+            "status":"installed" if inst else "owned","installable":True,
+        })
+    return out
+
+
+def _http_json(url: str, token: str, timeout: int = 30):
+    headers={"Accept":"application/json","User-Agent":f"PCGA/{VERSION}"}
+    if token: headers["Authorization"]="Bearer "+token
+    req=urllib.request.Request(url,headers=headers,method="GET")
+    with urllib.request.urlopen(req,timeout=timeout) as res:
+        if int(getattr(res,"status",200)) != 200: raise RuntimeError(f"HTTP {getattr(res,'status',0)}")
+        return json.loads(res.read(8*1024*1024).decode("utf-8","replace"))
+
+
+def _gog_credentials() -> dict:
+    provider=PROVIDERS["gog"]
+    # Let gogdl validate/refresh an existing login. This writes only the
+    # provider-owned auth cache and does not log a user in or out.
+    p=run_plan(provider.library_plan()[0],timeout=60)
+    candidate={}
+    if p.returncode == 0:
+        text=(p.stdout or "").strip()
+        try: candidate=json.loads(text)
+        except Exception:
+            for line in reversed(text.splitlines()):
+                try:
+                    obj=json.loads(line)
+                    if isinstance(obj,dict): candidate=obj; break
+                except Exception: pass
+    host_auth=host_layout()["config"] / "gog" / "auth.json"
+    disk=_read_json(host_auth,{})
+    if isinstance(disk,dict): candidate={**disk,**(candidate if isinstance(candidate,dict) else {})}
+    token=str(candidate.get("access_token") or "")
+    user=str(candidate.get("user_id") or "")
+    if p.returncode != 0 or not token or not user:
+        detail=(p.stderr or p.stdout or "GOG account credentials are unavailable").strip()
+        raise RuntimeError(detail[-1000:] or "GOG account credentials are unavailable")
+    return candidate
+
+
+def _gog_products(ids: list[str], token: str) -> dict[str,dict]:
+    result={}
+    for start in range(0,len(ids),50):
+        chunk=ids[start:start+50]
+        q=urllib.parse.urlencode({"ids":",".join(chunk),"expand":"description","locale":"en-US"})
+        try:
+            data=_http_json("https://api.gog.com/products?"+q,token,30)
+            rows=data if isinstance(data,list) else (data.get("products") if isinstance(data,dict) else [])
+            for row in rows or []:
+                if isinstance(row,dict) and row.get("id") is not None: result[str(row["id"])]=row
+        except Exception:
+            pass
+    missing=[x for x in ids if x not in result][:120]
+    if missing:
+        def one(aid):
+            try: return aid,_http_json(f"https://api.gog.com/products/{urllib.parse.quote(aid)}?expand=description&locale=en-US",token,20)
+            except Exception: return aid,None
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for aid,row in ex.map(one,missing):
+                if isinstance(row,dict): result[aid]=row
+    return result
+
+
+def _gog_items() -> list[dict]:
+    cred=_gog_credentials(); token=str(cred.get("access_token") or ""); user=str(cred.get("user_id") or "")
+    rows=[]; page_token=""; seen=set()
+    for _ in range(40):
+        url=f"https://galaxy-library.gog.com/users/{urllib.parse.quote(user)}/releases"
+        if page_token: url += "?" + urllib.parse.urlencode({"page_token":page_token})
+        data=_http_json(url,token,30)
+        items=data.get("items") if isinstance(data,dict) else []
+        rows.extend(x for x in (items or []) if isinstance(x,dict) and str(x.get("platform_id"))=="gog" and x.get("owned",True))
+        nxt=str(data.get("next_page_token") or "") if isinstance(data,dict) else ""
+        if not nxt or nxt in seen: break
+        seen.add(nxt); page_token=nxt
+    ids=[]
+    for row in rows:
+        aid=str(row.get("external_id") or "")
+        if aid and aid not in ids: ids.append(aid)
+    products=_gog_products(ids,token)
+    out=[]
+    for aid in ids:
+        product=products.get(aid) or {}
+        if str(product.get("game_type") or "game").lower()=="dlc": continue
+        title=_text(product.get("title")) or aid
+        images=product.get("images") if isinstance(product.get("images"),dict) else {}
+        art=_https_url(images.get("background") or images.get("sidebarIcon2x") or images.get("sidebarIcon") or images.get("icon"))
+        desc=product.get("description") if isinstance(product.get("description"),dict) else {}
+        release=str(product.get("release_date") or ""); year=re.search(r"(?:19|20)\d{2}",release)
+        out.append({
+            "id":f"store:gog:{aid}","provider":"gog","provider_label":"GOG","runner":"gogdl","provider_game_id":aid,
+            "title":title,"sort_title":title.casefold(),"description":_strip_markup(desc.get("lead") or desc.get("full")),"developer":"",
+            "genres":[],"year":year.group(0) if year else "","art_url":art,"owned":True,"installed":False,"install_path":"","version":"",
+            "status":"owned","installable":bool(product.get("is_installable",True)),
+        })
+    return out
+
+
+
+def _legacy_heroic_installed_map() -> dict[tuple[str,str],dict]:
+    """Return installed games discovered by the v0.19.0 Heroic compatibility index.
+
+    v0.19.2 did not depend on Heroic for ownership/catalog refresh, but carrying
+    this evidence forward prevents already-installed games from regressing to an
+    "owned only" badge during the native-frontend migration.
+    """
+    data=_read_json(LEGACY_HEROIC_CATALOG,{})
+    rows=data.get("items") if isinstance(data,dict) else []
+    out={}
+    aliases={"legendary":"epic","epic":"epic","gog":"gog","gogdl":"gog","nile":"amazon","amazon":"amazon"}
+    for row in rows if isinstance(rows,list) else []:
+        if not isinstance(row,dict): continue
+        provider=aliases.get(str(row.get("heroic_runner") or row.get("runner") or "").casefold())
+        app=str(row.get("heroic_app_name") or row.get("app_name") or "").strip()
+        if not provider or not app: continue
+        out[(provider,app)]={
+            "install_path":str(row.get("host_install_path") or row.get("install_path") or ""),
+            "version":str(row.get("version") or ""),
+        }
+    return out
+
+
+def _gog_managed_installs() -> dict:
+    """Only trust completed GOG downloads with files still under the archive."""
+    data=_read_json(STATE_ROOT / "gog-installed.json", {})
+    records=data.get("games", {}) if isinstance(data,dict) else {}
+    base=host_layout()["library"].resolve()
+    good={}
+    for app_id,row in records.items() if isinstance(records,dict) else []:
+        if not isinstance(row,dict) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,179}",str(app_id)):
+            continue
+        path=Path(str(row.get("install_path") or ""))
+        try:
+            resolved=path.resolve(strict=True)
+            if not resolved.is_dir() or not resolved.is_relative_to(base / "gog"):
+                continue
+            if not any(resolved.iterdir()):
+                continue
+        except (ValueError,OSError):
+            continue
+        good[str(app_id)]={"install_path":str(resolved), "version":str(row.get("version") or "")}
+    return good
+
+
+def _overlay_legacy_installed(items: list[dict]) -> list[dict]:
+    installed=_legacy_heroic_installed_map()
+    managed=_gog_managed_installs() if any(x.get("provider")=="gog" for x in items) else {}
+    for item in items:
+        key=(str(item.get("provider") or ""),str(item.get("provider_game_id") or ""))
+        if item.get("installed_source") == "pcga-gog" and key[0] == "gog" and key[1] not in managed:
+            item.update(installed=False, status="owned", install_path="", installed_source="")
+        if item.get("installed"): continue
+        legacy=installed.get(key)
+        record=managed.get(key[1]) if key[0]=="gog" else None
+        if not record and not legacy: continue
+        evidence=record or legacy
+        item["installed"]=True
+        item["status"]="installed"
+        if evidence.get("install_path"): item["install_path"]=evidence["install_path"]
+        if evidence.get("version"): item["version"]=evidence["version"]
+        item["installed_source"]="pcga-gog" if record else "heroic-compat"
+    return items
+
+def _cache_path(provider_id: str) -> Path:
+    return host_layout()["catalogs"] / f"{provider_id}.json"
+
+
+def _cached_catalog(provider_id: str) -> dict:
+    data=_read_json(_cache_path(provider_id),{})
+    return data if isinstance(data,dict) else {}
+
+
+def _catalog_failure_detail(provider_id: str, error: Exception) -> str:
+    """Never present credential errors or Python stack traces in the portal."""
+    raw = str(error or "").strip()
+    if provider_id == "amazon" and ("not logged in" in raw.casefold() or raw.casefold() in {"null", "none"}):
+        return "Amazon Games is not connected. Open Control Center → Games → Amazon Games account to connect."
+    if provider_id == "gog" and (raw.casefold() in {"null", "none", ""} or "token" in raw.casefold() or "auth" in raw.casefold()):
+        return "GOG account verification failed. Open Control Center → Games → GOG account and reconnect."
+    if provider_id == "epic" and ("logging in" in raw.casefold() or "traceback" in raw.casefold() or "auth" in raw.casefold()):
+        return "Epic catalog could not be refreshed. Refresh your Epic account connection in Control Center → Games. If it persists, inspect pcga-store-provider logs on the appliance."
+    # Other backend errors get a short, redacted final diagnostic line.
+    parts = [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith('File "')]
+    tail = next((line for line in reversed(parts) if line != "Traceback (most recent call last):"), "Provider catalog unavailable")
+    return _redact_text(tail)[:240]
+
+
+def _catalog(provider_id: str, *, refresh: bool=False, runtime_ready: bool|None=None) -> dict:
+    path=_cache_path(provider_id); cached=_cached_catalog(provider_id); now=time.time()
+    age=now-float(cached.get("updated_at") or 0)
+    if cached.get("items") is not None and not refresh and age < CATALOG_CACHE_TTL:
+        # The installed manifest may change while the owned catalog is warm.
+        # Never allow a 120s cached ownership snapshot to hide completed jobs.
+        if provider_id=="gog":
+            cached={**cached,"items":_overlay_legacy_installed([dict(x) for x in cached.get("items",[])])}
+        return {**cached,"cached":True,"cache_age_seconds":max(0,int(age))}
+    ready=docker_image_ready() if runtime_ready is None else bool(runtime_ready)
+    if not ready:
+        if isinstance(cached.get("items"),list):
+            if provider_id=="gog":
+                cached={**cached,"items":_overlay_legacy_installed([dict(x) for x in cached.get("items",[])])}
+            return {**cached,"available":True,"cached":True,"stale":True,"error":"backend-not-prepared","detail":"Using cached library because the PC-store backend image is not prepared. Open Store settings and choose Prepare backends to refresh it.","cache_age_seconds":max(0,int(age))}
+        return {"provider":provider_id,"provider_label":PROVIDERS[provider_id].display_name,"available":False,"updated_at":0,"count":0,"items":[],"error":"backend-not-prepared","detail":"PC-store backends are not prepared. Open Store settings and choose Prepare backends."}
+    fetch={"epic":_epic_items,"gog":_gog_items,"amazon":_amazon_items}[provider_id]
+    try:
+        items=_overlay_legacy_installed(fetch())
+        payload={"provider":provider_id,"provider_label":PROVIDERS[provider_id].display_name,"available":True,"updated_at":now,"count":len(items),"items":items,"detail":f"Loaded {len(items)} owned title{'s' if len(items)!=1 else ''}."}
+        _atomic_json(path,payload)
+        return {**payload,"cached":False,"cache_age_seconds":0}
+    except Exception as exc:
+        if isinstance(cached.get("items"),list):
+            if provider_id=="gog":
+                cached={**cached,"items":_overlay_legacy_installed([dict(x) for x in cached.get("items",[])])}
+            return {**cached,"available":True,"cached":True,"stale":True,"error":type(exc).__name__,"detail":f"Using cached library because refresh failed: {_catalog_failure_detail(provider_id,exc)}","cache_age_seconds":max(0,int(age))}
+        return {"provider":provider_id,"provider_label":PROVIDERS[provider_id].display_name,"available":False,"updated_at":0,"count":0,"items":[],"error":type(exc).__name__,"detail":_catalog_failure_detail(provider_id,exc)}
+
+
+
+def _redact_text(value: str) -> str:
+    text=str(value or "")
+    text=re.sub(r'(?i)(access_token|refresh_token|authorizationCode|authorization_code|code_verifier|client_secret)([\"\'\s:=]+)([^\s,}]+)',r'\1\2<redacted>',text)
+    return text
+
+
+def _auth_code(value: str) -> str:
+    raw=str(value or "").strip()
+    if not raw:
+        raise ValueError("authorization code is required")
+    if len(raw)>8192:
+        raise ValueError("authorization code is too long")
+    if raw.startswith("{"):
+        try:
+            obj=json.loads(raw)
+            for key in ("authorizationCode","authorization_code","code"):
+                if obj.get(key): raw=str(obj[key]).strip(); break
+        except Exception:
+            pass
+    if raw.startswith(("http://","https://")):
+        q=urllib.parse.parse_qs(urllib.parse.urlparse(raw).query)
+        for key in ("code","authorizationCode","authorization_code"):
+            if q.get(key): raw=str(q[key][0]).strip(); break
+    raw=raw.strip().strip('"').strip("'")
+    if not raw or any(ord(c)<32 for c in raw):
+        raise ValueError("invalid authorization code")
+    return raw
+
+
+def _flow_path(provider_id: str) -> Path:
+    AUTH_FLOW_ROOT.mkdir(parents=True,exist_ok=True)
+    try: os.chmod(AUTH_FLOW_ROOT,0o700)
+    except OSError: pass
+    return AUTH_FLOW_ROOT / f"{provider_id}.json"
+
+
+def _save_flow(provider_id: str, value: dict) -> None:
+    value=dict(value); value["created_at"]=time.time(); _atomic_json(_flow_path(provider_id),value)
+
+
+def _load_flow(provider_id: str) -> dict:
+    path=_flow_path(provider_id); data=_read_json(path,{})
+    if not isinstance(data,dict) or time.time()-float(data.get("created_at") or 0)>AUTH_FLOW_TTL:
+        try: path.unlink()
+        except OSError: pass
+        raise RuntimeError("The login request expired. Start the account connection again.")
+    return data
+
+
+def _clear_flow(provider_id: str) -> None:
+    try: _flow_path(provider_id).unlink()
+    except OSError: pass
+
+
+def _clear_catalog(provider_id: str) -> None:
+    try: _cache_path(provider_id).unlink()
+    except OSError: pass
+
+
+def _account_local(provider_id: str) -> dict:
+    layout=host_layout(); evidence=config_evidence(provider_id,layout); present=bool(evidence.get("auth_material_present"))
+    state="connected" if present else "disconnected"
+    detail="Stored provider authentication is present; choose Refresh status to verify it." if present else "No stored account authentication was found."
+    if provider_id=="gog":
+        data=_read_json(layout["config"] / "gog" / "auth.json",{})
+        if isinstance(data,dict) and data.get("refresh_token"):
+            exp=float(data.get("loginTime") or data.get("login_time") or 0)+float(data.get("expires_in") or 0)
+            if exp and exp<time.time() and not data.get("refresh_token"):
+                state="expired"
+    return {"id":provider_id,"name":PROVIDERS[provider_id].display_name,"state":state,"connected":present,"verified":False,"detail":detail,"auth_material_present":present}
+
+
+def _account_verify(provider_id: str) -> dict:
+    provider=PROVIDERS[provider_id]; base=_account_local(provider_id)
+    if not docker_image_ready():
+        return {**base,"state":"needs-backends","connected":False,"verified":False,"detail":"Prepare the PC-store backends before verifying or connecting accounts."}
+    try:
+        if provider_id=="epic":
+            plan=OperationPlan("epic","account-status","legendary",("status",),network=True)
+            p=subprocess.run(docker_argv(provider,plan.argv),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45)
+        elif provider_id=="gog":
+            plan=provider.library_plan()[0]
+            p=subprocess.run(docker_argv(provider,plan.argv),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
+        else:
+            plan=provider.status_plan()
+            p=subprocess.run(docker_argv(provider,plan.argv),text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=45)
+        text=((p.stdout or "")+"\n"+(p.stderr or "")).strip()
+        connected=p.returncode==0
+        state="connected" if connected else ("expired" if base.get("auth_material_present") else "disconnected")
+        detail=("Account verified." if connected else (_redact_text(text)[-700:] or "Authentication could not be verified."))
+        return {**base,"state":state,"connected":connected,"verified":True,"detail":detail}
+    except Exception as exc:
+        return {**base,"state":"error" if base.get("auth_material_present") else "disconnected","connected":False,"verified":True,"detail":_catalog_failure_detail(provider_id,exc)}
+
+
+def accounts_payload(provider_id: str="all", *, refresh: bool=False) -> dict:
+    ids=list(PROVIDERS) if provider_id=="all" else [provider_id]
+    cached=_read_json(ACCOUNT_STATE,{})
+    previous={x.get("id"):x for x in cached.get("providers",[]) if isinstance(x,dict)} if isinstance(cached,dict) else {}
+    if refresh:
+        with ThreadPoolExecutor(max_workers=len(ids)) as ex:
+            rows=list(ex.map(_account_verify,ids))
+    else:
+        rows=[]
+        for pid in ids:
+            local=_account_local(pid); old=previous.get(pid) or {}
+            if local.get("auth_material_present") and old.get("verified"):
+                local={**local,**{k:old.get(k) for k in ("state","connected","verified","detail","verified_at") if k in old}}
+            rows.append(local)
+    now=time.time()
+    if refresh:
+        for row in rows: row["verified_at"]=now
+        full=[]
+        by={x["id"]:x for x in rows}
+        for pid in PROVIDERS: full.append(by.get(pid) or previous.get(pid) or _account_local(pid))
+        _atomic_json(ACCOUNT_STATE,{"updated_at":now,"providers":full})
+    return {"ok":True,"action":"store-accounts-status","version":VERSION,"provider":provider_id,"providers":rows,"connected_count":sum(1 for x in rows if x.get("connected")),"detail":"Store account status. Tokens and provider credentials are never returned by this endpoint."}
+
+
+def account_login_start(provider_id: str) -> dict:
+    if provider_id not in PROVIDERS: raise ValueError("unsupported provider")
+    if not docker_image_ready(): raise RuntimeError("Prepare the PC-store backends before connecting an account.")
+    _clear_flow(provider_id)
+    if provider_id=="epic":
+        return {"ok":True,"action":"store-account-login-start","provider":"epic","provider_label":"Epic Games","login_url":EPIC_LOGIN_URL,"input_kind":"authorization-code","detail":"Sign in to Epic in the new browser tab, then paste the authorizationCode value shown by Legendary's login page."}
+    if provider_id=="gog":
+        return {"ok":True,"action":"store-account-login-start","provider":"gog","provider_label":"GOG","login_url":GOG_LOGIN_URL,"input_kind":"authorization-code","detail":"Sign in to GOG in the new browser tab. After the redirect, copy the code value from the resulting URL and paste it into PCGA."}
+    plan=PROVIDERS["amazon"].login_plan()[0]
+    p=run_plan(plan,timeout=60,allow_account_mutation=True)
+    if p.returncode!=0: raise RuntimeError((p.stderr or p.stdout or "Amazon login could not be started")[-1200:])
+    data=None; text=(p.stdout or "").strip()
+    try: data=json.loads(text)
+    except Exception:
+        for line in reversed(text.splitlines()):
+            try:
+                obj=json.loads(line.strip())
+                if isinstance(obj,dict): data=obj; break
+            except Exception: pass
+    if not isinstance(data,dict): raise RuntimeError("Nile did not return a usable non-interactive login request")
+    url=str(data.get("url") or data.get("login_url") or "").strip()
+    pending={k:str(data.get(k) or "") for k in ("client_id","code_verifier","serial")}
+    if not url or not all(pending.values()): raise RuntimeError("Nile returned an incomplete device-registration request")
+    _save_flow("amazon",pending)
+    return {"ok":True,"action":"store-account-login-start","provider":"amazon","provider_label":"Amazon Games","login_url":url,"input_kind":"authorization-code","expires_in":AUTH_FLOW_TTL,"detail":"Sign in to Amazon using the new browser tab, then paste the authorization code. PCGA keeps the device verifier and serial only on the server."}
+
+
+def account_login_complete(provider_id: str, code_value: str) -> dict:
+    if provider_id not in PROVIDERS: raise ValueError("unsupported provider")
+    if not docker_image_ready(): raise RuntimeError("Prepare the PC-store backends before connecting an account.")
+    code=_auth_code(code_value); provider=PROVIDERS[provider_id]
+    if provider_id=="amazon":
+        flow=_load_flow("amazon")
+        plans=provider.login_plan(code=code,code_verifier=flow.get("code_verifier"),serial=flow.get("serial"),client_id=flow.get("client_id"))
+        plan=plans[-1]
+    else:
+        plan=provider.login_plan(code=code)[-1]
+    p=run_plan(plan,timeout=90,allow_account_mutation=True)
+    if p.returncode!=0:
+        detail=_redact_text((p.stderr or p.stdout or "Account connection failed").strip())[-1200:]
+        raise RuntimeError(detail)
+    _clear_flow(provider_id); _clear_catalog(provider_id)
+    status=_account_verify(provider_id); status["verified_at"]=time.time()
+    current=accounts_payload("all",refresh=False); by={x.get("id"):x for x in current.get("providers",[])}; by[provider_id]=status
+    _atomic_json(ACCOUNT_STATE,{"updated_at":time.time(),"providers":[by.get(pid) or _account_local(pid) for pid in PROVIDERS]})
+    return {"ok":True,"action":"store-account-login-complete","provider":provider_id,"account":status,"detail":f"{provider.display_name} account connected."}
+
+
+def account_logout(provider_id: str) -> dict:
+    if provider_id not in PROVIDERS: raise ValueError("unsupported provider")
+    if provider_id=="gog":
+        path=host_layout()["config"] / "gog" / "auth.json"
+        try:
+            if path.exists():
+                path.write_bytes(b""); os.chmod(path,0o600); path.unlink()
+        except OSError as exc: raise RuntimeError(f"Could not remove GOG authentication: {exc}")
+    else:
+        if not docker_image_ready(): raise RuntimeError("Prepare the PC-store backends before disconnecting this account.")
+        plan=PROVIDERS[provider_id].logout_plan()
+        p=run_plan(plan,timeout=60,allow_account_mutation=True)
+        if p.returncode!=0: raise RuntimeError(_redact_text(p.stderr or p.stdout or "Account logout failed")[-1200:])
+    _clear_flow(provider_id); _clear_catalog(provider_id)
+    status=_account_local(provider_id); status.update({"state":"disconnected","connected":False,"verified":True,"verified_at":time.time(),"detail":"Account disconnected from PCGA."})
+    current=accounts_payload("all",refresh=False); by={x.get("id"):x for x in current.get("providers",[])}; by[provider_id]=status
+    _atomic_json(ACCOUNT_STATE,{"updated_at":time.time(),"providers":[by.get(pid) or _account_local(pid) for pid in PROVIDERS]})
+    return {"ok":True,"action":"store-account-logout","provider":provider_id,"account":status,"detail":f"{PROVIDERS[provider_id].display_name} account disconnected."}
+
+def _fuzzy_score(query: str, item: dict) -> float:
+    q=re.sub(r"[^a-z0-9]+"," ",query.casefold()).strip()
+    hay=" ".join([str(item.get("title") or ""),str(item.get("developer") or ""),str(item.get("provider_label") or ""),str(item.get("provider_game_id") or "")," ".join(item.get("genres") or [])]).casefold()
+    h=re.sub(r"[^a-z0-9]+"," ",hay).strip()
+    if not q: return 1.0
+    if q == h: return 10.0
+    if q in h: return 8.0 + min(1.0,len(q)/max(1,len(h)))
+    qtokens=q.split(); htoks=h.split(); token_scores=[]
+    for qt in qtokens:
+        best=max([difflib.SequenceMatcher(None,qt,ht).ratio() for ht in htoks] or [0.0])
+        token_scores.append(best)
+    token=min(token_scores) if token_scores else 0.0
+    whole=difflib.SequenceMatcher(None,q,h).ratio()
+    return max(token*5.0,whole*4.0)
+
+
+def library_payload(provider_id: str="all", *, query: str="", limit: int=240, refresh: bool=False) -> dict:
+    provider_ids=list(PROVIDERS) if provider_id=="all" else [provider_id]
+    limit=max(1,min(500,int(limit or 240)))
+    catalogs=[]
+    runtime_ready=docker_image_ready()
+    with ThreadPoolExecutor(max_workers=len(provider_ids)) as ex:
+        fut={ex.submit(_catalog,pid,refresh=refresh,runtime_ready=runtime_ready):pid for pid in provider_ids}
+        for f in as_completed(fut):
+            pid=fut[f]
+            try: catalogs.append(f.result())
+            except Exception as exc: catalogs.append({"provider":pid,"provider_label":PROVIDERS[pid].display_name,"available":False,"count":0,"items":[],"detail":str(exc)[:500]})
+    order={pid:i for i,pid in enumerate(provider_ids)}; catalogs.sort(key=lambda x:order.get(x.get("provider"),99))
+    rows=[]
+    for catalog in catalogs:
+        for item in catalog.get("items") or []:
+            score=_fuzzy_score(query,item) if query else 0.0
+            if query and score < 2.55: continue
+            rows.append((score,item))
+    if query: rows.sort(key=lambda r:(-r[0],str(r[1].get("sort_title") or r[1].get("title") or "")))
+    else: rows.sort(key=lambda r:(str(r[1].get("sort_title") or r[1].get("title") or ""),str(r[1].get("provider") or "")))
+    items=[]
+    for score,item in rows[:limit]:
+        obj=dict(item)
+        if query: obj["search_score"]=round(score,4)
+        items.append(obj)
+    return {
+        "ok":True,"action":"store-library","version":VERSION,"read_only":True,"query":query,"provider":provider_id,
+        "count":len(items),"total_owned":sum(int(x.get("count") or 0) for x in catalogs),"items":items,
+        "providers":[{k:v for k,v in x.items() if k!="items"} for x in catalogs],
+        "detail":"Owned-game catalog. Epic/GOG support installation and guarded update, verify and uninstall through the persistent queue; Amazon remains library/account-only.",
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="PCGA native PC-store provider foundation")
+    sub = ap.add_subparsers(dest="command", required=True)
+    st = sub.add_parser("status", help="Return safe provider diagnostics")
+    st.add_argument("--provider", choices=["all", *PROVIDERS], default="all")
+    st.add_argument("--probe", action="store_true", help="Run each bundled backend's --version command")
+    st.add_argument("--online", action="store_true", help="Also run safe provider-defined online health checks when available")
+    sub.add_parser("capabilities", help="Show the normalized provider contract")
+    lib = sub.add_parser("library", help="Return the normalized read-only owned-game catalog")
+    lib.add_argument("--provider", choices=["all", *PROVIDERS], default="all")
+    lib.add_argument("--query", default="")
+    lib.add_argument("--limit", type=int, default=240)
+    lib.add_argument("--refresh", action="store_true", help="Refresh provider-owned catalog caches before returning")
+    ac = sub.add_parser("accounts", help="Return sanitized store-account connection state")
+    ac.add_argument("--provider", choices=["all", *PROVIDERS], default="all")
+    ac.add_argument("--refresh", action="store_true", help="Verify existing authentication with provider backends")
+    ls = sub.add_parser("login-start", help="Start a provider login flow without returning provider secrets")
+    ls.add_argument("provider", choices=PROVIDERS)
+    lc = sub.add_parser("login-complete", help="Complete a provider login with the returned authorization code")
+    lc.add_argument("provider", choices=PROVIDERS)
+    lc.add_argument("--code-stdin", action="store_true", help="Read the authorization code from stdin so it never appears in process arguments")
+    lo = sub.add_parser("logout", help="Disconnect a provider account from PCGA")
+    lo.add_argument("provider", choices=PROVIDERS)
+    pl = sub.add_parser("plan", help="Show a redacted operation plan; never executes it")
+    pl.add_argument("provider", choices=PROVIDERS)
+    pl.add_argument("operation", choices=["status","login","logout","library","installed","install","update","verify","uninstall","launch-metadata"])
+    pl.add_argument("--app-id", default="example-app")
+    pl.add_argument("--title", default="Example Game")
+    args = ap.parse_args()
+    try:
+        if args.command == "status":
+            out = status_payload(args.provider, probe=args.probe, online=args.online)
+        elif args.command == "capabilities":
+            out = capabilities_payload()
+        elif args.command == "library":
+            out = library_payload(args.provider, query=str(args.query or "")[:160], limit=args.limit, refresh=args.refresh)
+        elif args.command == "accounts":
+            out = accounts_payload(args.provider, refresh=args.refresh)
+        elif args.command == "login-start":
+            out = account_login_start(args.provider)
+        elif args.command == "login-complete":
+            if not args.code_stdin: raise ValueError("login-complete requires --code-stdin")
+            out = account_login_complete(args.provider, sys.stdin.read(8192))
+        elif args.command == "logout":
+            out = account_logout(args.provider)
+        else:
+            provider = PROVIDERS[args.provider]
+            out = {
+                "ok": True,
+                "action": "store-provider-plan",
+                "provider": provider.id,
+                "operation": args.operation,
+                "plans": [x.public() for x in plans_for(provider, args.operation, args.app_id, args.title)],
+                "executed": False,
+            }
+        print(json.dumps(out, separators=(",", ":"), sort_keys=True))
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": type(exc).__name__, "detail": str(exc)}, separators=(",", ":")))
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

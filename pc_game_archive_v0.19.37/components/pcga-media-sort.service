@@ -1,0 +1,10 @@
+[Unit]
+Description=Sort completed ARM rips into PCGA libraries and review queues
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-media-sort
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
