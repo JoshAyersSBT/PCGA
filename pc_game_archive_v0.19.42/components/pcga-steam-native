@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""Manage PCGA's opt-in Steam Headless runtime; Steam owns auth, Proton and installs.
+
+Steam's profile, downloaded games and state persist outside the Docker container.
+No store passwords or tokens are handled by this bridge.
+"""
+import argparse
+import json
+import os
+import re
+import ssl
+import urllib.error
+import urllib.request
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT_CONFIG = Path('/etc/pc-game-archive/archive-root')
+STACK_ENV = Path('/opt/pc-game-archive/.env')
+NAME = 'pcga-steam-native'
+IMAGE = 'josh5/steam-headless:2'
+ENCODER_CONFIG = Path('/etc/pc-game-archive/steam-encoder')
+VALID_ENCODERS = frozenset(('auto', 'software'))
+SHUI_URL = 'https://127.0.0.1:8483/'
+SUNSHINE_URL = 'https://127.0.0.1:47990/api/apps'
+
+
+
+def execute(args, timeout=25):
+    # Never use a shell or incorporate user-supplied Docker arguments.
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def root():
+    if not ROOT_CONFIG.is_file():
+        raise RuntimeError('PCGA archive root is not configured')
+    value = ROOT_CONFIG.read_text().strip()
+    p = Path(value).resolve(strict=True)
+    if not p.is_dir():
+        raise RuntimeError('PCGA archive root is not a directory')
+    return p
+
+
+def steam_paths():
+    base = root() / 'games' / 'steam'
+    return base, base / 'home', base / 'library', base / 'state', base / 'journal'
+
+
+def runtime_identity():
+    """Use the configured PCGA runtime identity, not SUDO_UID from the web service.
+
+    The original v0.19.13 referenced uid/gid before initialization, so an empty
+    first-time Steam profile failed with UnboundLocalError before Docker ran.
+    """
+    configured = {}
+    if STACK_ENV.exists():
+        for line in STACK_ENV.read_text().splitlines():
+            match = re.fullmatch(r'\s*(PUID|PGID)\s*=\s*["\']?(\d+)["\']?\s*', line)
+            if match:
+                configured[match.group(1)] = int(match.group(2))
+    fallback = root().stat()
+    uid = configured.get('PUID') or (fallback.st_uid if fallback.st_uid > 0 else 1000)
+    gid = configured.get('PGID') or (fallback.st_gid if fallback.st_gid > 0 else 1000)
+    if not (1 <= uid <= 2147483647 and 1 <= gid <= 2147483647):
+        raise RuntimeError('Invalid PCGA Steam runtime UID/GID')
+    return uid, gid
+
+
+def container_state():
+    if not shutil.which('docker'):
+        return ('unavailable', '')
+    result = execute(['docker', 'inspect', '--format', '{{.State.Status}}|{{.Config.Image}}', NAME], 12)
+    if result.returncode:
+        return ('not-installed', '')
+    parts = result.stdout.strip().split('|', 1)
+    return parts[0], (parts[1] if len(parts) > 1 else '')
+
+
+def verify_owned_image(image):
+    if image and image != IMAGE:
+        raise RuntimeError('Refusing to modify container of an unexpected image: ' + image[:120])
+
+
+def container_mounts():
+    response = execute(['docker', 'inspect', '--format', '{{json .Mounts}}', NAME], 12)
+    if response.returncode:
+        raise RuntimeError('Could not inspect the Steam runtime persistent mounts')
+    return json.loads(response.stdout)
+
+
+def verify_persistent_mounts():
+    """Only replace a container after verifying every Steam state path is bind mounted."""
+    _, home, lib, state, journal = steam_paths()
+    expected = {
+        '/home/steamheadless': home,
+        '/mnt/games': lib,
+        '/var/lib/steam-headless': state,
+        '/var/log/journal': journal,
+    }
+    mounted = {m.get('Destination'): m for m in container_mounts() if isinstance(m, dict)}
+    for dest, path in expected.items():
+        m = mounted.get(dest, {})
+        if m.get('Type') != 'bind' or Path(m.get('Source', '/__missing__')).resolve() != path.resolve():
+            raise RuntimeError('Steam container has non-PCGA storage at ' + dest + '; refusing removal')
+
+
+def verify_existing_container(image):
+    """Do not start/stop a borrowed or remapped container named like ours."""
+    verify_owned_image(image)
+    verify_persistent_mounts()
+
+
+def configured_encoder():
+    """A host-owned preference which survives Steam container replacement.
+
+    The Docker environment is generated from this setting on new containers;
+    editing /run/steam-headless/environment is deliberately not necessary.
+    """
+    try:
+        value = ENCODER_CONFIG.read_text(encoding='utf-8').strip()
+    except FileNotFoundError:
+        return 'auto'
+    if value not in VALID_ENCODERS:
+        raise RuntimeError('Invalid Steam encoder preference; allowed: auto, software')
+    return value
+
+
+def save_encoder(value):
+    if value not in VALID_ENCODERS:
+        raise ValueError('Choose auto or software for the Steam encoder')
+    ENCODER_CONFIG.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    temp = ENCODER_CONFIG.with_name(ENCODER_CONFIG.name + '.new')
+    try:
+        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as output:
+            output.write(value + '\n')
+        os.replace(temp, ENCODER_CONFIG)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    os.chmod(ENCODER_CONFIG, 0o600)
+
+
+def container_encoder():
+    response = execute(['docker', 'inspect', '--format', '{{json .Config.Env}}', NAME], 8)
+    if response.returncode:
+        return None
+    for entry in json.loads(response.stdout or '[]'):
+        if entry.startswith('SHUI_ENCODER='):
+            return entry.partition('=')[2]
+    return 'auto'
+
+
+def web_probe(url):
+    """401 is healthy for a private authenticated HTTPS service.
+
+    Do not disable certificate checking for any non-loopback destination.
+    """
+    try:
+        request = urllib.request.Request(url, method='GET')
+        with urllib.request.urlopen(request, timeout=0.8, context=ssl._create_unverified_context()) as response:
+            return True, response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code in (401, 403), exc.code
+    except (OSError, urllib.error.URLError, ValueError):
+        return False, None
+
+
+def container_check(command, timeout=4):
+    return execute(['docker', 'exec', NAME, '/bin/sh', '-c', command], timeout).returncode == 0
+
+
+def h264_encode_capability():
+    """Returns False only when the VA-API probe succeeds and exposes no H264 encode.
+
+    An absent vainfo tool or probe error is unknown, never evidence of absence.
+    """
+    for render in sorted(Path('/dev/dri').glob('renderD*')):
+        if not render.is_char_device():
+            continue
+        response = execute(['docker', 'exec', NAME, 'vainfo', '--display', 'drm',
+                            '--device', str(render)], 6)
+        if response.returncode:
+            continue
+        h264 = [line for line in response.stdout.splitlines() if 'VAProfileH264' in line]
+        if h264:
+            return any('VAEntrypointEnc' in line for line in h264)
+    return None
+
+
+def diagnostics():
+    result = {'docker_available': bool(shutil.which('docker')),
+              'gpu_cards': [], 'gpu_render_nodes': [], 'missing_devices': []}
+    dri = Path('/dev/dri')
+    result['gpu_cards'] = [str(p) for p in sorted(dri.glob('card*')) if p.is_char_device()]
+    result['gpu_render_nodes'] = [str(p) for p in sorted(dri.glob('renderD*')) if p.is_char_device()]
+    for name in ('/dev/uinput', '/dev/fuse'):
+        if not Path(name).is_char_device():
+            result['missing_devices'].append(name)
+    if not result['gpu_cards']:
+        result['missing_devices'].append('/dev/dri/card*')
+    if not result['gpu_render_nodes']:
+        result['missing_devices'].append('/dev/dri/renderD*')
+    return result
+
+
+def device_nodes():
+    dri = Path('/dev/dri')
+    renders = [str(p) for p in sorted(dri.glob('renderD*')) if p.is_char_device()]
+    cards = [str(p) for p in sorted(dri.glob('card*')) if p.is_char_device()]
+    if not renders or not cards:
+        raise RuntimeError('Steam Headless needs /dev/dri/card* and renderD* GPU nodes; check host DRM drivers')
+    devices = cards + renders
+    for needed in ('/dev/uinput', '/dev/fuse'):
+        if not Path(needed).is_char_device():
+            raise RuntimeError('Steam Headless requires ' + needed + ' (check the kernel module and permissions)')
+        devices.append(needed)
+    if Path('/dev/uhid').is_char_device():
+        devices.append('/dev/uhid')
+    return devices
+
+
+def prepare_directories():
+    _, home, lib, state, journal = steam_paths()
+    uid, gid = runtime_identity()  # computed before it is needed (v0.19.13 fix)
+    # Steam state and journal are managed as root inside Steam Headless; only
+    # the user-owned home and game library use the PUID/PGID account.
+    for path in (home, lib, state, journal):
+        path.mkdir(parents=True, exist_ok=True)
+        if path in (home, lib) and path.stat().st_uid == 0:
+            os.chown(path, uid, gid)
+    return uid, gid, home, lib, state, journal
+
+
+def launch_args(uid, gid, home, lib, state, journal, devices):
+    # Steam Headless's documented systemd/cgroup + runtime filesystem setup.
+    cmd = ['docker', 'run', '-d', '--name', NAME, '--hostname', NAME,
+           '--restart', 'no', '--network', 'host', '--shm-size', '2g',
+           '--pids-limit', '8192', '--cgroupns', 'private', '--tty',
+           '--stop-signal', 'SIGRTMIN+3',
+           '--cap-add', 'DAC_READ_SEARCH', '--cap-add', 'NET_ADMIN',
+           '--cap-add', 'SYS_ADMIN', '--cap-add', 'SYS_NICE', '--cap-add', 'SYS_PTRACE',
+           '--security-opt', 'apparmor=unconfined',
+           '--security-opt', 'seccomp=unconfined',
+           '--security-opt', 'systempaths=unconfined',
+           '--security-opt', 'writable-cgroups=true',
+           '--device-cgroup-rule', 'c 13:* rwm',
+           '--tmpfs', '/run:rw,exec,nosuid',
+           '--tmpfs', '/run/lock:rw,nosuid',
+           '--tmpfs', '/tmp:rw,exec,nosuid',
+           '--tmpfs', '/dev/input:rw,dev,mode=0755',
+           '-e', f'PUID={uid}', '-e', f'PGID={gid}',
+           '-e', 'ENABLE_STEAM=true', '-e', f'SHUI_ENCODER={configured_encoder()}',
+           '-v', f'{home}:/home/steamheadless', '-v', f'{lib}:/mnt/games',
+           '-v', f'{state}:/var/lib/steam-headless',
+           '-v', f'{journal}:/var/log/journal',
+           '-v', '/etc/localtime:/run/host-localtime:ro']
+    for node in devices:
+        cmd.extend(['--device', node])
+    if Path('/sys/devices/virtual/input').is_dir():
+        cmd.extend(['-v', '/sys/devices/virtual/input:/sys/devices/virtual/input:ro'])
+    cmd.append(IMAGE)
+    return cmd
+
+
+def steam_manifest_dirs():
+    _, home, lib, _, _ = steam_paths()
+    # Steam users can select additional library roots through libraryfolders.vdf.
+    # Only traverse paths already inside PCGA-owned persistent mounts.
+    roots = [lib, home / '.local/share/Steam', home / '.steam/steam', home / 'Steam']
+    allowed = [home.resolve(), lib.resolve()]
+    candidates = [folder / 'steamapps' for folder in roots]
+    for root_dir in roots:
+        config = root_dir / 'steamapps/libraryfolders.vdf'
+        if not config.is_file() or config.stat().st_size > 1024 * 1024:
+            continue
+        content = config.read_text(encoding='utf-8', errors='replace')
+        for folder in re.findall(r'^\s*"path"\s+"([^"\r\n]{1,1024})"', content, re.M):
+            # Container paths must be mapped into host paths explicitly; never
+            # inspect arbitrary host paths returned by mutable Steam config.
+            folder = folder.replace('\\\\', '\\')
+            mapping = {'/mnt/games': lib, '/home/steamheadless': home}
+            for prefix, target in mapping.items():
+                if folder == prefix or folder.startswith(prefix + '/'):
+                    candidates.append(target / folder[len(prefix):].lstrip('/') / 'steamapps')
+                    break
+    dirs = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if not any(resolved.is_relative_to(path) for path in allowed):
+            continue
+        if resolved.is_dir() and resolved not in dirs:
+            dirs.append(resolved)
+    return dirs
+
+
+def scan():
+    items = {}
+    for directory in steam_manifest_dirs():
+        for item in sorted(directory.glob('appmanifest_*.acf'))[:3000]:
+            if item.is_symlink() or not item.is_file() or item.stat().st_size > 1024 * 1024:
+                continue
+            match = re.fullmatch(r'appmanifest_([0-9]{1,12})\.acf', item.name)
+            if not match:
+                continue
+            content = item.read_text(encoding='utf-8', errors='replace')
+            def field(key):
+                found = re.search(r'^\s*"' + re.escape(key) + r'"\s+"([^"\r\n]{0,250})"', content, re.M)
+                return found.group(1) if found else ''
+            title = field('name')
+            if not title:
+                continue
+            flags = field('StateFlags')
+            # Do not represent partial downloads as playable installations.
+            if flags.isdecimal() and not (int(flags) & 4):
+                continue
+            items[match.group(1)] = {'appid': match.group(1), 'title': title,
+                                   'installed': True, 'state_flags': flags,
+                                   'provider': 'steam', 'streaming': 'steam-remote-play'}
+    return sorted(items.values(), key=lambda item: item['title'].casefold())
+
+
+def status():
+    state, image = container_state()
+    games = scan()
+    info = diagnostics()
+    choice = configured_encoder()
+    info.update({'web_ui_reachable': False, 'web_ui_http_status': None,
+                 'web_ui_port': 8483, 'web_ui_protocol': 'https',
+                 'steam_client_running': False, 'setup_required': None,
+                 'sunshine_running': False, 'sunshine_api_reachable': False,
+                 'encoder_preference': choice, 'encoder_container': None,
+                 'encoder_requires_recreate': False, 'hardware_h264_encode': None})
+    if state not in ('not-installed', 'unavailable'):
+        try:
+            verify_existing_container(image)
+            info['storage_verified'] = True
+        except Exception as exc:
+            info['storage_verified'] = False
+            info['storage_warning'] = str(exc)[:240]
+    if state == 'running':
+        info['web_ui_reachable'], info['web_ui_http_status'] = web_probe(SHUI_URL)
+        # An active systemd unit is not enough: Sunshine's setup placeholder
+        # is /usr/bin/sleep infinity and must not count as streaming-ready.
+        info['steam_client_running'] = container_check('pgrep -x steam >/dev/null')
+        info['setup_required'] = container_check('test -s /var/lib/steam-headless/auth/bootstrap-password')
+        info['sunshine_running'] = container_check('pgrep -x sunshine >/dev/null')
+        if info['sunshine_running']:
+            info['sunshine_api_reachable'], _ = web_probe(SUNSHINE_URL)
+        info['hardware_h264_encode'] = h264_encode_capability()
+    if state in ('running', 'exited', 'created'):
+        try:
+            info['encoder_container'] = container_encoder()
+            info['encoder_requires_recreate'] = info['encoder_container'] != choice
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    if state != 'running':
+        stage = 'stopped'
+        detail = 'Steam is optional. Start its native runtime on a trusted LAN.'
+    elif info.get('storage_verified') is False:
+        stage = 'storage-unverified'
+        detail = 'Steam container mounts or image differ from PCGA-managed storage; refusing to declare it ready.'
+    elif not info['web_ui_reachable']:
+        stage = 'shui-unavailable'
+        detail = 'Steam Headless HTTPS UI is unavailable on port 8483; inspect encoder and SHUI logs.'
+    elif info['setup_required']:
+        stage = 'setup-required'
+        detail = 'Finish Steam Headless first-run administrator setup in the HTTPS web UI.'
+    elif not info['steam_client_running']:
+        stage = 'client-unavailable'
+        detail = 'Steam Headless is accessible but the Steam client is not running.'
+    elif not (info['sunshine_running'] and info['sunshine_api_reachable']):
+        stage = 'streaming-unavailable'
+        detail = 'Steam client started; Sunshine streaming is not available yet.'
+    else:
+        stage = 'streaming-ready'
+        detail = 'Steam client and Sunshine are running. Steam account sign-in is managed within Steam.'
+    if info['hardware_h264_encode'] is False and choice == 'auto':
+        detail += ' This GPU exposes H.264 decode but no VA-API encode; select software encoder.'
+    if info['encoder_requires_recreate']:
+        detail += ' Encoder preference is pending container recreation.'
+    # Don't report account login just because a Steam process or webhelper exists.
+    client_ready = (state == 'running' and info.get('storage_verified') is True and
+                    info['web_ui_reachable'] and
+                    info['setup_required'] is False and info['steam_client_running'])
+    stream_ready = client_ready and info['sunshine_running'] and info['sunshine_api_reachable']
+    return {'ok': True, 'provider': 'steam', 'mode': 'native-client', 'diagnostics': info,
+            'status': state, 'stage': stage, 'image': image, 'games': games,
+            'installed_count': len(games), 'streaming': 'Steam Remote Play / Steam Link',
+            'steam_link_required': True, 'ready': bool(client_ready),
+            'streaming_ready': bool(stream_ready), 'steam_login': 'unverified',
+            'detail': detail}
+
+
+def configure_encoder(value, apply=False):
+    """Save without interrupting Steam, or explicitly recreate its container.
+
+    The recreation retains the four verified PCGA Steam bind mounts, and never
+    reads or resets Steam account passwords, games, or the SHUI auth database.
+    """
+    if value not in VALID_ENCODERS:
+        raise ValueError('Choose auto or software for the Steam encoder')
+    state, image = container_state()
+    if state in ('running', 'exited', 'created'):
+        verify_existing_container(image)
+    save_encoder(value)
+    if apply and state in ('running', 'exited', 'created'):
+        return repair()
+    return status()
+
+
+def start():
+    state, image = container_state()
+    if state == 'running':
+        return status()
+    if state not in ('not-installed', 'exited', 'created'):
+        raise RuntimeError('Unexpected Steam runtime state: ' + state)
+    if not shutil.which('docker'):
+        raise RuntimeError('Docker is required')
+    devices = device_nodes()
+    uid, gid, home, lib, persistent, journal = prepare_directories()
+    if state in ('exited', 'created'):
+        verify_existing_container(image)
+        # An explicit Start may safely rebuild a stopped owned container whose
+        # Docker environment differs; never leave the known-bad old encoder.
+        if container_encoder() != configured_encoder():
+            return repair()
+        p = execute(['docker', 'start', NAME], 50)
+        if p.returncode:
+            raise RuntimeError('Existing Steam runtime could not restart; use Repair Steam runtime: ' + p.stderr[-400:])
+    else:
+        cmd = launch_args(uid, gid, home, lib, persistent, journal, devices)
+        p = execute(cmd, 180)
+        if p.returncode:
+            raise RuntimeError('Steam container creation failed: ' + p.stderr[-600:])
+    current = status()
+    if current['status'] != 'running':
+        logs = execute(['docker', 'logs', '--tail', '25', NAME], 12)
+        raise RuntimeError('Steam container exited during initialization: ' + (logs.stderr or logs.stdout)[-450:])
+    return current
+
+
+def stop():
+    state, image = container_state()
+    if state == 'running':
+        verify_existing_container(image)
+        p = execute(['docker', 'stop', '-t', '30', NAME], 50)
+        if p.returncode:
+            raise RuntimeError('Steam runtime stop failed: ' + p.stderr[-500:])
+    return status()
+
+
+def repair():
+    """Recreate only the PCGA Steam container, never the profile or game files."""
+    state, image = container_state()
+    if state == 'not-installed':
+        return start()
+    if state not in ('running', 'exited', 'created'):
+        raise RuntimeError('Steam runtime cannot be repaired in state ' + state)
+    verify_existing_container(image)
+    # Validate prerequisites BEFORE destroying the old container.
+    device_nodes()
+    prepare_directories()
+    if state == 'running':
+        p = execute(['docker', 'stop', '-t', '30', NAME], 50)
+        if p.returncode:
+            raise RuntimeError('Could not stop Steam for repair: ' + p.stderr[-350:])
+    p = execute(['docker', 'rm', NAME], 30)
+    if p.returncode:
+        raise RuntimeError('Could not remove the old Steam container: ' + p.stderr[-350:])
+    return start()
+
+
+def reconcile_encoder():
+    """Non-disruptive upgrade migration for an existing decode-only GPU.
+
+    Does not restart Steam, rewrite runtime environment files, or touch auth.
+    The portal offers an explicit apply/recreation action when appropriate.
+    """
+    state, image = container_state()
+    if state == 'running' and not ENCODER_CONFIG.exists():
+        verify_existing_container(image)
+        if h264_encode_capability() is False:
+            save_encoder('software')
+    return status()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('command', choices=['status', 'start', 'stop', 'repair', 'configure', 'reconcile'])
+    parser.add_argument('--encoder', choices=sorted(VALID_ENCODERS))
+    parser.add_argument('--apply', action='store_true', help='Recreate owned Steam container after saving the encoder preference')
+    args = parser.parse_args()
+    try:
+        result = configure_encoder(args.encoder, args.apply) if args.command == 'configure' else {
+            'status': status, 'start': start, 'stop': stop, 'repair': repair,
+            'reconcile': reconcile_encoder}[args.command]()
+    except Exception as exc:
+        result = {'ok': False, 'error': type(exc).__name__, 'detail': str(exc)[:600]}
+    print(json.dumps(result))
+    if not result['ok']:
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,321 @@
+def _wolf_runtime_session_active() -> tuple[bool, str]:
+    """Return whether a PCGA game/setup or GameStream session is active.
+
+    Checking managed runtime containers first is stronger than relying only on
+    TCP state: Moonlight's media path is substantially UDP and a live game can
+    exist while no relevant TCP socket happens to be ESTABLISHED.
+    """
+    _prune_terminal_failed_managed_runtime_containers()
+    _prune_stopped_managed_runtime_containers()
+    ps = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True)
+    if ps.returncode == 0:
+        active_names = [name.strip() for name in ps.stdout.splitlines() if name.strip().startswith("PCGA-")]
+        if active_names:
+            return True, "managed runtime container active: " + ", ".join(active_names[:4])
+    if shutil.which("ss"):
+        ss = subprocess.run(["ss", "-Htn", "state", "established"], capture_output=True, text=True)
+        if ss.returncode == 0 and any(re.search(r":(47984|47989|48010)\b", line) for line in ss.stdout.splitlines()):
+            return True, "GameStream control session active"
+    return False, ""
+
+def _wolf_reconcile_batched_restart() -> bool:
+    """Restart Wolf at most once, and never while a PCGA session is active.
+
+    Pending work is persisted because the orchestrator is a periodic oneshot. If
+    a live game blocks this pass, a later timer invocation can perform the reload
+    even when no new Wolf TOML change occurs on that later pass.
+    """
+    global _WOLF_CONFIG_DIRTY, _WOLF_CHANGED_SET_IDS
+    pending = _wolf_pending_load() | _WOLF_CHANGED_SET_IDS
+    if not pending:
+        _WOLF_CONFIG_DIRTY = False
+        return True
+    active, reason = _wolf_runtime_session_active()
+    if active:
+        _wolf_pending_save(pending, reason="active-session")
+        log(f"Wolf reload deferred because {reason}")
+        for sid in sorted(pending):
+            if state_path(sid).exists():
+                state_update(sid, stream_state="pending-restart", stream_backend="wolf", stream_detail=f"Wolf app registered; reload deferred while {reason}")
+        return False
+    inspect = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", "wolf"], capture_output=True, text=True)
+    if inspect.stdout.strip() == "true":
+        log(f"Reloading Wolf once for {len(pending)} pending PC-game app profile(s)")
+        proc = subprocess.run(["docker", "restart", "wolf"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        log("Starting Wolf once to apply pending PC-game app profile changes")
+        proc = subprocess.run(["docker", "start", "wolf"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if proc.returncode != 0:
+        _wolf_pending_save(pending, reason="reload-failed")
+        log("Wolf batched reload failed; app profiles remain pending-restart")
+        for sid in sorted(pending):
+            if state_path(sid).exists():
+                state_update(sid, stream_state="pending-restart", stream_backend="wolf", stream_detail="Wolf app registered; batched reload failed")
+        return False
+    # Give supervisord/PulseAudio/Wolf time to settle before the orchestrator
+    # advertises profiles as ready. This avoids clients racing the restart.
+    time.sleep(2.0)
+
+    # Verify that the UUID-managed blocks survived the daemon reload.  A stale
+    # Wolf/Wolf-Den control-plane restart can rewrite config.toml from older API
+    # state after PCGA has just repaired it; v0.18.48 observed this with swfoc.
+    # Repair once in the same reconciliation pass instead of leaving the portal
+    # with a missing launch option until a later timer invocation.
+    def _missing_after_reload(ids: set[str]) -> list[str]:
+        try:
+            text = WOLF_CONFIG.read_text(encoding="utf-8")
+        except OSError:
+            return sorted(ids)
+        missing = []
+        for sid in sorted(ids):
+            st = load_json(state_path(sid))
+            if not st:
+                continue
+            setup_mode = st.get("status") == "setup-required" and bool(st.get("setup_runtime_image"))
+            ready_mode = st.get("status") == "ready" and bool(st.get("runtime_image"))
+            if not (setup_mode or ready_mode):
+                # A demoted title can legitimately be waiting for setup-source
+                # reconstruction.  It has no Wolf app to preserve yet.
+                continue
+            expected_titles = [str(x.get("title") or "") for x in wolf_launch_variant_apps(sid, st, setup_mode)]
+            begin = f"# BEGIN PCGA MANAGED APP {sid}"
+            end = f"# END PCGA MANAGED APP {sid}"
+            if begin not in text or end not in text or any(f'title = "{title}"' not in text for title in expected_titles if title):
+                missing.append(sid)
+        return missing
+
+    missing = _missing_after_reload(pending)
+    if missing:
+        log(f"Wolf reload dropped {len(missing)} managed PC-game app block(s); repairing once in-place")
+        for sid in missing:
+            st = load_json(state_path(sid))
+            if not st:
+                continue
+            game = load_json(SETS / f"{sid}.json") or {"title": st.get("title") or sid}
+            try:
+                wolf_sync(sid, game, st, force_retry=True)
+            except Exception as exc:
+                log(f"Wolf post-reload repair failed for {sid}: {type(exc).__name__}: {exc}")
+        proc2 = subprocess.run(["docker", "restart", "wolf"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if proc2.returncode != 0:
+            _wolf_pending_save(pending, reason="post-reload-repair-restart-failed")
+            return False
+        time.sleep(2.0)
+        still_missing = _missing_after_reload(pending)
+        if still_missing:
+            # v0.18.68 left the entire pending set armed when one Wolf app block
+            # was repeatedly rejected.  The periodic orchestrator therefore
+            # restarted Wolf twice every minute, interrupting Moonlight before
+            # otherwise healthy titles could launch.  Quarantine only the
+            # rejected title(s), promote every surviving app to ready, and
+            # clear the global reload queue.  A user-initiated Retry stream uses
+            # --force and gets one explicit retry without reviving the restart
+            # storm for the rest of the catalog.
+            rejected = set(still_missing)
+            accepted = set(pending) - rejected
+            for sid in sorted(accepted):
+                st = load_json(state_path(sid))
+                if not st:
+                    continue
+                setup_mode = st.get("status") == "setup-required" and bool(st.get("setup_runtime_image"))
+                if setup_mode:
+                    state_update(sid, stream_state="setup-ready", stream_backend="wolf", phase="interactive-setup-ready", stream_detail="Interactive installer is available through Wolf")
+                elif st.get("status") == "ready":
+                    state_update(sid, stream_state="ready", stream_backend="wolf", phase="stream-ready", stream_detail="Available to paired Moonlight clients through Wolf")
+            for sid in sorted(rejected):
+                if state_path(sid).exists():
+                    state_update(
+                        sid,
+                        stream_state="failed",
+                        stream_backend="wolf",
+                        wolf_registration_quarantined_v01869=True,
+                        wolf_registration_quarantine_reason="managed-app-block-dropped-after-two-reloads",
+                        wolf_registration_quarantined_at=now(),
+                        stream_detail="Wolf rejected this app registration after two reload attempts; automatic Wolf reloads are quarantined for this title. Use Retry stream to retry only this app.",
+                    )
+            _wolf_pending_save(set())
+            _WOLF_CONFIG_DIRTY = False
+            _WOLF_CHANGED_SET_IDS.clear()
+            log("Wolf rejected managed app block(s); quarantined without further automatic daemon reloads: " + ", ".join(still_missing[:6]))
+            return True
+
+    for sid in sorted(pending):
+        st = load_json(state_path(sid))
+        if not st:
+            continue
+        setup_mode = st.get("status") == "setup-required" and bool(st.get("setup_runtime_image"))
+        if setup_mode:
+            state_update(sid, stream_state="setup-ready", stream_backend="wolf", phase="interactive-setup-ready", stream_detail="Interactive installer is available through Wolf")
+        elif st.get("status") == "ready":
+            state_update(sid, stream_state="ready", stream_backend="wolf", phase="stream-ready", stream_detail="Available to paired Moonlight clients through Wolf")
+    _wolf_pending_save(set())
+    _WOLF_CONFIG_DIRTY = False
+    _WOLF_CHANGED_SET_IDS.clear()
+    return True
+
+def wolf_sync(set_id: str, game: dict, state: dict, *, force_retry: bool = False) -> dict:
+    global _WOLF_CONFIG_DIRTY, _WOLF_CHANGED_SET_IDS
+    setup_mode = state.get("status") == "setup-required" and bool(state.get("setup_runtime_image"))
+    if state.get("wolf_registration_quarantined_v01869") and not force_retry:
+        return state_update(
+            set_id,
+            stream_state="failed",
+            stream_backend="wolf",
+            stream_detail="Wolf rejected this app registration after two reload attempts; automatic daemon reloads are quarantined for this title. Use Retry stream to try this title again without disrupting other games.",
+        )
+    if force_retry and state.get("wolf_registration_quarantined_v01869"):
+        state = state_update(
+            set_id,
+            wolf_registration_quarantined_v01869=False,
+            wolf_registration_quarantine_reason=None,
+            wolf_registration_quarantined_at=None,
+            stream_state="pending",
+            stream_backend="wolf",
+            stream_detail="Explicit Wolf registration retry requested",
+        )
+        setup_mode = state.get("status") == "setup-required" and bool(state.get("setup_runtime_image"))
+    if not setup_mode and (state.get("status") != "ready" or not state.get("runtime_image")):
+        return state
+    if not WOLF_CONFIG.exists():
+        return state_update(set_id, stream_state="unavailable", stream_backend="wolf", stream_detail="Wolf config is not present on this host")
+    lock_path=Path("/run/pcga-game-stack-start.lock")
+    lock_path.parent.mkdir(parents=True,exist_ok=True)
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
+        original = WOLF_CONFIG.read_text(encoding="utf-8")
+        desired=managed_app_block(set_id,game,state).strip()+"\n"
+        managed_rx=re.compile(rf"(?ms)^# BEGIN PCGA MANAGED APP {re.escape(set_id)}\n.*?^# END PCGA MANAGED APP {re.escape(set_id)}\n?")
+        app_rx=re.compile(r"(?ms)^\s*\[\[profiles\.apps\]\]\s*$.*?(?=^\s*\[\[profiles\.apps\]\]\s*$|^\s*\[\[profiles\]\]\s*$|\Z)")
+
+        # Reconcile the canonical managed block in place. Pre-v0.18.16 releases
+        # removed and re-appended every managed block on each pass. That changed
+        # ordering transiently, falsely marked Wolf dirty, and could leave games
+        # pending-restart whenever a runtime container happened to be active.
+        text=original
+        canonical=managed_rx.search(text)
+        canonical_span=canonical.span() if canonical else None
+
+        # Remove only unmarked legacy app tables for this set id. Any app table
+        # whose start lies inside the canonical BEGIN/END block is the canonical
+        # table and must be preserved.
+        removals=[]
+        for match in app_rx.finditer(text):
+            if canonical_span and canonical_span[0] <= match.start() < canonical_span[1]:
+                continue
+            block=match.group(0)
+            if re.search(rf"PCGA_GAME_SET_ID={re.escape(set_id)}(?:['\"]|\s|$)", block):
+                removals.append(match.span())
+        for a,b in reversed(removals):
+            text=text[:a]+text[b:]
+
+        canonical=managed_rx.search(text)
+        if canonical:
+            current=canonical.group(0).strip()+"\n"
+            if current.strip()!=desired.strip():
+                text=text[:canonical.start()]+desired+text[canonical.end():]
+        else:
+            profile_rx = re.compile(r"(?m)^\[\[profiles\]\]\s*$")
+            starts = [m.start() for m in profile_rx.finditer(text)]
+            insert_at = None
+            for i, profile_start in enumerate(starts):
+                section_end = starts[i+1] if i+1 < len(starts) else len(text)
+                section = text[profile_start:section_end]
+                if re.search(r"(?m)^\s*id\s*=\s*['\"]moonlight-profile-id['\"]\s*$", section):
+                    insert_at = section_end
+                    break
+            if insert_at is None:
+                return state_update(set_id, stream_state="pending", stream_backend="wolf", stream_detail="Wolf moonlight-profile-id profile is missing")
+            text=text[:insert_at]+"\n"+desired+"\n"+text[insert_at:]
+
+        changed = text.strip() != original.strip()
+        if changed:
+            backup = WOLF_CONFIG.with_suffix(".toml.pcga-backup")
+            if not backup.exists(): shutil.copy2(WOLF_CONFIG, backup)
+            tmp = WOLF_CONFIG.with_suffix(".toml.pcga-tmp")
+            tmp.write_text(text, encoding="utf-8")
+            try:
+                import tomllib
+                with tmp.open("rb") as fh: tomllib.load(fh)
+            except Exception as exc:
+                tmp.unlink(missing_ok=True)
+                return state_update(set_id, stream_state="failed", stream_backend="wolf", stream_detail=f"Generated Wolf TOML was rejected: {type(exc).__name__}")
+            os.replace(tmp, WOLF_CONFIG)
+            _wolf_request_reload(set_id)
+        app_title = wolf_internal_app_title(set_id, setup_mode)
+        variant_apps = {str(x.get("key")): str(x.get("title")) for x in wolf_launch_variant_apps(set_id, state, setup_mode) if x.get("key") and x.get("title")} if not setup_mode else {}
+        display_title = str(game.get("title") or state.get("title") or "PC Game")
+        desired_state = "setup-ready" if setup_mode else "ready"
+        detail_text = "Interactive installer is available to paired Moonlight clients through Wolf" if setup_mode else "Available to paired Moonlight clients through Wolf"
+        if not changed and state.get("stream_state") == desired_state:
+            return state_update(set_id, stream_state=desired_state, stream_backend="wolf", stream_app_title=app_title, stream_variant_apps=variant_apps, stream_display_title=display_title, stream_detail=detail_text)
+        # A profile can already be on disk from an earlier pass but still be
+        # waiting for a safe Wolf reload. Keep it in this invocation's batch.
+        if state.get("stream_state") == "pending-restart":
+            _wolf_request_reload(set_id)
+        return state_update(set_id, stream_state="pending-restart", stream_backend="wolf", stream_app_title=app_title, stream_variant_apps=variant_apps, stream_display_title=display_title, stream_detail="Wolf app registered; one batched reload will occur after PC-game reconciliation")
+
+def _wolf_reconcile_all_launchable_apps() -> int:
+    """Ensure every canonical launchable state owns a current Wolf app block.
+
+    Source reconciliation can legitimately omit a previously-installed game when
+    its preserved media ownership has already moved to another canonical record.
+    A schema migration of Wolf identifiers must nevertheless update that game's
+    app block.  Walking the launchable state registry here keeps Wolf's catalog
+    complete and makes UUID-derived runtime identifiers self-healing even when no
+    intake source needs work during this invocation.
+    """
+    repaired = 0
+    for path in sorted(STATE_ROOT.glob("*.json")):
+        sid = path.stem
+        state = load_json(path)
+        if not state:
+            continue
+        game = load_json(SETS / f"{sid}.json")
+        if game.get("catalog_hidden") or game.get("superseded_by"):
+            continue
+        if state.get("catalog_hidden") or state.get("duplicate_of"):
+            if not game:
+                continue
+            # A visible canonical set with stale state visibility is recoverable.
+            # Clear it here as a second line of defense so Wolf registration and
+            # the portal cannot disagree about whether the title exists.
+            state = state_update(sid, catalog_hidden=False, duplicate_of=None)
+        status = str(state.get("status") or "")
+        if state.get("wolf_registration_quarantined_v01869"):
+            # A title that Wolf itself removed after two immediate repair
+            # restarts must not be reinserted by the periodic full-catalog
+            # repair pass.  Only an explicit user retry clears quarantine.
+            continue
+        setup_mode = status == "setup-required" and bool(state.get("setup_runtime_image"))
+        ready_mode = status == "ready" and bool(state.get("runtime_image"))
+        if not (setup_mode or ready_mode):
+            continue
+        if ready_mode and not state.get("launch_variant_detection_v01871"):
+            try:
+                state = build_runtime_image(sid, game or {"title": state.get("title") or sid}, state)
+            except Exception as exc:
+                state_update(sid, stream_state="failed", stream_backend="wolf", stream_detail=f"Launch-variant migration failed: {type(exc).__name__}: {str(exc)[:180]}")
+                continue
+        expected_titles = [str(x.get("title") or "") for x in wolf_launch_variant_apps(sid, state, setup_mode)]
+        before = ""
+        if WOLF_CONFIG.exists():
+            try:
+                before = WOLF_CONFIG.read_text(encoding="utf-8")
+            except OSError:
+                before = ""
+        begin = f"# BEGIN PCGA MANAGED APP {sid}"
+        had_current = begin in before and all(f'title = "{title}"' in before for title in expected_titles if title)
+        try:
+            wolf_sync(sid, game or {"title": state.get("title") or sid}, state)
+        except Exception as exc:
+            state_update(
+                sid,
+                stream_state="failed",
+                stream_backend="wolf",
+                stream_detail=f"Wolf catalog reconciliation failed: {type(exc).__name__}: {str(exc)[:220]}",
+            )
+            continue
+        if not had_current:
+            repaired += 1
+            log(f"repaired missing/stale Wolf registration for {state.get('title') or game.get('title') or sid}")
+    return repaired

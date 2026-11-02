@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""Index Heroic-installed games and publish them as Wolf/Moonlight PCGA apps."""
+from __future__ import annotations
+import argparse, hashlib, json, os, re, shutil, subprocess, tempfile, time
+from pathlib import Path
+
+VERSION="0.19.0"
+HEROIC_VERSION="2.22.3"
+IMAGE=f"pcga/heroic-runtime:{HEROIC_VERSION}"
+ROOT_FILE=Path('/etc/pc-game-archive/archive-root')
+STATE=Path('/var/lib/pc-game-archive/heroic')
+CATALOG=STATE/'catalog.json'
+STATUS=STATE/'status.json'
+WOLF_CONFIG=Path('/etc/wolf/cfg/config.toml')
+BEGIN='# BEGIN PCGA HEROIC MANAGED APPS'
+END='# END PCGA HEROIC MANAGED APPS'
+LAUNCHER_SID='heroic-library-manager'
+LAUNCHER_TITLE='PCGA Heroic Library'
+
+
+def run(cmd, timeout=30):
+    return subprocess.run(cmd,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+
+def root() -> Path:
+    p=Path(ROOT_FILE.read_text().strip())
+    if not p.is_absolute(): raise RuntimeError('invalid archive root')
+    return p
+
+def atomic_json(path:Path,obj):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    fd,name=tempfile.mkstemp(prefix=path.name+'.',dir=path.parent)
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as f: json.dump(obj,f,indent=2,sort_keys=True); f.write('\n')
+        os.chmod(name,0o644); os.replace(name,path)
+    finally:
+        try: os.unlink(name)
+        except FileNotFoundError: pass
+
+def slug_sid(runner:str,app:str)->str:
+    return 'heroic-'+hashlib.sha256((runner+'\0'+app).encode()).hexdigest()[:24]
+
+def norm_runner(value, source=''):
+    text=(str(value or '')+' '+str(source or '')).casefold()
+    if 'legendary' in text or 'epic' in text: return 'legendary'
+    if 'nile' in text or 'amazon' in text: return 'nile'
+    if 'sideload' in text: return 'sideload'
+    if 'zoom' in text: return 'zoom'
+    if 'gog' in text: return 'gog'
+    return ''
+
+def pick(d,*keys):
+    for k in keys:
+        v=d.get(k) if isinstance(d,dict) else None
+        if v not in (None,'',[],{}): return v
+    return None
+
+def host_install_path(value:str, archive:Path)->Path|None:
+    if not value: return None
+    s=str(value)
+    prefix='/home/retro/Games/Heroic'
+    if s==prefix or s.startswith(prefix+'/'):
+        return archive/'games/heroic/library'/s[len(prefix):].lstrip('/')
+    p=Path(s)
+    return p if p.is_absolute() else None
+
+def record_from(node:dict, *, app_hint='', runner_hint='', source='', archive:Path):
+    if not isinstance(node,dict): return None
+    app=str(pick(node,'app_name','appName','appNameId','id','game_id','gameId','product_id','productId') or app_hint or '').strip()
+    title=str(pick(node,'title','name','game_title','gameTitle','product_name','productName') or '').strip()
+    path=str(pick(node,'install_path','installPath','install_dir','installDir','path','folder','folder_name') or '').strip()
+    executable=str(pick(node,'executable','exe','launch_executable','launchExecutable') or '').strip()
+    runner=norm_runner(pick(node,'runner','store','source','provider'),runner_hint+' '+source)
+    installed=pick(node,'is_installed','isInstalled','installed')
+    if isinstance(installed,str): installed=installed.casefold() in {'1','true','yes','installed'}
+    host=host_install_path(path,archive)
+    exists=bool(host and host.exists())
+    if installed is False: return None
+    if not app or not runner: return None
+    # Require actual installed content, or an explicit installed marker plus an executable/path.
+    if not exists and not (installed is True and (path or executable)): return None
+    if not title:
+        title=(host.name if host else '') or app
+    return {'runner':runner,'app_name':app,'title':title,'install_path':path or None,'host_install_path':str(host) if host else None,'executable':executable or None,'source_file':source}
+
+def walk_json(obj, *, source, runner_hint, archive, out, app_hint=''):
+    if isinstance(obj,dict):
+        rec=record_from(obj,app_hint=app_hint,runner_hint=runner_hint,source=source,archive=archive)
+        if rec: out.append(rec)
+        for k,v in obj.items():
+            walk_json(v,source=source,runner_hint=runner_hint,archive=archive,out=out,app_hint=str(k) if isinstance(v,dict) else '')
+    elif isinstance(obj,list):
+        for v in obj: walk_json(v,source=source,runner_hint=runner_hint,archive=archive,out=out,app_hint='')
+
+def discover(config:Path, archive:Path):
+    rows=[]
+    if config.exists():
+        files=[]
+        for p in config.rglob('*.json'):
+            try:
+                if len(p.relative_to(config).parts)>6 or p.stat().st_size>16*1024*1024: continue
+            except OSError: continue
+            files.append(p)
+        # Known installed registries first; later heuristic files only fill gaps.
+        files.sort(key=lambda p:(0 if p.name.casefold()=='installed.json' else 1,len(p.parts),str(p)))
+        for p in files[:800]:
+            try: obj=json.loads(p.read_text(encoding='utf-8',errors='replace'))
+            except Exception: continue
+            rel=str(p.relative_to(config))
+            walk_json(obj,source=rel,runner_hint=rel,archive=archive,out=rows)
+    dedup={}
+    for row in rows:
+        key=(row['runner'],row['app_name'])
+        score=(1 if row.get('host_install_path') and Path(row['host_install_path']).exists() else 0)+(1 if row.get('executable') else 0)+(1 if row.get('title') and row['title']!=row['app_name'] else 0)
+        old=dedup.get(key)
+        if old is None or score>old[0]: dedup[key]=(score,row)
+    result=[]
+    for _,row in dedup.values():
+        sid=slug_sid(row['runner'],row['app_name']); token=sid.split('-',1)[1][:12]
+        row.update({
+            'id':'pcga:'+sid,'pcga_set_id':sid,'stream_id':'pcga:'+sid,'source':'heroic','source_label':'Heroic',
+            'title':row['title'],'heroic_runner':row['runner'],'heroic_app_name':row['app_name'],
+            'install_status':'ready','stream_state':'ready','status':'ready','playable':True,'launchable':True,
+            'setup_required':False,'stream_app_title':'PCGA Heroic '+token,
+            'description':f"Installed through Heroic ({row['runner']}). PCGA streams this game through Wolf/Moonlight.",
+        })
+        result.append(row)
+    result.sort(key=lambda x:x['title'].casefold())
+    return result
+
+def tq(s): return json.dumps(str(s))
+def app_block(title,name,mode,archive,sid,app_name='',runner=''):
+    mounts=[
+      f"{archive}/games/heroic/config:/home/retro/.config/heroic:rw",
+      f"{archive}/games/heroic/library:/home/retro/Games/Heroic:rw",
+      f"{archive}/games/heroic/cache:/home/retro/.cache/heroic:rw",
+    ]
+    env=[
+      'RUN_SWAY=1','RUN_GAMESCOPE=','WAYBAR_HIDDEN=1','GOW_REQUIRED_DEVICES=/dev/input/event* /dev/dri/* /dev/snd/* /dev/nvidia*',
+      'PCGA_LAN_NETWORK=legacy-games','PCGA_GAME_SET_ID='+sid,'PCGA_HEROIC_MODE='+mode,
+    ]
+    if app_name: env.append('PCGA_HEROIC_APP_NAME='+app_name)
+    if runner: env.append('PCGA_HEROIC_RUNNER='+runner)
+    host={"IpcMode":"host","NetworkMode":"legacy-games","AutoRemove":True,"CapAdd":["SYS_ADMIN","SYS_NICE","SYS_PTRACE","NET_RAW","MKNOD","NET_ADMIN"],"SecurityOpt":["seccomp=unconfined","apparmor=unconfined"],"Ulimits":[{"Name":"nofile","Hard":524288,"Soft":524288}],"Privileged":False,"DeviceCgroupRules":["c 13:* rmw","c 244:* rmw"]}
+    env_t='[\n            '+',\n            '.join(tq(x) for x in env)+'\n        ]'
+    return f'''    [[profiles.apps]]
+    title = {tq(title)}
+    icon_png_path = "https://heroicgameslauncher.com/img/logo.png"
+    start_virtual_compositor = true
+    start_audio_server = true
+
+        [profiles.apps.runner]
+        type = "docker"
+        name = {tq(name)}
+        image = {tq(IMAGE)}
+        mounts = [{', '.join(tq(x) for x in mounts)}]
+        env = {env_t}
+        devices = []
+        ports = []
+        base_create_json = {tq(json.dumps({'HostConfig':host},separators=(',',':')))}
+'''
+
+def runtime_active():
+    p=run(['docker','ps','--format','{{.Image}}\t{{.Names}}'],15)
+    if p.returncode: return False
+    for line in p.stdout.splitlines():
+        image,name=(line.split('\t',1)+[''])[:2] if '\t' in line else (line,'')
+        if image.startswith(('pcga/game-','pcga/setup-','pcga/heroic-runtime:')) or name.startswith(('PCGA-','PCGA-Heroic-')): return True
+    return False
+
+def reconcile_wolf(items,archive):
+    if not WOLF_CONFIG.exists(): return {'changed':False,'restarted':False,'detail':'Wolf config is not present yet'}
+    image_ready=run(['docker','image','inspect',IMAGE],20).returncode==0
+    blocks=[]
+    if image_ready:
+        blocks.append(app_block(LAUNCHER_TITLE,'PCGA-Heroic-Library','launcher',archive,LAUNCHER_SID))
+        for x in items:
+            token=x['pcga_set_id'].split('-',1)[1][:12]
+            blocks.append(app_block(x['stream_app_title'],'PCGA-Heroic-'+token,'game',archive,x['pcga_set_id'],x['heroic_app_name'],x['heroic_runner']))
+    managed=BEGIN+'\n'+('\n'.join(blocks) if blocks else '')+END+'\n'
+    original=WOLF_CONFIG.read_text(encoding='utf-8')
+    rx=re.compile(r'(?ms)^'+re.escape(BEGIN)+r'\n.*?^'+re.escape(END)+r'\n?')
+    if rx.search(original):
+        updated=rx.sub(managed,original,count=1)
+    else:
+        # Publish into PCGA's Moonlight profile, not merely at EOF: Wolf may
+        # contain more than one [[profiles]] entry and nested app arrays belong
+        # to the profile section in which they are declared.
+        profile_rx=re.compile(r'(?m)^\[\[profiles\]\]\s*$')
+        starts=[m.start() for m in profile_rx.finditer(original)]
+        insert_at=None
+        for i,start in enumerate(starts):
+            end=starts[i+1] if i+1<len(starts) else len(original)
+            section=original[start:end]
+            if re.search(r'(?m)^\s*id\s*=\s*[\"\']moonlight-profile-id[\"\']\s*$',section):
+                insert_at=end; break
+        if insert_at is None:
+            raise RuntimeError('Wolf moonlight-profile-id profile is missing')
+        updated=original[:insert_at].rstrip()+'\n\n'+managed+'\n'+original[insert_at:].lstrip('\n')
+    if updated==original: return {'changed':False,'restarted':False,'detail':'Wolf Heroic applications are current'}
+    # Validate TOML before replacing the authoritative Wolf config.
+    try:
+        import tomllib; tomllib.loads(updated)
+    except Exception as exc: raise RuntimeError(f'generated Wolf TOML is invalid: {exc}')
+    backup=WOLF_CONFIG.with_suffix('.toml.pre-heroic')
+    if not backup.exists(): shutil.copy2(WOLF_CONFIG,backup)
+    tmp=WOLF_CONFIG.with_suffix('.toml.heroic.tmp'); tmp.write_text(updated); os.replace(tmp,WOLF_CONFIG)
+    if runtime_active():
+        atomic_json(STATE/'wolf-reload-pending.json',{'schema':1,'reason':'heroic-catalog-changed','updated_at':time.time()})
+        return {'changed':True,'restarted':False,'pending':True,'detail':'Heroic catalog updated; Wolf reload deferred until active game sessions finish'}
+    p=run(['docker','restart','wolf'],90)
+    restarted=p.returncode==0
+    if restarted:
+        (STATE/'wolf-reload-pending.json').unlink(missing_ok=True)
+        bootstrap=Path('/usr/local/sbin/pcga-moonlight-web-bootstrap')
+        if bootstrap.exists(): run([str(bootstrap)],180)
+    return {'changed':True,'restarted':restarted,'detail':'Heroic Wolf applications published' if restarted else ('Wolf config updated; restart failed: '+(p.stderr or p.stdout)[-500:])}
+
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument('--reconcile-wolf',action='store_true'); args=ap.parse_args()
+    STATE.mkdir(parents=True,exist_ok=True)
+    archive=root(); config=archive/'games/heroic/config'
+    for p in (config,archive/'games/heroic/library',archive/'games/heroic/cache'): p.mkdir(parents=True,exist_ok=True)
+    items=discover(config,archive)
+    image_ready=run(['docker','image','inspect',IMAGE],20).returncode==0
+    catalog={'schema':1,'version':VERSION,'heroic_version':HEROIC_VERSION,'generated_at':time.time(),'image':IMAGE,'image_ready':image_ready,'launcher':{'id':'pcga:'+LAUNCHER_SID,'pcga_set_id':LAUNCHER_SID,'stream_app_title':LAUNCHER_TITLE,'available':image_ready},'items':items,'count':len(items)}
+    atomic_json(CATALOG,catalog)
+    result={'changed':False,'restarted':False}
+    if args.reconcile_wolf: result=reconcile_wolf(items,archive)
+    status={"schema":1,"heroic_version":HEROIC_VERSION,"image":IMAGE,"state":"ready" if image_ready else "not-installed","detail":result.get('detail') or ("Heroic runtime is ready" if image_ready else "Heroic runtime has not been prepared yet"),"catalog_count":len(items),"wolf":result,"updated_at":time.time()}
+    atomic_json(STATUS,status)
+    print(json.dumps({'ok':True,'catalog_count':len(items),'image_ready':image_ready,'wolf':result},separators=(',',':')))
+if __name__=='__main__': main()

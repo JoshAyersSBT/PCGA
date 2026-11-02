@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Verified, opt-in NAS tier for *published* PCGA low-loss original masters.
+
+Only the ORIGINAL master is transferred; the Jellyfin playable file is never
+removed.  A NAS copy is SHA-256 verified before local storage is reclaimed.
+Restores verify SHA-256 before atomically installing the local master. The remote
+copy remains after restore for redundancy. Designed to fail closed.
+"""
+from __future__ import annotations
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+
+ROOT_FILE = Path('/etc/pc-game-archive/archive-root')
+CONFIG = Path('/etc/pc-game-archive/appliance.json')
+NAS_MOUNT = Path('/mnt/pcga-nas')
+NAS_LOCK = Path('/run/pcga-nas-storage.lock')
+JOB_DIR = Path('/var/lib/pc-game-archive/low-loss-tier-jobs')
+LIBRARIES = {'movies', 'tv', 'home-videos'}
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def read_json(path):
+    if path.is_symlink() or not path.is_file(): fail('missing or unsafe manifest: ' + str(path))
+    obj = json.loads(path.read_text(encoding='utf-8'))
+    if not isinstance(obj, dict): fail('manifest must be an object')
+    return obj
+
+
+def atomic_json(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink(): fail('refusing symlink record')
+    tmp = path.with_name(path.name + '.tmp.' + uuid.uuid4().hex)
+    try:
+        with open(tmp, 'x', encoding='utf-8') as f:
+            json.dump(obj, f, indent=2, sort_keys=True)
+            f.write('\n'); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, path)
+        sync_dir(path.parent)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def sync_dir(path):
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+        try: os.fsync(fd)
+        finally: os.close(fd)
+    except OSError:
+        # Some SMB mounts refuse directory fsync. Data file itself was synced.
+        pass
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(4 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def regular(path):
+    if path.is_symlink(): fail('symlink refused: ' + str(path))
+    st = path.stat()
+    if not stat.S_ISREG(st.st_mode): fail('expected a regular file')
+    return st
+
+
+def safe_path(path, boundary):
+    p = path
+    while p != boundary and p != p.parent:
+        if p.is_symlink(): fail('symlink path refused')
+        p = p.parent
+    if boundary.is_symlink(): fail('symlink storage boundary refused')
+    if not path.resolve(strict=False).is_relative_to(boundary.resolve(strict=False)):
+        fail('path escapes managed storage')
+
+
+def relative(value):
+    p = Path(str(value))
+    if (not p.parts or p.is_absolute() or '..' in p.parts or '\\' in str(value)
+            or p.parts[0] not in LIBRARIES or p.suffix.lower() != '.mkv'):
+        fail('expected a managed movies/tv/home-videos relative MKV path')
+    return p
+
+
+def root_path():
+    path = Path(ROOT_FILE.read_text(encoding='utf-8').strip()).resolve(strict=True)
+    if not path.is_dir(): fail('invalid PCGA archive root')
+    return path
+
+
+def paths(root, rel):
+    rel = relative(rel)
+    base = root / 'media'
+    out = (base/'library'/rel,
+           base/'cold-archive/low-loss-masters'/rel,
+           base/'low-loss/records'/(str(rel)+'.json'),
+           base/'low-loss/tier-records'/(str(rel)+'.json'))
+    for path, boundary in zip(out, (base/'library', base/'cold-archive', base/'low-loss', base/'low-loss')):
+        safe_path(path, boundary)
+    return out
+
+
+def mount_details():
+    config = read_json(CONFIG).get('nas') or {}
+    if not isinstance(config, dict) or not config.get('enabled'):
+        fail('configure and enable PCGA NAS storage first')
+    if config.get('mode','mirror') != 'mirror':
+        fail('select NAS Mirror mode to keep optimized Jellyfin copies local; NAS Smart offload can remove playable copies')
+    base = str(config.get('base_dir') or 'PCGA').strip().strip('/')
+    import re
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._ -]{0,79}', base): fail('invalid NAS base directory')
+    if not NAS_MOUNT.is_dir() or NAS_MOUNT.is_symlink(): fail('NAS mount directory unavailable')
+    point = subprocess.run(['mountpoint', '-q', str(NAS_MOUNT)], capture_output=True, timeout=10)
+    if point.returncode: fail('NAS is not mounted; refusing local fallback')
+    info = subprocess.run(['findmnt', '-n', '-o', 'SOURCE,FSTYPE', '--mountpoint', str(NAS_MOUNT)],
+                          capture_output=True, text=True, timeout=10)
+    if info.returncode or not info.stdout.strip(): fail('cannot identify NAS mount')
+    source, fs = info.stdout.strip().rsplit(None, 1)
+    expect = 'cifs' if config.get('protocol', 'smb') == 'smb' else 'nfs'
+    if not (fs == expect or (expect == 'nfs' and fs in {'nfs4'})):
+        fail('NAS mount type does not match configuration: '+fs)
+    ident = {'protocol':str(config.get('protocol') or 'smb'),
+             'host':str(config.get('host') or ''), 'share':str(config.get('share') or ''),
+             'base_dir':base, 'mount_source':source}
+    if not ident['host'] or not ident['share']: fail('NAS endpoint not configured')
+    if ident['protocol']=='smb':
+        expected='//'+ident['host']+'/'+ident['share'].strip('/')
+    else:
+        expected=ident['host']+':'+(ident['share'] if ident['share'].startswith('/') else '/'+ident['share'])
+    if source != expected:
+        fail('mounted NAS endpoint differs from configured NAS; refusing cross-server transfer')
+    destination = NAS_MOUNT / base / 'media/cold-archive/low-loss-masters'
+    safe_path(destination, NAS_MOUNT)
+    return destination, ident
+
+
+def file_record(root, rel):
+    live, master, conversion, tier_path = paths(root, rel)
+    meta = read_json(conversion)
+    if meta.get('schema') != 1 or meta.get('source') != str(rel) or meta.get('state') != 'published':
+        fail('master must belong to a published verified low-loss conversion')
+    for k in ('source_sha256','encoded_sha256'):
+        if not isinstance(meta.get(k), str) or len(meta[k]) != 64: fail('invalid checksum manifest')
+    if digest(live) != meta['encoded_sha256']:
+        fail('Jellyfin playable copy differs from conversion manifest; refusing tiering')
+    return live, master, meta, tier_path
+
+
+def remote_path(remote_base, rel):
+    dest = remote_base / relative(rel)
+    safe_path(dest, NAS_MOUNT)
+    return dest
+
+
+def same_endpoint(record, endpoint):
+    if record.get('endpoint') != endpoint:
+        fail('NAS target changed since transfer; reconnect the original NAS to restore')
+
+
+def nas_lock():
+    # Coordinate with pcga-nas-storage mount/reconcile/unmount/sync operations.
+    NAS_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    f = NAS_LOCK.open('a+')
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+def lock(root):
+    path = root/'media/cold-archive/.pcga-media-storage.lock'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = path.open('a+')
+    fcntl.flock(f, fcntl.LOCK_EX)
+    return f
+
+
+def copy_verified(source, target, expected_digest, expected_bytes):
+    safe_path(target, NAS_MOUNT)
+    if target.exists() or target.is_symlink(): fail('target already exists; refusing overwrite')
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + '.partial.' + uuid.uuid4().hex)
+    try:
+        with source.open('rb') as inp, tmp.open('xb') as out:
+            shutil.copyfileobj(inp, out, 4 << 20)
+            out.flush(); os.fsync(out.fileno())
+        if tmp.stat().st_size != expected_bytes or digest(tmp) != expected_digest:
+            fail('copy checksum or byte count mismatch')
+        # No collision / changes to a remote archived master permitted.
+        if target.exists() or target.is_symlink(): fail('target occupied during transfer')
+        os.replace(tmp, target)
+        sync_dir(target.parent)
+        if regular(target).st_size != expected_bytes or digest(target) != expected_digest:
+            fail('completed copy failed independent verification')
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def offload(root, source):
+    rel = relative(source)
+    with lock(root), nas_lock():
+        remote_base, endpoint = mount_details()
+        remote = remote_path(remote_base, rel)
+        _, local, meta, tier = file_record(root, rel)
+        source_bytes = int(meta['source_bytes']); source_hash = meta['source_sha256']
+        if tier.exists():
+            old = read_json(tier); same_endpoint(old, endpoint)
+            if old.get('sha256') != source_hash: fail('record/master checksum conflict')
+            if old.get('remote_relpath') != str(remote.relative_to(NAS_MOUNT)):
+                fail('tier record destination path changed')
+        else: old = {}
+        if remote.exists():
+            if regular(remote).st_size != source_bytes or digest(remote) != source_hash:
+                fail('NAS destination exists with different content; never overwrite')
+        else:
+            if not local.exists(): fail('no local source or verified NAS master; cannot offload')
+            if regular(local).st_size != source_bytes or digest(local) != source_hash:
+                fail('local master failed checksum verification')
+            if shutil.disk_usage(NAS_MOUNT).free < source_bytes + (64 << 20):
+                fail('insufficient NAS space for the original master')
+            remote.parent.mkdir(parents=True, exist_ok=True)
+            copy_verified(local, remote, source_hash, source_bytes)
+        if not tier.exists() or old.get('state') not in {'verified_remote','offloaded','restored'}:
+            old = {'schema':1, 'source':str(rel), 'sha256':source_hash,'bytes':source_bytes,
+                   'endpoint':endpoint,'remote_relpath':str(remote.relative_to(NAS_MOUNT)),
+                   'verified_at':time.time(),'state':'verified_remote'}
+            atomic_json(tier, old)
+        removed_local = local.exists()
+        if removed_local:
+            if regular(local).st_size != source_bytes or digest(local) != source_hash:
+                fail('master changed before local offload')
+            # Confirm the managed NAS was not detached or remounted during this copy.
+            _, still_endpoint = mount_details()
+            if still_endpoint != endpoint: fail('NAS endpoint changed during offload; local master retained')
+            # Confirm remote still exists with the right bytes before reclaiming local space.
+            if regular(remote).st_size != source_bytes or digest(remote) != source_hash:
+                fail('NAS master no longer verified; local master retained')
+            local.unlink()
+            sync_dir(local.parent)
+        old.update(state='offloaded',offloaded_at=time.time())
+        atomic_json(tier, old)
+        return {'ok':True,'operation':'offload','source':str(rel),'state':'offloaded',
+                'reclaimed_bytes':source_bytes if removed_local else 0,'remote':str(remote.relative_to(NAS_MOUNT)),
+                'detail':'NAS master verified; local original offloaded. Jellyfin copy remains playable.'}
+
+
+def restore(root, source):
+    rel = relative(source)
+    with lock(root), nas_lock():
+        remote_base, endpoint = mount_details()
+        remote = remote_path(remote_base, rel)
+        _, local, meta, tier = file_record(root, rel)
+        old = read_json(tier)
+        same_endpoint(old, endpoint)
+        if old.get('source') != str(rel) or old.get('sha256') != meta['source_sha256']:
+            fail('tier manifest does not match original master')
+        if str(remote.relative_to(NAS_MOUNT)) != old.get('remote_relpath'):
+            fail('NAS relative path mismatch')
+        if regular(remote).st_size != int(meta['source_bytes']) or digest(remote) != meta['source_sha256']:
+            fail('NAS master does not match original checksum')
+        if local.exists():
+            if regular(local).st_size != int(meta['source_bytes']) or digest(local) != meta['source_sha256']:
+                fail('local master exists but does not match original; refusing overwrite')
+        else:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            if shutil.disk_usage(local.parent).free < int(meta['source_bytes']) + (64 << 20):
+                fail('not enough local free space to restore the original')
+            # Copy to a temporary file on the local master filesystem; swap only after verification.
+            tmp = local.with_name(local.name + '.partial.' + uuid.uuid4().hex)
+            try:
+                with remote.open('rb') as inp, tmp.open('xb') as out:
+                    shutil.copyfileobj(inp, out, 4 << 20)
+                    out.flush(); os.fsync(out.fileno())
+                if tmp.stat().st_size != int(meta['source_bytes']) or digest(tmp) != meta['source_sha256']:
+                    fail('restored master verification failed')
+                if local.exists() or local.is_symlink(): fail('local master occupied during restore')
+                os.replace(tmp, local)
+                sync_dir(local.parent)
+            finally:
+                tmp.unlink(missing_ok=True)
+        old.update(state='restored',restored_at=time.time())
+        atomic_json(tier, old)
+        return {'ok':True,'operation':'restore','source':str(rel),'state':'restored',
+                'detail':'Original restored locally and SHA-256 verified. NAS copy retained.'}
+
+
+def inventory(root):
+    items=[]; jobs=[]
+    records=root/'media/low-loss/records'
+    remote_ready=False; remote_error=''
+    try: _,_=mount_details(); remote_ready=True
+    except Exception as exc: remote_error=str(exc)
+    for p in sorted(records.rglob('*.mkv.json'))[:500] if records.exists() else []:
+        try:
+            if p.is_symlink(): continue
+            meta=read_json(p); rel=relative(meta.get('source', ''))
+            _, master, _, tier=paths(root, rel)
+            if meta.get('state')!='published' or not p.samefile(paths(root,rel)[2]):continue
+            status='local'
+            if tier.exists():
+                rec=read_json(tier)
+                status='local_and_nas' if master.exists() else 'nas_only'
+                if rec.get('sha256')!=meta.get('source_sha256'):status='error'
+                elif remote_ready and status=='nas_only':
+                    try:
+                        remote_root,ep=mount_details()
+                        if ep!=rec.get('endpoint') or not remote_path(remote_root, rel).is_file():
+                            status='remote_missing'
+                    except (OSError,ValueError): status='remote_missing'
+            elif not master.exists(): status='missing_master'
+            items.append({'source':str(rel),'bytes':meta.get('source_bytes'),
+                          'tier_state':status,'remote_verified':bool(tier.exists()),
+                          'nas_available':remote_ready})
+        except (OSError,ValueError,TypeError,KeyError,json.JSONDecodeError): continue
+    if JOB_DIR.is_dir():
+        for p in sorted(JOB_DIR.glob('*.json'),key=lambda x:x.stat().st_mtime,reverse=True)[:12]:
+            try: jobs.append(read_json(p))
+            except (OSError, ValueError): continue
+    return {'ok':True,'available':True,'nas_available':remote_ready,
+            'nas_detail':remote_error or 'Mounted NAS ready', 'masters':items, 'jobs':jobs}
+
+
+def job(root, operation, source, job_id):
+    if not job_id or len(job_id)>65 or not job_id.replace('-','').isalnum():fail('invalid job id')
+    target=JOB_DIR/(job_id+'.json')
+    def write(state, **kwargs):
+        JOB_DIR.mkdir(parents=True,exist_ok=True)
+        atomic_json(target, {'job_id':job_id,'operation':operation,'source':source,
+                            'state':state,'updated_at':time.time(),**kwargs})
+    write('running')
+    try:
+        result=offload(root,source) if operation=='offload' else restore(root,source)
+        write(result['state'],detail=result.get('detail',''))
+        return result
+    except Exception as exc:
+        write('error',detail=str(exc)[:900]); raise
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    sub=parser.add_subparsers(dest='command', required=True)
+    sub.add_parser('inventory')
+    for action in ('offload','restore'):
+        sub.add_parser(action).add_argument('source')
+    task=sub.add_parser('job'); task.add_argument('operation',choices=('offload','restore'))
+    task.add_argument('source'); task.add_argument('job_id')
+    args=parser.parse_args()
+    try:
+        root=root_path()
+        if args.command=='inventory': result=inventory(root)
+        elif args.command=='job':result=job(root,args.operation,args.source,args.job_id)
+        elif args.command=='offload':result=offload(root,args.source)
+        else:result=restore(root,args.source)
+        print(json.dumps(result,sort_keys=True));return 0
+    except Exception as exc:
+        print(json.dumps({'ok':False,'detail':str(exc)}));return 1
+
+if __name__=='__main__':sys.exit(main())

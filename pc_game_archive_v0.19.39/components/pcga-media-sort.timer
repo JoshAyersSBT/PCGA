@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic safety scan for completed ARM media
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=pcga-media-sort.service
+
+[Install]
+WantedBy=timers.target

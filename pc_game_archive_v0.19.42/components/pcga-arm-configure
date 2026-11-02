@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT_FILE=/etc/pc-game-archive/archive-root
+APPLIANCE_CONFIG=/etc/pc-game-archive/appliance.json
+[[ -r "$ROOT_FILE" ]] || { echo "missing $ROOT_FILE" >&2; exit 1; }
+ROOT="$(cat "$ROOT_FILE")"
+CFG="$ROOT/media/arm/config/arm.yaml"
+ABC="$ROOT/media/arm/config/abcde.conf"
+PROVIDER_FILE=/etc/pc-game-archive/arm-metadata-provider
+OMDB_FILE=/etc/pc-game-archive/arm-omdb-key
+TMDB_FILE=/etc/pc-game-archive/arm-tmdb-key
+
+arm_rip_active() {
+  if [[ "${PCGA_CONFIG_DURING_TRIGGER:-0}" != "1" ]]; then
+    systemctl list-units --all --state=active,activating --plain --no-legend \
+      'pcga-arm-rip@*.service' 2>/dev/null | grep -q 'pcga-arm-rip@' && return 0
+  fi
+  if docker inspect -f '{{.State.Running}}' arm-rippers 2>/dev/null | grep -qx true; then
+    docker exec arm-rippers sh -lc "ps -eo args | grep -q '[p]ython3 /opt/arm/arm/ripper/main.py'" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+if arm_rip_active; then
+  echo "ARM configuration deferred: a disc rip is currently active." >&2
+  exit 75
+fi
+
+# ARM creates its config on first start. Wait briefly for it, but never create
+# a partial replacement configuration ourselves.
+for _ in $(seq 1 45); do
+  [[ -s "$CFG" ]] && break
+  sleep 1
+done
+[[ -s "$CFG" ]] || { echo "ARM config has not appeared at $CFG" >&2; exit 1; }
+
+provider="omdb"
+[[ -r "$PROVIDER_FILE" ]] && provider="$(tr -d '\r\n[:space:]' < "$PROVIDER_FILE" | tr '[:upper:]' '[:lower:]')"
+case "$provider" in omdb|tmdb) ;; *) provider=omdb ;; esac
+key=""
+if [[ "$provider" == omdb && -r "$OMDB_FILE" ]]; then key="$(tr -d '\r\n' < "$OMDB_FILE")"; fi
+if [[ "$provider" == tmdb && -r "$TMDB_FILE" ]]; then key="$(tr -d '\r\n' < "$TMDB_FILE")"; fi
+
+# keep_raw is a PCGA appliance policy, not an ARM hard-coded profile.  The
+# default is false: keep the source-quality final MKV, but let ARM clean raw /
+# transcode work files after a successful job. Failed/incomplete artifacts are
+# still retained by ARM and PCGA's recovery path can inspect them.
+keep_raw="$(python3 - "$APPLIANCE_CONFIG" <<'PYKEEP'
+import json, sys
+from pathlib import Path
+p=Path(sys.argv[1])
+value=False
+try:
+    obj=json.loads(p.read_text())
+    value=bool((obj.get('ingest') or {}).get('keep_raw', False))
+except Exception:
+    pass
+print('true' if value else 'false')
+PYKEEP
+)"
+
+PCGA_PROVIDER="$provider" PCGA_METADATA_KEY="$key" PCGA_KEEP_RAW="$keep_raw" python3 - "$CFG" <<'PYCFG'
+from pathlib import Path
+import datetime as dt
+import os, re, shutil, sys
+p = Path(sys.argv[1])
+s = p.read_text()
+provider = os.environ.get('PCGA_PROVIDER','omdb').lower()
+key = os.environ.get('PCGA_METADATA_KEY','')
+keep_raw = os.environ.get('PCGA_KEEP_RAW','false').lower() == 'true'
+
+# PCGA owns only the settings required for unattended source-quality ingest and
+# its staging contract. Metadata classification remains asynchronous in PCGA.
+# Importantly, this is reconciled only when settings change / setup runs; it is
+# not blindly rewritten immediately before each disc starts.
+settings = {
+    'ARM_CHECK_UDF': 'true',
+    'GET_VIDEO_TITLE': 'false',
+    'VIDEOTYPE': '"auto"',
+    'METADATA_PROVIDER': '"none"',
+    'GET_AUDIO_TITLE': '"musicbrainz"',
+    'MANUAL_WAIT': 'false',
+    'MANUAL_WAIT_TIME': '0',
+    'AUTO_EJECT': 'true',
+    'MAINFEATURE': 'false',
+    'SKIP_TRANSCODE': 'true',
+    'MINLENGTH': '"30"',
+    'MAXLENGTH': '"99999"',
+    'RIPMETHOD': '"mkv"',
+    'RIPMETHOD_DVD': '"mkv"',
+    'RIPMETHOD_BR': '"mkv"',
+    'ALLOW_DUPLICATES': 'false',
+    'PREVENT_99': 'true',
+    'EXTRAS_SUB': '"extras"',
+    # ARM defines this as cleanup after successful processing.  Keep false only
+    # when the user explicitly enables Retain successful ARM work files.
+    'DELRAWFILES': 'false' if keep_raw else 'true',
+    'RAW_PATH': '"/home/arm/media/raw/"',
+    'TRANSCODE_PATH': '"/home/arm/media/transcode/"',
+    'COMPLETED_PATH': '"/home/arm/media/completed/"',
+    'ABCDE_CONFIG_FILE': '"/etc/arm/config/abcde.conf"',
+    'OMDB_API_KEY': '""',
+    'TMDB_API_KEY': '""',
+}
+missing=[]
+out=s
+for k,v in settings.items():
+    pat=re.compile(rf'(?m)^(\s*{re.escape(k)}\s*:\s*).*$')
+    out2,n=pat.subn(rf'\g<1>{v}',out,count=1)
+    if not n: missing.append(k)
+    out=out2
+if out != s:
+    stamp=dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+    backup=p.with_name(p.name+f'.pre-pcga.{stamp}')
+    shutil.copy2(p, backup)
+    p.write_text(out)
+    print(f'ARM managed ingest settings updated in {p}')
+else:
+    print('ARM managed ingest settings already aligned; no rewrite needed')
+if missing:
+    print('WARNING: ARM config keys not found: '+', '.join(missing), file=sys.stderr)
+PYCFG
+
+# Keep audio output predictable for the host sorter, but avoid rewriting the
+# file when it is already correct.
+if [[ -s "$ABC" ]]; then
+  python3 - "$ABC" <<'PYABC'
+from pathlib import Path
+import datetime as dt
+import re, shutil, sys
+p=Path(sys.argv[1]); s=p.read_text()
+pat=re.compile(r'(?m)^\s*OUTPUTDIR=.*$')
+out=pat.sub('OUTPUTDIR="/home/arm/music/"',s,count=1) if pat.search(s) else s+'\nOUTPUTDIR="/home/arm/music/"\n'
+if out != s:
+    stamp=dt.datetime.now().strftime('%Y%m%d-%H%M%S')
+    shutil.copy2(p,p.with_name(p.name+f'.pre-pcga.{stamp}'))
+    p.write_text(out)
+PYABC
+fi
+
+echo "PCGA ARM ingest policy: source-quality MKV; successful work-file retention=$keep_raw"
+echo "Video metadata mode: asynchronous ($provider); ARM rip path performs no OMDb/TMDb lookup."
+if [[ -z "$key" ]]; then
+  echo "INFO: no managed $provider API key; local-first classification remains active and ambiguous movie/video items will stay pending for review." >&2
+fi

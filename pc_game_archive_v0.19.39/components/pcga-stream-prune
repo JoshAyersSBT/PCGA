@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+"""PCGA v0.19.36: stream-aware Blu-ray duplicate audit and reversible consolidation.
+
+Only identical *compressed video and audio* streams qualify. The selected keeper
+must contain all subtitle payloads+metadata from every file and must preserve
+chapters. No transcoding, no unapproved deletion, no cross-title actions.
+"""
+from __future__ import annotations
+import argparse
+from collections import Counter
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+import importlib.machinery
+import importlib.util
+EXTRA = Path(__file__).with_name('pcga-extra-prune')
+spec = importlib.util.spec_from_loader('pcga_stream_prune_extra', importlib.machinery.SourceFileLoader('pcga_stream_prune_extra', str(EXTRA)))
+base = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(base)
+
+VERSION = '0.19.37'
+STATE = Path('/var/lib/pc-game-archive/extra-prune')
+HOLD_SUBDIR = 'recovery-hold/stream-prune'
+AGE = 600
+PURGE_AGE = 7 * 86400
+MAX_FILES_PER_TITLE = 36
+MAX_CANDIDATES = 200
+
+
+def execute(args: list[str], timeout=3600) -> str:
+    result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=timeout, check=False)
+    if result.returncode:
+        raise ValueError(f"{' '.join(args[:2])} failed: {result.stderr[-450:]}")
+    return result.stdout
+
+
+def identity(root: Path, rel: str) -> dict:
+    p = base.verify_child(root, rel)
+    s = p.stat(follow_symlinks=False)
+    if not stat.S_ISREG(s.st_mode) or s.st_nlink < 1:
+        raise ValueError('not a regular file')
+    return {'path': rel, 'size': s.st_size, 'mtime_ns': s.st_mtime_ns,
+            'inode': s.st_ino, 'device': s.st_dev, 'links': s.st_nlink}
+
+
+def checked(root: Path, rec: dict) -> Path:
+    path = base.verify_child(root, rec['path'])
+    s = path.stat(follow_symlinks=False)
+    if (s.st_size, s.st_mtime_ns, s.st_ino, s.st_dev) != (rec['size'], rec['mtime_ns'], rec['inode'], rec['device']):
+        raise ValueError('Media changed since scan; scan again')
+    return path
+
+
+def probe(path: Path) -> dict:
+    data = json.loads(execute(['ffprobe', '-v', 'error', '-show_streams', '-show_chapters',
+                               '-show_format', '-of', 'json', str(path)], timeout=90))
+    stream_data = data.get('streams') or []
+    if any(s.get('codec_type') not in ('video', 'audio', 'subtitle') for s in stream_data):
+        raise ValueError('Attachments or auxiliary streams require manual preservation')
+    durations = float((data.get('format') or {}).get('duration') or 0)
+    chapters = [(round(float(c['start_time']), 3), round(float(c['end_time']), 3),
+                 str((c.get('tags') or {}).get('title') or ''),
+                 str((c.get('tags') or {}).get('language') or '').lower())
+                for c in data.get('chapters', [])]
+    hashes = execute(['ffmpeg', '-nostdin', '-hide_banner', '-v', 'error', '-i', str(path),
+                      '-map', '0:v?', '-map', '0:a?', '-map', '0:s?', '-c', 'copy',
+                      '-f', 'streamhash', '-hash', 'SHA256', '-'], timeout=3600)
+    # ffmpeg maps video, then audio, then subtitles, independent of input interleaving.
+    grouped = {'video': [], 'audio': [], 'subtitle': []}
+    for line in hashes.splitlines():
+        m = re.fullmatch(r'(\d+),([vas]),SHA256=([0-9a-f]{64})', line.strip(), re.I)
+        if m:
+            grouped[{'v': 'video', 'a': 'audio', 's': 'subtitle'}[m[2]]].append(m[3].lower())
+    for kind in grouped:
+        metadata = [s for s in stream_data if s.get('codec_type') == kind]
+        if len(metadata) != len(grouped[kind]):
+            raise ValueError(f'Unable to hash every {kind} stream')
+        grouped[kind] = sorted((h, str(s.get('codec_name') or ''),
+                                str((s.get('tags') or {}).get('language') or '').lower(),
+                                str((s.get('tags') or {}).get('title') or ''),
+                                bool((s.get('disposition') or {}).get('forced', False)))
+                               for h, s in zip(grouped[kind], metadata))
+    if len(grouped['video']) != 1 or not grouped['audio']:
+        raise ValueError('Requires one video stream and at least one audio stream')
+    return {'duration': durations, 'tracks': grouped, 'chapters': chapters}
+
+
+def analyze_group(root: Path, title: Path, records: list[dict]) -> list[dict]:
+    # Consider the primary movie file first; do not attempt TV/episode promotion.
+    mains = [x for x in records if not x['extra'] and x['path'].lower().endswith('.mkv')]
+    extras = [x for x in records if x['extra'] and x['path'].lower().endswith('.mkv')]
+    if len(mains) != 1 or not extras:
+        return []
+    main = mains[0]
+    try:
+        main_probe = probe(checked(root, main))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    similar = []
+    for rec in extras:
+        if rec['device'] != main['device'] or rec['inode'] == main['inode']:
+            continue
+        try:
+            p = probe(checked(root, rec))
+            if abs(p['duration'] - main_probe['duration']) > 0.1:
+                continue
+            if (p['tracks']['video'] != main_probe['tracks']['video'] or
+                    p['tracks']['audio'] != main_probe['tracks']['audio']):
+                continue
+            if p['chapters'] and p['chapters'] != main_probe['chapters']:
+                continue
+            similar.append((rec, p))
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+    if not similar:
+        return []
+    # Consider individually: a larger subtitle track set can contain smaller ones.
+    # Exclude metadata-mismatched subsets and all hardlink aliases.
+    groups = []
+    items = [(main, main_probe)] + similar
+    for keeper, kprobe in sorted(items, key=lambda rp: (-len(rp[1]['tracks']['subtitle']), rp[0]['extra'], rp[0]['path'])):
+        eligible = []
+        ksubs = Counter(map(tuple, kprobe['tracks']['subtitle']))
+        for candidate, cp in items:
+            if candidate['path'] == keeper['path']:
+                continue
+            if Counter(map(tuple, cp['tracks']['subtitle'])) <= ksubs:
+                eligible.append(candidate)
+        if not any(x['path'] == main['path'] for x in eligible) and keeper['path'] != main['path']:
+            continue
+        if not kprobe['chapters'] and not main_probe['chapters']:
+            chapters = 'none'
+        elif kprobe['chapters'] == main_probe['chapters']:
+            chapters = 'present'
+        elif not kprobe['chapters'] and main_probe['chapters']:
+            chapters = 'copy-from-main'
+        else:
+            continue
+        # Must include all other listed extras to make a single unambiguous group.
+        # If an alternate edition has distinct payloads it remains untouched.
+        covered = [x for x in eligible if x['extra']]
+        if not covered and keeper['path'] == main['path']:
+            continue
+        members = [main] + [x for x in eligible if x['path'] != main['path']]
+        by_path = {x['path']: x for x in members}
+        if keeper['path'] not in by_path:
+            by_path[keeper['path']] = keeper
+        copies = sorted(by_path.values(), key=lambda x: x['path'])
+        if len(copies) < 2:
+            continue
+        # A grouped operation may only remove extras, never an unrelated other main.
+        if any(x['links'] != 1 for x in copies):
+            continue
+        evidence = hashlib.sha256(json.dumps([x['path'] for x in copies] +
+              kprobe['tracks']['video'] + kprobe['tracks']['audio'], sort_keys=True).encode()).hexdigest()
+        duplicates = [x for x in copies if x['path'] != keeper['path']]
+        candidate = {'id': evidence[:24], 'title': str(title.relative_to(root)),
+                     'main': main, 'keeper': keeper, 'members': copies,
+                     'chapters': chapters, 'video_sha256': kprobe['tracks']['video'][0][0],
+                     'audio_tracks': len(kprobe['tracks']['audio']),
+                     'subtitle_tracks': len(kprobe['tracks']['subtitle']),
+                     'files_consolidated': len(copies),
+                     'estimated_reclaim': sum(x['size'] for x in duplicates),
+                     'message': 'No transcoding; same encoded video/audio and subtitle superset. Manual approval required.'}
+        groups.append(candidate)
+        break  # One safe unambiguous consolidation per title.
+    return groups
+
+
+def scan(root: Path, state: Path, title_filter: str = '', min_age: int = AGE) -> dict:
+    if base.optical_jobs_active():
+        raise ValueError('optical rip active; cannot scan for stream consolidation')
+    for cmd in ('ffmpeg', 'ffprobe'):
+        if not shutil.which(cmd):
+            raise ValueError(f'{cmd} is required for stream consolidation')
+    output = state / 'stream-scan.json'
+    now = time.time()
+    base.state_write(output, {'state': 'scanning', 'started_at': int(now), 'version': VERSION})
+    result = {'state': 'ready', 'version': VERSION, 'started_at': int(now),
+              'titles_checked': 0, 'files_checked': 0, 'skipped_titles': 0,
+              'candidates': [], 'estimated_reclaim': 0,
+              'message': 'Stream-identical title-local candidates. Nothing moved or deleted.'}
+    try:
+        for title in base.title_roots(root):
+            if title_filter and title_filter.casefold() not in str(title.relative_to(root)).casefold():
+                continue
+            # No automatic TV episode promotion. TV is read-only and requires review.
+            if 'tv' in title.relative_to(root).parts[:3]:
+                continue
+            result['titles_checked'] += 1
+            recs = [{**r, 'links': base.verify_child(root, r['path']).stat().st_nlink} for r in base.title_files(root, title, now, min_age)]
+            result['files_checked'] += len(recs)
+            if len(recs) > MAX_FILES_PER_TITLE:
+                result['skipped_titles'] += 1
+                continue
+            for item in analyze_group(root, title, recs):
+                if len(result['candidates']) >= MAX_CANDIDATES:
+                    break
+                result['candidates'].append(item)
+                result['estimated_reclaim'] += item['estimated_reclaim']
+        result['finished_at'] = int(time.time())
+        base.state_write(output, result)
+    except Exception as exc:
+        base.state_write(output, {'state': 'error', 'error': str(exc)[:300], 'started_at': int(now)})
+        raise
+    return result
+
+
+def locked(state: Path):
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = (state / 'stream-prune.lock').open('a+')
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def holding_path(root: Path, candidate_id: str) -> Path:
+    return root / HOLD_SUBDIR / candidate_id
+
+
+def report_candidate(state: Path, item_id: str) -> dict:
+    report = base.state_read(state / 'stream-scan.json')
+    if report.get('state') != 'ready' or time.time() - report.get('finished_at', 0) > 4 * 3600:
+        raise ValueError('Scan missing or stale; run scan-streams again')
+    return next((x for x in report.get('candidates', []) if x.get('id') == item_id), None) or _raise('Candidate not in latest scan')
+
+
+def _raise(msg):
+    raise ValueError(msg)
+
+
+def stage(root: Path, state: Path, item_id: str) -> dict:
+    if base.optical_jobs_active():
+        raise ValueError('Optical rip active; staging denied')
+    item = report_candidate(state, item_id)
+    for member in item['members']:
+        checked(root, member)
+    main = checked(root, item['main'])
+    keeper = checked(root, item['keeper'])
+    title = root / item['title']
+    # Completely re-evaluate all stream signatures before touching source files.
+    recalculated = analyze_group(root, title, [{**x, 'extra': x['path'].lower().split('/extras/')[0] != x['path'].lower() or
+            any(seg.lower().replace('_',' ') in base.EXTRAS_NAMES for seg in Path(x['path']).parts[:-1])} for x in item['members']])
+    if not any(x['id'] == item_id and {y['path'] for y in x['members']} == {y['path'] for y in item['members']} and x['keeper']['path'] == item['keeper']['path'] for x in recalculated):
+        raise ValueError('Stream evidence changed; run scan again')
+    hold = holding_path(root, item_id)
+    if hold.exists():
+        raise ValueError('Recovery holding directory already exists; refusing overwrite')
+    if root.stat().st_dev != main.stat().st_dev:
+        raise ValueError('Recovery holding directory must remain on same filesystem')
+    hold.mkdir(mode=0o700, parents=True)
+    # A recoverable plan is created before the first filesystem move.
+    main_rel = item['main']['path']
+    keeper_rel = item['keeper']['path']
+    displaced = [x for x in item['members'] if x['path'] != keeper_rel]
+    staging = {'id': item_id, 'status': 'staging', 'created_at': int(time.time()),
+               'main': main_rel, 'keeper_original': keeper_rel, 'keeper': item['keeper'],
+               'members': item['members'], 'held': {}, 'chapters': item['chapters'],
+               'estimated_reclaim': item['estimated_reclaim']}
+    base.state_write(state / 'stream-staged' / (item_id + '.json'), staging)
+    changes = []
+    try:
+        # The keeper may gain chapters in place, but its video/audio/subtitle
+        # stream payloads must remain unchanged.
+        keeper_tracks = probe(keeper)['tracks']
+        main_chapters = probe(main)['chapters']
+        if item['chapters'] == 'copy-from-main':
+            for tool in ('mkvextract', 'mkvpropedit'):
+                if not shutil.which(tool):
+                    raise ValueError(f'{tool} required to preserve chapters; install mkvtoolnix')
+            with tempfile.TemporaryDirectory(prefix='pcga-chapters-', dir=str(hold)) as tmp:
+                xml = Path(tmp) / 'chapters.xml'
+                execute(['mkvextract', str(main), 'chapters', str(xml)], timeout=90)
+                if not xml.is_file() or xml.stat().st_size == 0:
+                    raise ValueError('Chapter extraction failed')
+                execute(['mkvpropedit', str(keeper), '--chapters', str(xml)], timeout=120)
+                updated = probe(keeper)
+                if updated['chapters'] != main_chapters or updated['tracks'] != keeper_tracks:
+                    raise ValueError('Stream or chapter verification failed after metadata injection')
+        # Files are renamed within the same disk. No full-size temporary movie is created.
+        for index, rec in enumerate(displaced):
+            source = base.verify_child(root, rec['path'])
+            destination = hold / f'original-{index}.mkv'
+            os.rename(source, destination)
+            changes.append((destination, source))
+            staging['held'][rec['path']] = str(destination.relative_to(root))
+            base.state_write(state / 'stream-staged' / (item_id + '.json'), staging)
+        if keeper != main:
+            os.rename(keeper, main)
+            changes.append((main, keeper))
+        if not main.is_file():
+            raise ValueError('Primary movie missing after staging')
+        staging['status'] = 'staged'
+        staging['keeper_tracks'] = keeper_tracks
+        staging['keeper_chapters'] = main_chapters if item['chapters'] != 'none' else []
+        staging['keeper_identity'] = identity(root, main_rel)
+        staging['held_identity'] = {p: identity(root, h) for p, h in staging['held'].items()}
+        base.state_write(state / 'stream-staged' / (item_id + '.json'), staging)
+        return {'ok': True, 'state': 'staged', 'item': staging}
+    except Exception:
+        for source, destination in reversed(changes):
+            if source.exists() and not destination.exists():
+                os.rename(source, destination)
+        staging['status'] = 'error-needs-review' if any(x for x in changes if x[0].exists()) else 'rolled-back'
+        base.state_write(state / 'stream-staged' / (item_id + '.json'), staging)
+        raise
+
+
+def held_manifest(state: Path, item_id: str) -> tuple[Path, dict]:
+    p = state / 'stream-staged' / (item_id + '.json')
+    data = base.state_read(p)
+    if data.get('id') != item_id or data.get('status') != 'staged':
+        raise ValueError('No staged transaction for this id')
+    return p, data
+
+
+def check_held(root: Path, rec: dict, location: str):
+    p = base.verify_child(root, location)
+    s = p.stat(follow_symlinks=False)
+    if (s.st_dev, s.st_ino, s.st_size) != (rec['device'], rec['inode'], rec['size']) or s.st_nlink != 1:
+        raise ValueError('Held file changed or linked elsewhere; refusing operation')
+    return p
+
+
+def restore(root: Path, state: Path, item_id: str) -> dict:
+    if base.optical_jobs_active():
+        raise ValueError('Optical rip active; restoration denied')
+    mpath, manifest = held_manifest(state, item_id)
+    main = checked(root, manifest['keeper_identity'])
+    records = {x['path']: x for x in manifest['members']}
+    for original, location in manifest['held'].items():
+        check_held(root, records[original], location)
+        target = base.verify_child(root, original, present=False)
+        if original != manifest['main'] and target.exists():
+            raise ValueError('Original location occupied; refusing restore')
+    if manifest['keeper_original'] != manifest['main']:
+        target = base.verify_child(root, manifest['keeper_original'], present=False)
+        if target.exists():
+            raise ValueError('Keeper original path occupied')
+        os.rename(main, target)
+    for original, location in manifest['held'].items():
+        source = base.verify_child(root, location)
+        target = base.verify_child(root, original, present=False)
+        if target.exists():
+            raise ValueError('Original location occupied; manual rollback required')
+        os.rename(source, target)
+    manifest['status'] = 'restored'
+    base.state_write(mpath, manifest)
+    # Restoring a transaction re-opens the possibility of a later, new scan.
+    try:
+        holding_path(root, item_id).rmdir()  # only if empty
+    except OSError:
+        pass
+    return {'ok': True, 'state': 'restored', 'id': item_id}
+
+
+def purge(root: Path, state: Path, item_id: str) -> dict:
+    if base.optical_jobs_active():
+        raise ValueError('Optical rip active; purge denied')
+    mpath, manifest = held_manifest(state, item_id)
+    if time.time() - manifest['created_at'] < PURGE_AGE:
+        raise ValueError('Seven-day holding period has not elapsed')
+    checked(root, manifest['keeper_identity'])
+    records = {x['path']: x for x in manifest['members']}
+    for original, location in manifest['held'].items():
+        check_held(root, records[original], location)
+    # Validate the surviving master has not lost its video/audio/subtitle payloads.
+    master = base.verify_child(root, manifest['main'])
+    master_probe = probe(master)
+    if json.dumps(master_probe['tracks'], sort_keys=True) != json.dumps(manifest['keeper_tracks'], sort_keys=True) or json.dumps(master_probe['chapters']) != json.dumps(manifest['keeper_chapters']):
+        raise ValueError('Keeper streams or chapters changed; refusing purge')
+    bytes_reclaimed = 0
+    for original, location in manifest['held'].items():
+        f = base.verify_child(root, location)
+        bytes_reclaimed += f.stat().st_blocks * 512
+        f.unlink()
+    manifest['status'] = 'purged'
+    manifest['purged_at'] = int(time.time())
+    base.state_write(mpath, manifest)
+    return {'ok': True, 'state': 'purged', 'id': item_id, 'estimated_freed_blocks': bytes_reclaimed}
+
+
+def status(state: Path) -> dict:
+    staged = []
+    for f in sorted((state / 'stream-staged').glob('*.json'))[:200]:
+        d = base.state_read(f)
+        if d.get('status') in ('staged', 'error-needs-review'):
+            staged.append({k: d.get(k) for k in ('id', 'status', 'created_at', 'main', 'keeper_original', 'estimated_reclaim')})
+    return {'ok': True, 'scan': base.state_read(state / 'stream-scan.json', {'state': 'not-scanned', 'candidates': []}),
+            'operation': base.state_read(state / 'stream-operation.json', {}), 'staged': staged}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='PCGA safe stream-aware duplicate consolidation')
+    parser.add_argument('operation', choices=('scan-streams', 'status', 'stage', 'restore', 'purge'))
+    parser.add_argument('--id', default='')
+    parser.add_argument('--title', default='', help='optional movie title substring for audit')
+    parser.add_argument('--root', type=Path, default=None)
+    parser.add_argument('--state', type=Path, default=STATE)
+    parser.add_argument('--min-age', type=int, default=AGE)
+    parser.add_argument('--confirm', action='store_true')
+    args = parser.parse_args()
+    try:
+        root = (args.root or base.archive_root()).resolve(strict=True)
+        state = args.state.resolve()
+        if args.operation in ('stage', 'restore', 'purge'):
+            if not args.confirm or not re.fullmatch(r'[0-9a-f]{24}', args.id):
+                raise ValueError('Explicit --confirm and valid --id required')
+        if args.operation == 'status':
+            result = status(state)
+        elif args.operation == 'scan-streams':
+            result = scan(root, state, args.title, args.min_age)
+        else:
+            with locked(state):
+                state_file = state / 'stream-operation.json'
+                base.state_write(state_file, {'state': 'running', 'operation': args.operation, 'id': args.id})
+                try:
+                    result = {'stage': stage, 'restore': restore, 'purge': purge}[args.operation](root, state, args.id)
+                    base.state_write(state_file, {'state': 'done', 'operation': args.operation, 'id': args.id, 'time': int(time.time())})
+                except Exception as err:
+                    base.state_write(state_file, {'state': 'error', 'operation': args.operation, 'id': args.id, 'error': str(err)[:400]})
+                    raise
+        print(json.dumps(result, indent=2))
+        return 0
+    except (OSError, ValueError, subprocess.TimeoutExpired, BlockingIOError) as e:
+        print(json.dumps({'ok': False, 'error': str(e)[:600]}), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

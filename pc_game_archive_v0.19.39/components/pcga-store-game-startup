@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export RUN_GAMESCOPE=""
+export RUN_SWAY="${RUN_SWAY:-1}"
+source /opt/gow/launch-comp.sh
+export HOME=/pcga/home
+export LEGENDARY_CONFIG_PATH=/pcga/config/legendary
+export GOGDL_CONFIG_PATH=/pcga/config/gogdl
+export XDG_CONFIG_HOME=/pcga/config/xdg
+export XDG_CACHE_HOME=/pcga/cache
+export XDG_DATA_HOME=/pcga/home/.local/share
+export WINEPREFIX=/pcga/prefix
+export WINEDEBUG=-all
+provider="${PCGA_STORE_PROVIDER:-}"; app="${PCGA_STORE_APP_ID:-}"
+[[ "$app" =~ ^[A-Za-z0-9][A-Za-z0-9._:+-]{0,179}$ ]] || { echo 'Invalid PCGA store game identity' >&2; exit 64; }
+runner="${PCGA_STORE_COMPAT_RUNNER:-wine}"
+if [[ "$runner" == umu ]]; then
+    [[ -x /opt/pcga-umu/umu-run ]] || { echo 'UMU was selected but has not been prepared. Open PCGA Control Center > Games > Compatibility.' >&2; exit 78; }
+    command -v python3 >/dev/null || { echo 'UMU requires Python 3 in the streamed game runtime' >&2; exit 78; }
+    export GAMEID="${PCGA_STORE_UMU_GAMEID:-umu-default}"
+    export PROTONPATH="${PCGA_STORE_PROTON:-UMU-Proton}"
+    export STORE="$([[ "$provider" == epic ]] && echo egs || echo gog)"
+    [[ "$PROTONPATH" == UMU-Proton || "$PROTONPATH" == GE-Proton ]] || { echo 'Invalid Proton selection' >&2; exit 64; }
+    [[ "$GAMEID" =~ ^(umu-[A-Za-z0-9_-]{1,64}|[0-9]{1,15})$ ]] || { echo 'Invalid UMU game ID' >&2; exit 64; }
+    echo "PCGA store compatibility: UMU / $PROTONPATH / $STORE / $GAMEID"
+else
+    [[ "$runner" == wine ]] || { echo 'Invalid PCGA compatibility runner' >&2; exit 64; }
+    command -v wine >/dev/null || { echo 'Wine is unavailable in PCGA store runtime' >&2; exit 127; }
+    echo 'PCGA store compatibility: Wine (persistent legacy prefix)'
+fi
+if [[ "$provider" == epic ]]; then
+    if [[ "$runner" == umu ]]; then
+        # Legendary still supplies Epic entitlement and required game arguments;
+        # --no-wine passes the Windows executable to the UMU wrapper unchanged.
+        exec /opt/pcga-store-backends/legendary launch "$app" --no-wine --wrapper /opt/pcga-umu/umu-run
+    else
+        exec /opt/pcga-store-backends/legendary launch "$app" --wine "$(command -v wine)" --wine-prefix "$WINEPREFIX"
+    fi
+elif [[ "$provider" == gog ]]; then
+    rel="${PCGA_STORE_RELATIVE_PATH:-}"; exe="${PCGA_STORE_EXE:-}"
+    [[ "$rel" != /* && "$exe" != /* && "$rel" != *..* && "$exe" != *..* && "${exe,,}" == *.exe ]] || { echo 'GOG launch target must be configured' >&2; exit 64; }
+    [[ -f "/pcga/library/$rel/$exe" ]] || { echo 'GOG game executable is missing' >&2; exit 66; }
+    cd "/pcga/library/$rel/$(dirname "$exe")"
+    if [[ "$runner" == umu ]]; then exec /opt/pcga-umu/umu-run "$(basename "$exe")"; fi
+    exec wine "$(basename "$exe")"
+else
+    echo 'Unsupported PCGA store provider' >&2; exit 64
+fi

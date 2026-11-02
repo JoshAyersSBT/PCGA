@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+VERSION="0.19.7"
+HEROIC_VERSION="2.22.3"
+ASSET="Heroic-${HEROIC_VERSION}-linux-x64.tar.xz"
+URL="https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/releases/download/v${HEROIC_VERSION}/${ASSET}"
+SHA256="7382d719a5114c5f0761eea05cdb22f73f58fe98ec840d16b3d85a054d0d3efd"
+IMAGE="pcga/heroic-backends:${HEROIC_VERSION}"
+STATE=/var/lib/pc-game-archive/store-providers
+CACHE=/var/cache/pc-game-archive/store-providers
+ROOT_FILE=/etc/pc-game-archive/archive-root
+RUNTIME_ENV=/etc/pc-game-archive/game-runtime.env
+PROVIDER=/usr/local/sbin/pcga-store-provider
+STATUS="$STATE/status.json"
+
+[[ $EUID -eq 0 ]] || exec sudo -E bash "$0" "$@"
+log(){ printf '[pcga-store-bootstrap] %s\n' "$*"; }
+die(){ printf '[pcga-store-bootstrap:error] %s\n' "$*" >&2; write_status error "$*"; exit 1; }
+write_status(){
+  local phase="$1" detail="${2:-}"
+  install -d -m 0700 "$STATE"
+  python3 - "$STATUS" "$phase" "$detail" "$IMAGE" "$HEROIC_VERSION" <<'PY'
+import json,os,sys,tempfile,time
+from pathlib import Path
+p=Path(sys.argv[1]); obj={"schema":1,"version":"0.19.7","state":sys.argv[2],"detail":sys.argv[3],"image":sys.argv[4],"heroic_bundle_version":sys.argv[5],"updated_at":time.time()}
+fd,name=tempfile.mkstemp(prefix=p.name+'.',dir=p.parent)
+with os.fdopen(fd,'w') as f: json.dump(obj,f,indent=2,sort_keys=True); f.write('\n')
+os.chmod(name,0o600); os.replace(name,p)
+PY
+}
+
+[[ -r "$ROOT_FILE" ]] || die "Missing $ROOT_FILE"
+[[ -x "$PROVIDER" ]] || die "Missing $PROVIDER"
+ARCH="$(uname -m)"
+[[ "$ARCH" == x86_64 || "$ARCH" == amd64 ]] || die "Pinned Heroic helper bundle currently requires x86-64; detected $ARCH"
+install -d -m 0700 "$STATE" "$CACHE"
+ROOT="$(cat "$ROOT_FILE")"
+[[ "$ROOT" == /* ]] || die "Invalid archive root"
+PUID=1000; PGID=1000
+if [[ -r /opt/pc-game-archive/.env ]]; then
+  read_puid="$(sed -n 's/^PUID=//p' /opt/pc-game-archive/.env | tail -n1 | tr -d '\r"')"
+  read_pgid="$(sed -n 's/^PGID=//p' /opt/pc-game-archive/.env | tail -n1 | tr -d '\r"')"
+  [[ "$read_puid" =~ ^[0-9]+$ ]] && PUID="$read_puid"
+  [[ "$read_pgid" =~ ^[0-9]+$ ]] && PGID="$read_pgid"
+fi
+install -d -o "$PUID" -g "$PGID" -m 0700 "$ROOT/games/stores/config" "$ROOT/games/stores/cache" "$ROOT/games/stores/home"
+install -d -o "$PUID" -g "$PGID" -m 0755 "$ROOT/games/stores/library"
+for d in legendary gog gogdl nile xdg; do
+  install -d -o "$PUID" -g "$PGID" -m 0700 "$ROOT/games/stores/config/$d"
+done
+
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  write_status ready "Headless Epic/GOG/Amazon store backends are already prepared"
+  log "$IMAGE already exists"
+  exit 0
+fi
+
+write_status downloading "Downloading pinned Heroic helper bundle ${HEROIC_VERSION}"
+ARCHIVE="$CACHE/$ASSET"
+if [[ -f "$ARCHIVE" ]] && [[ "$(sha256sum "$ARCHIVE" | awk '{print $1}')" != "$SHA256" ]]; then
+  rm -f "$ARCHIVE"
+fi
+if [[ ! -f "$ARCHIVE" ]]; then
+  tmp="$ARCHIVE.part"; rm -f "$tmp"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$URL" || die "Unable to download Heroic helper bundle"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$tmp" "$URL" || die "Unable to download Heroic helper bundle"
+  else
+    die "Neither curl nor wget is installed"
+  fi
+  mv "$tmp" "$ARCHIVE"
+fi
+[[ "$(sha256sum "$ARCHIVE" | awk '{print $1}')" == "$SHA256" ]] || die "Heroic bundle checksum did not match the pinned v${HEROIC_VERSION} asset"
+
+BUILD="$(mktemp -d /var/tmp/pcga-store-backends.XXXXXX)"
+trap 'rm -rf "$BUILD"' EXIT
+mkdir -p "$BUILD/unpack" "$BUILD/bin"
+tar -xJf "$ARCHIVE" -C "$BUILD/unpack"
+legendary="$(find "$BUILD/unpack" -type f -path '*/resources/app.asar.unpacked/build/bin/*/linux/legendary' -perm -u+x 2>/dev/null | head -n1 || true)"
+[[ -n "$legendary" ]] || legendary="$(find "$BUILD/unpack" -type f -path '*/resources/app.asar.unpacked/build/bin/linux/legendary' -perm -u+x 2>/dev/null | head -n1 || true)"
+[[ -n "$legendary" ]] || die "Pinned Heroic bundle did not contain the Linux Legendary helper"
+bindir="$(dirname "$legendary")"
+for runner in legendary gogdl nile; do
+  [[ -x "$bindir/$runner" ]] || die "Pinned Heroic bundle did not contain executable $runner beside Legendary"
+done
+# Copy the helper directory, not Electron/Heroic. Companion helper files used by
+# gogdl/Nile stay available without shipping or starting the desktop launcher.
+cp -a "$bindir/." "$BUILD/bin/"
+
+BASE_IMAGE="ghcr.io/games-on-whales/lutris:edge"
+if [[ -r "$RUNTIME_ENV" ]]; then
+  candidate="$(sed -n 's/^PCGA_GAME_RUNTIME_IMAGE=//p' "$RUNTIME_ENV" | tail -n1 | tr -d '\r\"')"
+  [[ -n "$candidate" ]] && BASE_IMAGE="$candidate"
+fi
+cat > "$BUILD/Dockerfile" <<EOF
+FROM ${BASE_IMAGE}
+USER root
+COPY bin/ /opt/pcga-store-backends/
+RUN chmod 0755 /opt/pcga-store-backends/legendary /opt/pcga-store-backends/gogdl /opt/pcga-store-backends/nile
+LABEL org.pcga.component="store-backends" org.pcga.version="${VERSION}" org.pcga.heroic-bundle="${HEROIC_VERSION}"
+EOF
+write_status building "Building headless store-backend image from Legendary, gogdl and Nile"
+docker build --pull=false -t "$IMAGE" "$BUILD" || die "Docker could not build $IMAGE"
+
+write_status probing "Probing bundled store helper binaries"
+probe="$($PROVIDER status --probe 2>&1)" || die "Store backend image built but provider diagnostics failed: $probe"
+write_status ready "Headless Epic/GOG/Amazon store backends are ready"
+log "Prepared $IMAGE without launching or embedding the Heroic Electron frontend"

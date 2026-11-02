@@ -1,0 +1,17 @@
+[Unit]
+Description=PC Game Archive CDEmu virtual optical device
+Documentation=https://cdemu.sourceforge.io/
+After=dbus.service systemd-modules-load.service
+Wants=dbus.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/pcga-cdemu-bootstrap
+ExecStart=/usr/bin/cdemu-daemon --num-devices=1 --bus=system --audio-driver=null --system-sleep-handler=0
+Restart=no
+TimeoutStartSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

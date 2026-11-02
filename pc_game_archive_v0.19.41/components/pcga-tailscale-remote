@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+VERSION="0.19.0"
+STATE_DIR=/var/lib/pc-game-archive/bootstrap
+STATE_FILE="$STATE_DIR/tailscale-remote.json"
+PORTAL_TARGET='https+insecure://127.0.0.1:8443'
+MOONLIGHT_LANES="${PCGA_MOONLIGHT_WEB_LANES:-4}"
+MOONLIGHT_BASE_PORT="${PCGA_MOONLIGHT_WEB_PORT:-8101}"
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || exec sudo -E "$0" "$@"
+
+json_status(){
+  python3 - "$VERSION" "$STATE_FILE" "$PORTAL_TARGET" "$MOONLIGHT_BASE_PORT" "$MOONLIGHT_LANES" <<'PY'
+import json, os, subprocess, sys
+version, state_path, portal_target, base_port, lane_count = sys.argv[1:]
+base_port=int(base_port); lane_count=max(1,min(8,int(lane_count)))
+
+def run(*args):
+    try:
+        p=subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=12)
+        return p.returncode,p.stdout,p.stderr
+    except Exception as e:
+        return 127,"",str(e)
+
+out={
+    "ok": True, "version": version, "available": False, "configured": False,
+    "state": "unavailable", "backend_state": "Unavailable", "dns_name": "",
+    "tailscale_ips": [], "portal_url": "", "moonlight_url": "", "moonlight_urls": [],
+    "moonlight_lane_count": lane_count,
+    "detail": "Tailscale CLI is not installed on this appliance.",
+}
+if not any(os.access(os.path.join(p,"tailscale"),os.X_OK) for p in os.environ.get("PATH","").split(os.pathsep)):
+    print(json.dumps(out,separators=(",",":"))); raise SystemExit
+out["available"]=True
+rc,stdout,stderr=run("tailscale","status","--json")
+if rc!=0:
+    out.update(state="needs-login",backend_state="NeedsLogin",detail=(stderr or stdout or "Tailscale is installed but not connected.").strip()[:500])
+    print(json.dumps(out,separators=(",",":"))); raise SystemExit
+try: st=json.loads(stdout or "{}")
+except Exception: st={}
+backend=str(st.get("BackendState") or "Unknown")
+self_obj=st.get("Self") if isinstance(st.get("Self"),dict) else {}
+dns=str(self_obj.get("DNSName") or "").rstrip(".")
+ips=[str(x) for x in (self_obj.get("TailscaleIPs") or []) if x]
+out.update(backend_state=backend,dns_name=dns,tailscale_ips=ips)
+if backend.lower()!="running":
+    out.update(state="needs-login",detail=f"Tailscale backend state is {backend}.")
+    print(json.dumps(out,separators=(",",":"))); raise SystemExit
+if not dns:
+    out.update(state="no-magicdns",detail="Tailscale is connected, but this node has no MagicDNS name.")
+    print(json.dumps(out,separators=(",",":"))); raise SystemExit
+out["portal_url"]=f"https://{dns}/"
+out["moonlight_urls"]=[f"https://{dns}:{base_port+i}/" for i in range(lane_count)]
+out["moonlight_url"]=out["moonlight_urls"][0]
+rc,serve,serve_err=run("tailscale","serve","status")
+serve_text=(serve+"\n"+serve_err).lower()
+portal_origins=(f"https://{dns}".lower(), f"https://{dns}:443".lower())
+portal_ok=(portal_target.lower() in serve_text and any(origin in serve_text for origin in portal_origins))
+moon_ok=True
+for i in range(lane_count):
+    port=base_port+i
+    target=f"https+insecure://127.0.0.1:{port}".lower()
+    origin=f"https://{dns}:{port}".lower()
+    if target not in serve_text or origin not in serve_text:
+        moon_ok=False; break
+if rc==0 and portal_ok and moon_ok:
+    out.update(configured=True,state="ready",detail=f"PCGA portal and all {lane_count} Moonlight Web lanes are published to this tailnet with Tailscale Serve.")
+else:
+    out.update(state="connected",detail="Tailscale is connected. Enable PCGA Remote Access to publish the portal and all browser-stream lanes through Serve.")
+print(json.dumps(out,separators=(",",":")))
+PY
+}
+
+write_state(){
+  local state="$1"
+  install -d -m 0755 "$STATE_DIR"
+  python3 - "$STATE_FILE" "$VERSION" "$state" "$MOONLIGHT_LANES" <<'PY'
+import json,pathlib,sys,datetime
+p,version,state,lanes=sys.argv[1:]
+obj={"version":version,"state":state,"moonlight_lane_count":int(lanes),"updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat()}
+pathlib.Path(p).write_text(json.dumps(obj,indent=2,sort_keys=True)+"\n",encoding="utf-8")
+PY
+  chmod 0644 "$STATE_FILE"
+}
+
+serve_off_all(){
+  tailscale serve --https=443 off >/dev/null 2>&1 || true
+  local lane port
+  for lane in $(seq 1 "$MOONLIGHT_LANES"); do
+    port=$((MOONLIGHT_BASE_PORT + lane - 1))
+    tailscale serve --https="$port" off >/dev/null 2>&1 || true
+  done
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  status)
+    json_status
+    ;;
+  enable)
+    command -v tailscale >/dev/null 2>&1 || { echo '{"ok":false,"error":"tailscale-not-installed","detail":"Install Tailscale on the PCGA host and sign it into the same tailnet as the thin client."}'; exit 3; }
+    backend="$(tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)"
+    [[ "$backend" == Running ]] || { echo '{"ok":false,"error":"tailscale-not-connected","detail":"Tailscale is installed but not signed in. Run tailscale up on the PCGA host first."}'; exit 4; }
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    if ! timeout 35 tailscale serve --yes --bg --https=443 "$PORTAL_TARGET" >"$tmp" 2>&1; then
+      detail="$(tr '\n' ' ' <"$tmp" | head -c 900)"
+      python3 - "$detail" <<'PYERR'
+import json,sys; print(json.dumps({"ok":False,"error":"tailscale-serve-portal-failed","detail":sys.argv[1] or "Unable to enable Tailscale Serve for the PCGA portal."},separators=(",",":")))
+PYERR
+      exit 5
+    fi
+    for lane in $(seq 1 "$MOONLIGHT_LANES"); do
+      port=$((MOONLIGHT_BASE_PORT + lane - 1))
+      target="https+insecure://127.0.0.1:${port}"
+      if ! timeout 35 tailscale serve --yes --bg --https="$port" "$target" >"$tmp" 2>&1; then
+        serve_off_all
+        detail="$(tr '\n' ' ' <"$tmp" | head -c 900)"
+        python3 - "$lane" "$detail" <<'PYERR'
+import json,sys; print(json.dumps({"ok":False,"error":"tailscale-serve-moonlight-failed","detail":f"Unable to enable Tailscale Serve for Moonlight Web lane {sys.argv[1]}: {sys.argv[2] or 'unknown error'}. All PCGA Serve routes were rolled back."},separators=(",",":")))
+PYERR
+        exit 6
+      fi
+    done
+    rm -f "$tmp"; trap - EXIT
+    write_state enabled
+    json_status
+    ;;
+  disable)
+    if command -v tailscale >/dev/null 2>&1; then serve_off_all; fi
+    write_state disabled
+    json_status
+    ;;
+  *)
+    echo "usage: pcga-tailscale-remote {status|enable|disable}" >&2
+    exit 2
+    ;;
+esac

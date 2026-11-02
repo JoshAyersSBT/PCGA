@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, hashlib, json, os, re, subprocess, tempfile
+from pathlib import Path
+
+GAME_EXACT = {
+    'steam_api.dll','steam_api64.dll','steam_appid.txt','galaxy.dll','goggame.dll',
+    'gameuxinstallhelper.dll','chitin.key','dialog.tlk','dos4gw.exe'
+}
+INSTALLER_EXACT = {'autorun.inf','setup.exe','install.exe','installer.exe','setup.msi','install.msi'}
+GAME_SUFFIXES = {'.bif','.wad','.pk3','.vpk','.grp','.gob','.mix','.pak'}
+GENERIC_EXE = {'.exe','.com'}
+
+
+def run(cmd, timeout=8):
+    try:
+        return subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+    except Exception:
+        return None
+
+
+def normalize(dev: str) -> str:
+    return dev if dev.startswith('/dev/') else '/dev/' + dev.removeprefix('/dev/')
+
+
+def udev_props(dev: str) -> dict[str,str]:
+    p=run(['udevadm','info','--query=property',f'--name={dev}'])
+    out={}
+    if p:
+        for line in p.stdout.splitlines():
+            if '=' in line:
+                k,v=line.split('=',1); out[k]=v
+    return out
+
+
+def num(props, key):
+    try: return int(props.get(key,'0') or 0)
+    except ValueError: return 0
+
+
+def mount_inspect(dev: str) -> dict:
+    result={'mounted':False,'video_ts':False,'bdmv':False,'entries':[], 'game_markers':[], 'installer_markers':[], 'game_suffix_hits':[], 'application_executables':[]}
+    mnt=Path(tempfile.mkdtemp(prefix='pcga-optical-probe-', dir='/run' if Path('/run').is_dir() else None))
+    mounted=False
+    try:
+        p=run(['mount','-o','ro,nosuid,nodev,noexec',dev,str(mnt)], timeout=15)
+        if not p or p.returncode != 0:
+            result['mount_error']=((p.stderr if p else '') or 'mount failed').strip()[:300]
+            return result
+        mounted=True; result['mounted']=True
+        files=[]
+        dirs=[]
+        for base, dirnames, names in os.walk(mnt):
+            basep=Path(base)
+            try: depth=len(basep.relative_to(mnt).parts)
+            except ValueError: continue
+            if depth >= 4:
+                dirnames[:] = []
+            for d in dirnames:
+                dirs.append((basep/d).relative_to(mnt).as_posix())
+            for n in names:
+                pth=basep/n
+                try:
+                    rel=pth.relative_to(mnt).as_posix()
+                    size=pth.stat().st_size
+                except OSError:
+                    continue
+                files.append((rel,size))
+                if len(files)>=1200:
+                    dirnames[:]=[]; break
+            if len(files)>=1200: break
+        lower_dirs={x.lower().rstrip('/') for x in dirs}
+        result['video_ts']=any(x=='video_ts' or x.endswith('/video_ts') for x in lower_dirs)
+        result['bdmv']=any(x=='bdmv' or x.endswith('/bdmv') for x in lower_dirs)
+        basenames={Path(x).name.lower() for x,_ in files}
+        result['game_markers']=sorted(x for x in basenames if x in GAME_EXACT)[:40]
+        result['installer_markers']=sorted(x for x in basenames if x in INSTALLER_EXACT)[:40]
+        suffix_hits=[]; app_exes=[]
+        for rel,size in files:
+            p=Path(rel); low=p.name.lower(); suf=p.suffix.lower()
+            if suf in GAME_SUFFIXES:
+                suffix_hits.append(rel)
+            if suf in GENERIC_EXE and low not in INSTALLER_EXACT and not low.startswith(('unins','uninstall')) and size >= 128*1024:
+                app_exes.append(rel)
+        result['game_suffix_hits']=suffix_hits[:40]
+        result['application_executables']=app_exes[:40]
+        result['entries']=[{'path':r,'size':s} for r,s in files[:400]]
+        return result
+    finally:
+        if mounted:
+            run(['umount',str(mnt)],timeout=10)
+        try: mnt.rmdir()
+        except OSError: pass
+
+
+
+def content_fingerprint(dev: str, size: int) -> str | None:
+    """Bounded, read-only content sampling; labels and size alone are not a disc ID.
+
+    Optical TOC/volume metadata is not unique. This is an identity hint, not a
+    cryptographic whole-disc checksum. Fail closed when samples cannot be read.
+    """
+    if size < 2 * 1024 * 1024:
+        return None
+    offsets = sorted({32768, 1024 * 1024, 4 * 1024 * 1024,
+                      max(32768, size // 2 // 2048 * 2048),
+                      max(32768, (size - 65536) // 2048 * 2048)})
+    h = hashlib.sha256()
+    count = 0
+    try:
+        fd = os.open(dev, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+        try:
+            for offset in offsets:
+                if offset + 4096 > size:continue
+                data = os.pread(fd, 4096, offset)
+                if len(data) != 4096:
+                    return None
+                h.update(offset.to_bytes(8, 'big'))
+                h.update(data)
+                count += 1
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    return h.hexdigest() if count >= 3 else None
+
+
+def main():
+    ap=argparse.ArgumentParser(description='Classify an inserted optical disc before choosing a PCGA ingest backend')
+    ap.add_argument('--field', choices=['route','kind','fingerprint','label','fs_type'])
+    ap.add_argument('--no-mount', action='store_true')
+    ap.add_argument('device')
+    args=ap.parse_args()
+    dev=normalize(args.device)
+    props=udev_props(dev)
+    fs_type=props.get('ID_FS_TYPE','')
+    fs_label=props.get('ID_FS_LABEL','') or props.get('ID_FS_LABEL_ENC','')
+    if not fs_type:
+        p=run(['blkid','-p','-o','value','-s','TYPE',dev])
+        if p and p.returncode==0: fs_type=p.stdout.strip()
+    if not fs_label:
+        p=run(['blkid','-p','-o','value','-s','LABEL',dev])
+        if p and p.returncode==0: fs_label=p.stdout.strip()
+    audio=num(props,'ID_CDROM_MEDIA_TRACK_COUNT_AUDIO')
+    data=num(props,'ID_CDROM_MEDIA_TRACK_COUNT_DATA')
+    total=num(props,'ID_CDROM_MEDIA_TRACK_COUNT') or (audio+data)
+    bytes_=0
+    p=run(['blockdev','--getsize64',dev])
+    if p and p.returncode==0:
+        try: bytes_=int(p.stdout.strip())
+        except ValueError: pass
+    inspect={}
+    if not args.no_mount and (data>0 or fs_type.lower() in {'iso9660','udf'}):
+        inspect=mount_inspect(dev)
+    video_ts=bool(inspect.get('video_ts')); bdmv=bool(inspect.get('bdmv'))
+    if bdmv:
+        kind='bluray-video'; route='arm-video'; confidence=0.99; reason='BDMV filesystem structure detected'
+    elif video_ts:
+        kind='dvd-video'; route='arm-video'; confidence=0.99; reason='VIDEO_TS filesystem structure detected'
+    elif audio>0 and data>0:
+        kind='mixed-mode-cd'; route='pc-mixed'; confidence=0.99; reason=f'mixed-mode CD has {data} data and {audio} audio track(s)'
+    elif audio>0 and data==0:
+        kind='audio-cd'; route='arm-audio'; confidence=0.99; reason=f'audio-only CD has {audio} audio track(s)'
+    elif data>0 or fs_type.lower() in {'iso9660','udf'}:
+        kind='data-disc'; route='pc-data'; confidence=0.98; reason='data track/filesystem detected without DVD/Blu-ray video structure'
+    else:
+        kind='unknown'; route='unsupported'; confidence=0.25; reason='disc is present but no supported media signature was found'
+    content_guess='unknown'; content_confidence=0.0
+    gm=inspect.get('game_markers') or []; gs=inspect.get('game_suffix_hits') or []; ie=inspect.get('installer_markers') or []; apps=inspect.get('application_executables') or []
+    if gm:
+        content_guess='pc-game'; content_confidence=0.99
+    elif gs and (ie or apps):
+        content_guess='pc-game'; content_confidence=0.95
+    elif route=='pc-mixed' and (ie or apps):
+        content_guess='pc-game'; content_confidence=0.90
+    elif ie and apps:
+        content_guess='pc-game-candidate'; content_confidence=0.86
+    elif ie:
+        content_guess='software'; content_confidence=0.82
+    samples = content_fingerprint(dev, bytes_) if route == 'arm-video' else None
+    # Version 2 video-disc IDs include sampled content. Do not reuse weak
+    # volume-label identities when the same-sized disc replaces another disc.
+    sig_parts = ([kind, fs_type, str(bytes_), samples] if samples else
+                 [dev, fs_type, fs_label, str(audio), str(data), str(total), str(bytes_), kind])
+    fingerprint = hashlib.sha256('\0'.join(sig_parts).encode()).hexdigest()
+    fingerprint_quality = 'content-sampled' if samples else 'weak-volume-toc'
+    payload={
+        'schema':1,'device':dev,'kind':kind,'route':route,'confidence':confidence,'reason':reason,
+        'filesystem':{'type':fs_type,'label':fs_label},
+        'tracks':{'total':total,'data':data,'audio':audio},'bytes':bytes_,
+        'content_guess':content_guess,'content_confidence':content_confidence,
+        'fingerprint':fingerprint,'fingerprint_quality':fingerprint_quality,'inspection':inspect,
+    }
+    if args.field:
+        value={'route':route,'kind':kind,'fingerprint':fingerprint,'label':fs_label,'fs_type':fs_type}[args.field]
+        print(value); return 0
+    print(json.dumps(payload,indent=2,sort_keys=True))
+    return 0
+
+if __name__=='__main__': raise SystemExit(main())

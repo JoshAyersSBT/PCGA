@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, datetime as dt, json, os, re, uuid
+from pathlib import Path
+
+STATE=Path('/var/lib/pc-game-archive/game-intake')
+SETS=STATE/'sets'; DISCS=STATE/'discs'; COLLECTIONS=STATE/'collections'
+ROOT_FILE=Path('/etc/pc-game-archive/archive-root')
+
+
+def load(p:Path):
+    try:
+        d=json.loads(p.read_text()); return d if isinstance(d,dict) else {}
+    except Exception:return {}
+
+def save(p:Path,d):
+    p.parent.mkdir(parents=True,exist_ok=True)
+    t=p.with_suffix(p.suffix+'.tmp'); t.write_text(json.dumps(d,indent=2,sort_keys=True)+'\n'); os.replace(t,p)
+
+def all_json(path:Path):
+    out=[]
+    if path.exists():
+        for p in sorted(path.glob('*.json')):
+            d=load(p)
+            if d:out.append(d)
+    return out
+
+def now(): return dt.datetime.now(dt.timezone.utc).isoformat(timespec='seconds')
+def norm(v): return ' '.join(re.sub(r'[^a-z0-9]+',' ',str(v or '').casefold()).split())
+
+def set_snapshot(d:dict)->dict:
+    return {'game_set_id':d.get('id'),'title':d.get('title'),'series':d.get('series'),'edition':d.get('edition')}
+
+def migrate_disc(d:dict)->dict:
+    if not d:return d
+    if not isinstance(d.get('contents'),list):
+        d['contents']=[]
+        sid=str(d.get('game_set_id') or '')
+        if sid:
+            d['contents'].append({'game_set_id':sid,'title':d.get('title'),'source_path':'.','role':'included-game','confidence':1.0 if d.get('metadata_status')=='confirmed' else 0.9,'status':d.get('metadata_status','provisional')})
+    ids=[]
+    for item in d.get('contents') or []:
+        sid=str((item or {}).get('game_set_id') or '')
+        if sid and sid not in ids:ids.append(sid)
+    d['game_set_ids']=ids
+    if len(ids)==1 and not d.get('game_set_id'):d['game_set_id']=ids[0]
+    if len(ids)>1:d['game_set_id']=None
+    if not d.get('layout'):
+        d['layout']='compilation' if len(ids)>1 else ('multi-disc-game' if d.get('disc_count') or d.get('disc_number') else 'single-game')
+    return d
+
+
+def sync_set_media(set_id:str,current:dict|None=None):
+    p=SETS/f'{set_id}.json'; rec=load(p)
+    if not rec:return
+    members={}
+    for q in DISCS.glob('*.json') if DISCS.exists() else []:
+        d=migrate_disc(load(q)); ids=d.get('game_set_ids') or []
+        if set_id in [str(x) for x in ids]:members[str(d.get('fingerprint') or q.stem)]=d
+    if current and set_id in [str(x) for x in current.get('game_set_ids') or []]:members[str(current.get('fingerprint') or '')]=current
+    rows=[]
+    for d in members.values():
+        rows.append({'fingerprint':d.get('fingerprint'),'disc_number':d.get('disc_number'),'disc_count':d.get('disc_count'),'disc_role':d.get('disc_role'),'volume_label':d.get('volume_label'),'metadata_status':d.get('metadata_status'),'layout':d.get('layout')})
+    rows.sort(key=lambda x:(int(x.get('disc_number')) if isinstance(x.get('disc_number'),int) else 9999,str(x.get('volume_label') or '').casefold()))
+    declared=[int(x['disc_count']) for x in rows if isinstance(x.get('disc_count'),int) and x['disc_count']>0]
+    rec['media']={'schema':1,'kind':'optical-disc-set','disc_count':max(declared) if declared else len(rows),'discs':rows}
+    rec['disc_fingerprints']=[str(x.get('fingerprint')) for x in rows if x.get('fingerprint')]
+    rec['updated_at']=now();save(p,rec)
+
+def sync_preserved_sidecars(disc:dict)->list[str]:
+    """Carry an explicit user assignment into preservation-backed metadata.
+
+    The fingerprint registry is canonical, but the immutable game bundle keeps a
+    travelling .pcga-game.json recovery sidecar.  Keeping both copies aligned
+    prevents a later source rescan from resurrecting an obsolete title mapping.
+    The disc image itself is never modified.
+    """
+    fp=str(disc.get('fingerprint') or '').strip()
+    if not fp or not ROOT_FILE.is_file():return []
+    try:root=Path(ROOT_FILE.read_text().strip())
+    except OSError:return []
+    if not root.is_absolute():return []
+    search_roots=[
+        root/'ingest/inbox/pc-games', root/'ingest/inbox/software', root/'ingest/inbox/disc-images',
+        root/'media/metadata-pending', root/'media/quarantine/unidentified', root/'media/quarantine/duplicates',
+    ]
+    updated=[]; matched_dirs=set()
+    for base in search_roots:
+        if not base.exists():continue
+        for marker in base.rglob('.pcga-game.json'):
+            current=load(marker)
+            if str(current.get('fingerprint') or '')!=fp:continue
+            save(marker,disc);updated.append(str(marker));matched_dirs.add(marker.parent.resolve())
+        # A user may assign a freshly-preserved image before game classification
+        # created the travelling game sidecar. In that case materialize it beside
+        # the optical preservation metadata so ownership follows the image onward.
+        for optical in base.rglob('.pcga-optical.json'):
+            current=load(optical)
+            if str(current.get('fingerprint') or '')!=fp:continue
+            parent=optical.parent.resolve()
+            if parent in matched_dirs:continue
+            marker=optical.parent/'.pcga-game.json';save(marker,disc);updated.append(str(marker));matched_dirs.add(parent)
+    return updated
+
+
+def sync_collection_members(collection_id:str, disc:dict):
+    if not collection_id:return
+    p=COLLECTIONS/f'{collection_id}.json'; c=load(p)
+    if not c:return
+    ids=list(c.get('game_set_ids') or [])
+    for sid in disc.get('game_set_ids') or []:
+        if sid and sid not in ids:ids.append(sid)
+    c['game_set_ids']=ids;c['updated_at']=now();save(p,c)
+
+def require_set(sid:str)->dict:
+    d=load(SETS/f'{sid}.json')
+    if not d:raise SystemExit('game set not found')
+    return d
+
+def main():
+    ap=argparse.ArgumentParser(description='Manage PCGA pre-rip PC game, compilation and physical-disc metadata')
+    sp=ap.add_subparsers(dest='cmd',required=True)
+    sp.add_parser('list-sets'); sp.add_parser('list-discs'); sp.add_parser('list-collections')
+    sh=sp.add_parser('show-set'); sh.add_argument('set_id')
+    dh=sp.add_parser('show-disc'); dh.add_argument('fingerprint')
+    ch=sp.add_parser('show-collection'); ch.add_argument('collection_id')
+
+    cs=sp.add_parser('create-set'); cs.add_argument('--title',required=True)
+    for x in ('sort-title','series','edition','publisher','developer','operating-system','language','region'):cs.add_argument('--'+x)
+    cs.add_argument('--release-year',type=int);cs.add_argument('--confirm',action='store_true')
+
+    cc=sp.add_parser('create-collection');cc.add_argument('--title',required=True)
+    for x in ('sort-title','edition','publisher','developer','language','region'):cc.add_argument('--'+x)
+    cc.add_argument('--release-year',type=int);cc.add_argument('--confirm',action='store_true')
+
+    us=sp.add_parser('update-set'); us.add_argument('set_id')
+    for x in ('title','sort-title','series','edition','publisher','developer','operating-system','language','region'):us.add_argument('--'+x)
+    us.add_argument('--release-year',type=int); us.add_argument('--confirm',action='store_true')
+
+    uc=sp.add_parser('update-collection');uc.add_argument('collection_id')
+    for x in ('title','sort-title','edition','publisher','developer','language','region'):uc.add_argument('--'+x)
+    uc.add_argument('--release-year',type=int);uc.add_argument('--confirm',action='store_true')
+
+    ad=sp.add_parser('assign-disc'); ad.add_argument('fingerprint'); ad.add_argument('set_id'); ad.add_argument('--number',type=int); ad.add_argument('--count',type=int); ad.add_argument('--role'); ad.add_argument('--confirm',action='store_true');ad.add_argument('--replace-compilation',action='store_true')
+    ac=sp.add_parser('assign-collection');ac.add_argument('fingerprint');ac.add_argument('collection_id');ac.add_argument('--number',type=int);ac.add_argument('--count',type=int);ac.add_argument('--confirm',action='store_true')
+    sl=sp.add_parser('set-disc-layout');sl.add_argument('fingerprint');sl.add_argument('layout',choices=('single-game','multi-disc-game','compilation','unknown'));sl.add_argument('--confirm',action='store_true')
+    ag=sp.add_parser('add-game-to-disc');ag.add_argument('fingerprint');ag.add_argument('set_id');ag.add_argument('--source-path',default='.');ag.add_argument('--role',default='included-game');ag.add_argument('--confirm',action='store_true')
+    rg=sp.add_parser('remove-game-from-disc');rg.add_argument('fingerprint');rg.add_argument('set_id');rg.add_argument('--source-path')
+
+    ns=ap.parse_args()
+    if ns.cmd=='list-sets': print(json.dumps({'sets':all_json(SETS)},indent=2)); return
+    if ns.cmd=='list-discs': print(json.dumps({'discs':[migrate_disc(x) for x in all_json(DISCS)]},indent=2)); return
+    if ns.cmd=='list-collections': print(json.dumps({'collections':all_json(COLLECTIONS)},indent=2)); return
+    if ns.cmd=='show-set':
+        d=load(SETS/f'{ns.set_id}.json');
+        if not d:raise SystemExit('game set not found')
+        print(json.dumps(d,indent=2));return
+    if ns.cmd=='show-disc':
+        d=migrate_disc(load(DISCS/f'{ns.fingerprint}.json'))
+        if not d:raise SystemExit('disc not found')
+        print(json.dumps(d,indent=2));return
+    if ns.cmd=='show-collection':
+        d=load(COLLECTIONS/f'{ns.collection_id}.json')
+        if not d:raise SystemExit('collection not found')
+        print(json.dumps(d,indent=2));return
+
+    if ns.cmd=='create-set':
+        sid=str(uuid.uuid4());ts=now();title=ns.title.strip()
+        d={'schema':1,'id':sid,'title':title,'sort_title':ns.sort_title or title,'normalized_title':norm(title),'series':ns.series,'release_year':ns.release_year,'edition':ns.edition,'publisher':ns.publisher,'developer':ns.developer,'platform':'PC','operating_system':ns.operating_system,'language':ns.language,'region':ns.region,'external_ids':{},'provisional':not ns.confirm,'user_confirmed':bool(ns.confirm),'created_at':ts,'updated_at':ts}
+        save(SETS/f'{sid}.json',d);print(json.dumps(d,indent=2));return
+    if ns.cmd=='create-collection':
+        cid=str(uuid.uuid4());ts=now();title=ns.title.strip()
+        d={'schema':1,'id':cid,'title':title,'sort_title':ns.sort_title or title,'normalized_title':norm(title),'release_year':ns.release_year,'edition':ns.edition,'publisher':ns.publisher,'developer':ns.developer,'language':ns.language,'region':ns.region,'external_ids':{},'game_set_ids':[],'provisional':not ns.confirm,'user_confirmed':bool(ns.confirm),'created_at':ts,'updated_at':ts}
+        save(COLLECTIONS/f'{cid}.json',d);print(json.dumps(d,indent=2));return
+
+    if ns.cmd=='update-set':
+        p=SETS/f'{ns.set_id}.json'; d=load(p)
+        if not d:raise SystemExit('game set not found')
+        mapping={'title':'title','sort_title':'sort_title','series':'series','edition':'edition','publisher':'publisher','developer':'developer','operating_system':'operating_system','language':'language','region':'region','release_year':'release_year'}
+        for attr,key in mapping.items():
+            v=getattr(ns,attr,None)
+            if v is not None:d[key]=v
+        if ns.title is not None:d['normalized_title']=norm(ns.title)
+        if ns.confirm:
+            d['provisional']=False; d['user_confirmed']=True
+        d['updated_at']=now();save(p,d);print(json.dumps(d,indent=2));return
+    if ns.cmd=='update-collection':
+        p=COLLECTIONS/f'{ns.collection_id}.json';d=load(p)
+        if not d:raise SystemExit('collection not found')
+        mapping={'title':'title','sort_title':'sort_title','edition':'edition','publisher':'publisher','developer':'developer','language':'language','region':'region','release_year':'release_year'}
+        for attr,key in mapping.items():
+            v=getattr(ns,attr,None)
+            if v is not None:d[key]=v
+        if ns.title is not None:d['normalized_title']=norm(ns.title)
+        if ns.confirm:
+            d['provisional']=False; d['user_confirmed']=True
+        d['updated_at']=now();save(p,d);print(json.dumps(d,indent=2));return
+
+    p=DISCS/f'{getattr(ns,"fingerprint","")}.json';d=migrate_disc(load(p))
+    if not d:raise SystemExit('disc not found')
+
+    if ns.cmd=='assign-disc':
+        target=require_set(ns.set_id)
+        previous_ids=[str(x) for x in (d.get('game_set_ids') or ([d.get('game_set_id')] if d.get('game_set_id') else [])) if x]
+        if d.get('layout')=='compilation' and len(d.get('contents') or [])>1 and not ns.replace_compilation:
+            raise SystemExit('disc is a compilation; use add-game-to-disc, or pass --replace-compilation to intentionally replace its memberships')
+        d.update(set_snapshot(target));d['game_set_ids']=[ns.set_id]
+        d['contents']=[{'game_set_id':ns.set_id,'title':target.get('title'),'source_path':'.','role':'included-game','confidence':1.0,'status':'confirmed' if ns.confirm else 'provisional'}]
+        d['layout']='multi-disc-game' if (ns.count or ns.number or d.get('disc_count') or d.get('disc_number')) else 'single-game'
+        over=dict(d.get('user_overrides') or {})
+        if ns.number is not None:d['disc_number']=ns.number;over['disc_number']=ns.number
+        if ns.count is not None:d['disc_count']=ns.count;over['disc_count']=ns.count
+        if ns.role is not None:d['disc_role']=ns.role;over['disc_role']=ns.role
+        over['layout']=d['layout'];over['game_set_ids']=[ns.set_id];d['user_overrides']=over
+        d['collection_id']=None;d['match']={'method':'user-assigned','confidence':1.0,'candidate_set_ids':[ns.set_id]};d['updated_at']=now()
+        if ns.confirm:d['metadata_status']='confirmed'
+        save(p,d);sync_preserved_sidecars(d)
+        for sid in dict.fromkeys(previous_ids+[ns.set_id]):sync_set_media(sid,d if sid==ns.set_id else None)
+        print(json.dumps(d,indent=2));return
+
+    if ns.cmd=='assign-collection':
+        c=load(COLLECTIONS/f'{ns.collection_id}.json')
+        if not c:raise SystemExit('collection not found')
+        d['collection_id']=ns.collection_id;d['collection_title']=c.get('title');d['layout']='compilation'
+        if ns.number is not None:d['disc_number']=ns.number
+        if ns.count is not None:d['disc_count']=ns.count
+        over=dict(d.get('user_overrides') or {});over['collection_id']=ns.collection_id;over['layout']='compilation';d['user_overrides']=over
+        if ns.confirm:d['metadata_status']='confirmed'
+        d['updated_at']=now();save(p,d);sync_collection_members(ns.collection_id,d);print(json.dumps(d,indent=2));return
+
+    if ns.cmd=='set-disc-layout':
+        d['layout']=ns.layout;over=dict(d.get('user_overrides') or {});over['layout']=ns.layout;d['user_overrides']=over
+        if ns.confirm:d['metadata_status']='confirmed'
+        d['updated_at']=now();save(p,d);print(json.dumps(d,indent=2));return
+
+    if ns.cmd=='add-game-to-disc':
+        target=require_set(ns.set_id);items=list(d.get('contents') or []);src=str(ns.source_path or '.').strip() or '.'
+        found=None
+        for item in items:
+            if str(item.get('game_set_id') or '')==ns.set_id and str(item.get('source_path') or '.')==src:found=item;break
+        if found is None:
+            found={'game_set_id':ns.set_id,'title':target.get('title'),'source_path':src,'role':ns.role,'confidence':1.0,'status':'confirmed' if ns.confirm else 'provisional'};items.append(found)
+        else:
+            found.update({'title':target.get('title'),'role':ns.role,'confidence':1.0});
+            if ns.confirm:found['status']='confirmed'
+        d['contents']=items;d['layout']='compilation' if len({str(x.get('game_set_id') or '') for x in items if x.get('game_set_id')})>1 else d.get('layout','single-game')
+        ids=[]
+        for item in items:
+            sid=str(item.get('game_set_id') or '')
+            if sid and sid not in ids:ids.append(sid)
+        d['game_set_ids']=ids;d['game_set_id']=ids[0] if len(ids)==1 else None
+        if len(ids)>1:d['title']=d.get('collection_title') or d.get('volume_label') or 'PC Game Compilation'
+        if ns.confirm:d['metadata_status']='confirmed'
+        d['updated_at']=now();save(p,d);sync_set_media(ns.set_id,d);sync_collection_members(str(d.get('collection_id') or ''),d);print(json.dumps(d,indent=2));return
+
+    if ns.cmd=='remove-game-from-disc':
+        items=[]
+        for item in d.get('contents') or []:
+            same=str(item.get('game_set_id') or '')==ns.set_id
+            if ns.source_path is not None:same=same and str(item.get('source_path') or '.')==ns.source_path
+            if not same:items.append(item)
+        d['contents']=items;ids=[]
+        for item in items:
+            sid=str(item.get('game_set_id') or '')
+            if sid and sid not in ids:ids.append(sid)
+        d['game_set_ids']=ids;d['game_set_id']=ids[0] if len(ids)==1 else None
+        if len(ids)<=1 and d.get('layout')=='compilation' and not d.get('collection_id'):d['layout']='single-game'
+        d['updated_at']=now();save(p,d);sync_set_media(ns.set_id,d);print(json.dumps(d,indent=2));return
+
+if __name__=='__main__':main()

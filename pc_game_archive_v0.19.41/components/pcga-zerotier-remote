@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import ipaddress,json,os,re,shutil,subprocess,sys,tempfile,urllib.request
+VERSION="0.19.0"; PORTAL_PORT=8443
+MOONLIGHT_BASE=int(os.environ.get("PCGA_MOONLIGHT_WEB_PORT","8101")); MOONLIGHT_LANES=max(1,min(8,int(os.environ.get("PCGA_MOONLIGHT_WEB_LANES","4"))))
+def run(args,timeout=45):
+    try:return subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=timeout)
+    except Exception as exc:return subprocess.CompletedProcess(args,127,"",str(exc))
+def read_payload():
+    try:
+        x=json.loads(sys.stdin.read() or "{}"); return x if isinstance(x,dict) else {}
+    except Exception:return {}
+def clean_ip(v):
+    try:return str(ipaddress.ip_address(str(v).split('/')[0]))
+    except Exception:return ""
+def status():
+    out={"ok":True,"provider":"zerotier","version":VERSION,"available":False,"configured":False,"state":"unavailable","node_id":"","networks":[],"ips":[],"portal_url":"","moonlight_url":"","moonlight_urls":[],"detail":"ZeroTier CLI is not installed on this appliance."}
+    if not shutil.which("zerotier-cli"): return out
+    out["available"]=True
+    p=run(["zerotier-cli","-j","info"],12)
+    try: info=json.loads(p.stdout or "{}") if p.returncode==0 else {}
+    except Exception: info={}
+    out["node_id"]=str(info.get("address") or "")
+    online=str(info.get("online") if "online" in info else info.get("status") or "").lower() in {"true","online"}
+    p=run(["zerotier-cli","-j","listnetworks"],15)
+    try: nets=json.loads(p.stdout or "[]") if p.returncode==0 else []
+    except Exception: nets=[]
+    if not isinstance(nets,list): nets=[]
+    ips=[]; rows=[]
+    for n in nets:
+        if not isinstance(n,dict): continue
+        assigned=n.get("assignedAddresses") or n.get("assigned_addresses") or []
+        nip=[clean_ip(x) for x in assigned]; nip=[x for x in nip if x]
+        ips.extend(nip)
+        rows.append({"id":str(n.get("nwid") or n.get("id") or ""),"name":str(n.get("name") or ""),"status":str(n.get("status") or ""),"type":str(n.get("type") or ""),"device":str(n.get("portDeviceName") or n.get("dev") or ""),"ips":nip})
+    ips=list(dict.fromkeys(ips)); out["networks"]=rows; out["ips"]=ips
+    ready=online and any(str(n.get("status") or "").upper()=="OK" for n in rows)
+    if ready:
+        ip=next((x for x in ips if ":" not in x),ips[0] if ips else "")
+        out.update(configured=True,state="ready")
+        if ip:
+            out["portal_url"]=f"https://{ip}:{PORTAL_PORT}/"; out["moonlight_urls"]=[f"https://{ip}:{MOONLIGHT_BASE+i}/" for i in range(MOONLIGHT_LANES)]; out["moonlight_url"]=out["moonlight_urls"][0]
+        out["detail"]=f"ZeroTier is online on {sum(1 for n in rows if str(n.get('status') or '').upper()=='OK')} authorized network(s)."
+    elif rows:
+        out.update(state="awaiting-authorization",detail="ZeroTier has joined a network but is waiting for controller authorization or configuration.")
+    else:
+        out.update(state="disconnected" if online else "offline",detail="ZeroTier is installed. Join an existing 16-character network ID to enable remote access or the virtual gaming LAN.")
+    return out
+
+def install_client():
+    if shutil.which("zerotier-cli"): return status()
+    try:
+        with urllib.request.urlopen("https://install.zerotier.com/",timeout=25) as r: script=r.read(2_000_000)
+        install_dir="/var/lib/pc-game-archive/control/installers"; os.makedirs(install_dir,exist_ok=True)
+        fd,path=tempfile.mkstemp(prefix="pcga-zerotier-",suffix=".sh",dir=install_dir); os.write(fd,script); os.close(fd); os.chmod(path,0o700)
+        if shutil.which("systemd-run"):
+            p=run(["systemd-run","--quiet","--wait","--pipe","--collect", "/bin/bash",path],240)
+        else:
+            p=run(["bash",path],180)
+        os.unlink(path)
+    except Exception as exc:return {"ok":False,"provider":"zerotier","error":"zerotier-install-failed","detail":str(exc)[:900]}
+    if p.returncode!=0:return {"ok":False,"provider":"zerotier","error":"zerotier-install-failed","detail":(p.stderr or p.stdout)[-1200:]}
+    return status()
+def reconcile_tls():
+    h="/usr/local/sbin/pcga-network-identity"
+    if os.path.isfile(h): run([h],150)
+def main():
+    cmd=sys.argv[1] if len(sys.argv)>1 else "status"; req=read_payload() if cmd in {"join","leave"} else {}
+    if cmd=="status": obj=status()
+    elif cmd=="refresh":
+        obj=status()
+        if obj.get("configured"):
+            reconcile_tls(); obj=status()
+    elif cmd=="install": obj=install_client()
+    elif cmd in {"join","leave"}:
+        nwid=str(req.get("network_id") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{16}",nwid): obj={"ok":False,"provider":"zerotier","error":"invalid-network-id","detail":"ZeroTier network IDs are exactly 16 hexadecimal characters."}
+        elif not shutil.which("zerotier-cli"): obj={"ok":False,"provider":"zerotier","error":"zerotier-not-installed","detail":"Install the ZeroTier client first."}
+        else:
+            p=run(["zerotier-cli",cmd,nwid],45)
+            if p.returncode!=0 or not ("200" in (p.stdout or "") or p.returncode==0): obj={"ok":False,"provider":"zerotier","error":f"zerotier-{cmd}-failed","detail":(p.stderr or p.stdout)[-1200:]}
+            else: reconcile_tls(); obj=status()
+    else: obj={"ok":False,"provider":"zerotier","error":"invalid-command","detail":"usage: pcga-zerotier-remote {status|refresh|install|join|leave}"}
+    print(json.dumps(obj,separators=(",",":"))); raise SystemExit(0 if obj.get("ok",False) else 2)
+if __name__=="__main__": main()

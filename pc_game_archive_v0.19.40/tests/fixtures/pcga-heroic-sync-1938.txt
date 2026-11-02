@@ -1,0 +1,47 @@
+def reconcile_wolf(items,archive):
+    if not WOLF_CONFIG.exists(): return {'changed':False,'restarted':False,'detail':'Wolf config is not present yet'}
+    image_ready=run(['docker','image','inspect',IMAGE],20).returncode==0
+    blocks=[]
+    if image_ready:
+        blocks.append(app_block(LAUNCHER_TITLE,'PCGA-Heroic-Library','launcher',archive,LAUNCHER_SID))
+        for x in items:
+            token=x['pcga_set_id'].split('-',1)[1][:12]
+            blocks.append(app_block(x['stream_app_title'],'PCGA-Heroic-'+token,'game',archive,x['pcga_set_id'],x['heroic_app_name'],x['heroic_runner']))
+    managed=BEGIN+'\n'+('\n'.join(blocks) if blocks else '')+END+'\n'
+    original=WOLF_CONFIG.read_text(encoding='utf-8')
+    rx=re.compile(r'(?ms)^'+re.escape(BEGIN)+r'\n.*?^'+re.escape(END)+r'\n?')
+    if rx.search(original):
+        updated=rx.sub(managed,original,count=1)
+    else:
+        # Publish into PCGA's Moonlight profile, not merely at EOF: Wolf may
+        # contain more than one [[profiles]] entry and nested app arrays belong
+        # to the profile section in which they are declared.
+        profile_rx=re.compile(r'(?m)^\[\[profiles\]\]\s*$')
+        starts=[m.start() for m in profile_rx.finditer(original)]
+        insert_at=None
+        for i,start in enumerate(starts):
+            end=starts[i+1] if i+1<len(starts) else len(original)
+            section=original[start:end]
+            if re.search(r'(?m)^\s*id\s*=\s*[\"\']moonlight-profile-id[\"\']\s*$',section):
+                insert_at=end; break
+        if insert_at is None:
+            raise RuntimeError('Wolf moonlight-profile-id profile is missing')
+        updated=original[:insert_at].rstrip()+'\n\n'+managed+'\n'+original[insert_at:].lstrip('\n')
+    if updated==original: return {'changed':False,'restarted':False,'detail':'Wolf Heroic applications are current'}
+    # Validate TOML before replacing the authoritative Wolf config.
+    try:
+        import tomllib; tomllib.loads(updated)
+    except Exception as exc: raise RuntimeError(f'generated Wolf TOML is invalid: {exc}')
+    backup=WOLF_CONFIG.with_suffix('.toml.pre-heroic')
+    if not backup.exists(): shutil.copy2(WOLF_CONFIG,backup)
+    tmp=WOLF_CONFIG.with_suffix('.toml.heroic.tmp'); tmp.write_text(updated); os.replace(tmp,WOLF_CONFIG)
+    if runtime_active():
+        atomic_json(STATE/'wolf-reload-pending.json',{'schema':1,'reason':'heroic-catalog-changed','updated_at':time.time()})
+        return {'changed':True,'restarted':False,'pending':True,'detail':'Heroic catalog updated; Wolf reload deferred until active game sessions finish'}
+    p=run(['docker','restart','wolf'],90)
+    restarted=p.returncode==0
+    if restarted:
+        (STATE/'wolf-reload-pending.json').unlink(missing_ok=True)
+        bootstrap=Path('/usr/local/sbin/pcga-moonlight-web-bootstrap')
+        if bootstrap.exists(): run([str(bootstrap)],180)
+    return {'changed':True,'restarted':restarted,'detail':'Heroic Wolf applications published' if restarted else ('Wolf config updated; restart failed: '+(p.stderr or p.stdout)[-500:])}

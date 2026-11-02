@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+STACK_DIR=/opt/pc-game-archive
+TLS_DIR=/etc/pc-game-archive/tls
+STATE_DIR=/var/lib/pc-game-archive/bootstrap
+STATE_FILE="$STATE_DIR/secure-context.json"
+CA_KEY="$TLS_DIR/pcga-ca.key"
+CA_CERT="$TLS_DIR/pcga-ca.crt"
+SERVER_KEY="$TLS_DIR/pcga-server.key"
+SERVER_CERT="$TLS_DIR/pcga-server.crt"
+SERVER_CSR="$TLS_DIR/pcga-server.csr"
+PORTAL_TLS_PORT="${PCGA_STATUS_TLS_PORT:-8443}"
+PORTAL_HTTP_PORT="${PCGA_STATUS_PORT:-}"
+MOONLIGHT_PORT="${PCGA_MOONLIGHT_WEB_PORT:-8101}"
+PORTAL_DNS_NAME="${PCGA_PORTAL_DNS_NAME:-pcga.portal}"
+LAN_HTTPS_PORT_FILE=/etc/pc-game-archive/lan-https-port
+
+log(){ printf '[pcga-secure-context] %s\n' "$*"; }
+fail(){ printf '[pcga-secure-context:error] %s\n' "$*" >&2; exit 1; }
+
+[[ $EUID -eq 0 ]] || exec sudo -E bash "$0" "$@"
+command -v openssl >/dev/null 2>&1 || fail 'openssl is required to provision the local PCGA certificate authority'
+
+old_persisted_ip=""
+if [[ -r "$STACK_DIR/.env" ]]; then
+  old_persisted_ip="$(awk -F= '$1=="PCGA_LAN_IP"{print substr($0,index($0,"=")+1)}' "$STACK_DIR/.env" | tail -n1)"
+  if [[ -z "$PORTAL_HTTP_PORT" ]]; then
+    PORTAL_HTTP_PORT="$(awk -F= '$1=="STATUS_PORT"{print substr($0,index($0,"=")+1)}' "$STACK_DIR/.env" | tail -n1)"
+  fi
+fi
+PORTAL_HTTP_PORT="${PORTAL_HTTP_PORT:-8098}"
+
+detect_current_lan_ip(){
+  local ip="" iface=""
+  # Prefer the source address selected by the default IPv4 route. Unlike the
+  # persisted .env value, this reflects DHCP state from the current boot.
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if [[ -z "$ip" ]]; then
+    iface="$(ip -4 route show default 2>/dev/null | awk '/^default/{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    if [[ -n "$iface" ]]; then
+      ip="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')"
+    fi
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="$(ip -o -4 addr show scope global 2>/dev/null | awk '$2 !~ /^(docker[0-9]*|br-|veth|virbr|tailscale|netbird|wt[0-9]|zt|tun|tap|wg)/ {sub(/\/.*/,"",$4); print $4; exit}')"
+  fi
+  # A generic hostname address list may contain Docker bridges before DHCP has
+  # configured the physical NIC. Never use that fallback in strict boot-time
+  # discovery; it remains available for manual/non-strict recovery calls.
+  if [[ -z "$ip" && "${PCGA_REQUIRE_LIVE_LAN_IP:-0}" != 1 ]]; then
+    ip="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./ && $i !~ /^169\.254\./){print $i; exit}}')"
+  fi
+  printf '%s\n' "$ip"
+}
+
+# An explicitly supplied PCGA_LAN_IP is honored for upgrade/testing calls. A
+# normal boot has no override and must discover the current address before ever
+# consulting the persisted value, otherwise DHCP changes become permanent.
+lan_ip="${PCGA_LAN_IP:-}"
+if [[ "${PCGA_DISCOVER_LAN_IP:-0}" == 1 ]]; then
+  lan_ip=""
+  # Some distributions reach network-online.target before DHCP has installed a
+  # usable default-route source address. Wait boundedly rather than accepting
+  # yesterday's persisted IP during that boot window.
+  for _ in $(seq 1 "${PCGA_LAN_DISCOVERY_TRIES:-30}"); do
+    lan_ip="$(detect_current_lan_ip)"
+    [[ -n "$lan_ip" ]] && break
+    sleep "${PCGA_LAN_DISCOVERY_DELAY:-2}"
+  done
+elif [[ -z "$lan_ip" ]]; then
+  lan_ip="$(detect_current_lan_ip)"
+fi
+if [[ -z "$lan_ip" && "${PCGA_REQUIRE_LIVE_LAN_IP:-0}" == 1 ]]; then
+  fail 'No live LAN IPv4 address became available before the DHCP discovery timeout'
+fi
+[[ -n "$lan_ip" ]] || lan_ip="$old_persisted_ip"
+[[ "$lan_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Unable to determine an IPv4 LAN address (got '$lan_ip')"
+
+# Keep Compose/WebRTC consumers in lockstep with the certificate identity. The
+# write is atomic so Docker Compose can never observe a partially written .env.
+python3 - "$STACK_DIR/.env" "$lan_ip" <<'PYENV'
+from pathlib import Path
+import os,sys,tempfile
+p=Path(sys.argv[1]); ip=sys.argv[2]
+lines=p.read_text(encoding='utf-8',errors='replace').splitlines() if p.exists() else []
+out=[]; seen=False
+for line in lines:
+    if line.split('=',1)[0].strip()=='PCGA_LAN_IP':
+        if not seen: out.append(f'PCGA_LAN_IP={ip}'); seen=True
+    else:
+        out.append(line)
+if not seen: out.append(f'PCGA_LAN_IP={ip}')
+mode=(p.stat().st_mode & 0o777) if p.exists() else 0o600
+uid=p.stat().st_uid if p.exists() else 0; gid=p.stat().st_gid if p.exists() else 0
+fd,tmp=tempfile.mkstemp(prefix='.env.pcga-',dir=str(p.parent),text=True)
+try:
+    with os.fdopen(fd,'w',encoding='utf-8') as f: f.write('\n'.join(out)+'\n')
+    os.chmod(tmp,mode)
+    try: os.chown(tmp,uid,gid)
+    except PermissionError: pass
+    os.replace(tmp,p)
+finally:
+    try:
+        if os.path.exists(tmp): os.unlink(tmp)
+    except OSError: pass
+PYENV
+
+host_name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf 'pcga')"
+host_name="${host_name//[^A-Za-z0-9.-]/-}"
+[[ -n "$host_name" ]] || host_name=pcga
+
+# Collect active overlay IPv4 addresses. They are certificate identities only;
+# they must never replace the physical LAN address used for bootstrap trust.
+mapfile -t OVERLAY_IPS < <(python3 - <<'PYOVERLAY'
+import ipaddress,json,shutil,subprocess
+ips=[]
+def add(v):
+    try:
+        ip=str(ipaddress.ip_address(str(v).split('/')[0]))
+        if ':' not in ip and ip not in ips: ips.append(ip)
+    except Exception: pass
+def run(args):
+    try: return subprocess.run(args,text=True,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=8)
+    except Exception: return None
+if shutil.which('tailscale'):
+    p=run(['tailscale','status','--json'])
+    if p and p.returncode==0:
+        try:
+            d=json.loads(p.stdout or '{}'); self=d.get('Self') if isinstance(d.get('Self'),dict) else {}
+            for v in self.get('TailscaleIPs') or []: add(v)
+        except Exception: pass
+if shutil.which('netbird'):
+    p=run(['netbird','status','--ipv4'])
+    if p and p.returncode==0: add((p.stdout or '').strip())
+if shutil.which('zerotier-cli'):
+    p=run(['zerotier-cli','-j','listnetworks'])
+    if p and p.returncode==0:
+        try:
+            rows=json.loads(p.stdout or '[]')
+            if isinstance(rows,list):
+                for row in rows:
+                    if isinstance(row,dict):
+                        for v in row.get('assignedAddresses') or []: add(v)
+        except Exception: pass
+for ip in ips: print(ip)
+PYOVERLAY
+)
+
+install -d -m 0751 "$TLS_DIR"
+install -d -m 0755 "$STATE_DIR"
+# Moonlight Web runs as uid 999 in the pinned image. Allow ordinary
+# host users to traverse this directory so the public CA certificate can be
+# consumed by curl/browser bootstrap helpers, while private-key confidentiality
+# remains enforced by the key files' 0600/0640 modes. The status sidecar runs
+# as root.
+chown root:999 "$TLS_DIR" 2>/dev/null || true
+chmod 0751 "$TLS_DIR"
+
+needs_ca=1
+if [[ -s "$CA_KEY" && -s "$CA_CERT" ]] && \
+   openssl x509 -in "$CA_CERT" -noout -text 2>/dev/null | grep -q 'CA:TRUE'; then
+  needs_ca=0
+fi
+if [[ $needs_ca -eq 1 ]]; then
+  log 'Creating PCGA local certificate authority'
+  rm -f "$CA_KEY" "$CA_CERT" "$TLS_DIR/pcga-ca.srl" "$SERVER_KEY" "$SERVER_CERT" "$SERVER_CSR"
+  umask 077
+  openssl genrsa -out "$CA_KEY" 3072 >/dev/null 2>&1
+  openssl req -x509 -new -sha256 -days 3650 \
+    -key "$CA_KEY" -out "$CA_CERT" \
+    -subj '/CN=PCGA Local Appliance CA/O=PC Game Archive' \
+    -addext 'basicConstraints=critical,CA:TRUE' \
+    -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+    -addext 'subjectKeyIdentifier=hash' >/dev/null 2>&1
+fi
+chmod 0600 "$CA_KEY"
+chmod 0644 "$CA_CERT"
+
+needs_server_cert=1
+certificate_reissued=0
+if [[ -s "$SERVER_KEY" && -s "$SERVER_CERT" ]]; then
+  if openssl x509 -checkend $((30*24*3600)) -noout -in "$SERVER_CERT" >/dev/null 2>&1 && \
+     openssl x509 -in "$SERVER_CERT" -noout -ext subjectAltName 2>/dev/null | grep -Fq "IP Address:${lan_ip}" && \
+     openssl x509 -in "$SERVER_CERT" -noout -ext subjectAltName 2>/dev/null | grep -Fq "DNS:${PORTAL_DNS_NAME}"; then
+    needs_server_cert=0
+  fi
+fi
+if [[ $needs_server_cert -eq 0 && ${#OVERLAY_IPS[@]} -gt 0 ]]; then
+  for overlay_ip in "${OVERLAY_IPS[@]}"; do
+    if ! openssl x509 -in "$SERVER_CERT" -noout -ext subjectAltName 2>/dev/null | grep -Fq "IP Address:${overlay_ip}"; then
+      needs_server_cert=1
+      break
+    fi
+  done
+fi
+
+if [[ $needs_server_cert -eq 1 ]]; then
+  certificate_reissued=1
+  log "Issuing appliance TLS certificate for ${lan_ip}"
+  cfg="$(mktemp)"
+  trap 'rm -f "$cfg" "$SERVER_CSR"' EXIT
+  cat >"$cfg" <<CFG
+[req]
+prompt = no
+distinguished_name = dn
+req_extensions = req_ext
+
+[dn]
+CN = ${host_name}
+O = PC Game Archive
+
+[req_ext]
+subjectAltName = @alt_names
+
+[alt_names]
+IP.1 = ${lan_ip}
+IP.2 = 127.0.0.1
+DNS.1 = ${host_name}
+DNS.2 = ${host_name}.local
+DNS.3 = pcga.local
+DNS.4 = localhost
+DNS.5 = host.docker.internal
+DNS.6 = ${PORTAL_DNS_NAME}
+CFG
+  san_index=3
+  for overlay_ip in "${OVERLAY_IPS[@]}"; do
+    printf 'IP.%d = %s\n' "$san_index" "$overlay_ip" >> "$cfg"
+    san_index=$((san_index + 1))
+  done
+  umask 077
+  openssl genrsa -out "$SERVER_KEY" 3072 >/dev/null 2>&1
+  openssl req -new -sha256 -key "$SERVER_KEY" -out "$SERVER_CSR" -config "$cfg" >/dev/null 2>&1
+  ext="$(mktemp)"
+  trap 'rm -f "$cfg" "$ext" "$SERVER_CSR"' EXIT
+  san_extra=""
+  for overlay_ip in "${OVERLAY_IPS[@]}"; do san_extra+=",IP:${overlay_ip}"; done
+  cat >"$ext" <<EXT
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=IP:${lan_ip},IP:127.0.0.1,DNS:${host_name},DNS:${host_name}.local,DNS:pcga.local,DNS:localhost,DNS:host.docker.internal,DNS:${PORTAL_DNS_NAME}${san_extra}
+EXT
+  openssl x509 -req -sha256 -days 825 \
+    -in "$SERVER_CSR" -CA "$CA_CERT" -CAkey "$CA_KEY" -CAcreateserial \
+    -out "$SERVER_CERT" -extfile "$ext" >/dev/null 2>&1
+  rm -f "$cfg" "$ext" "$SERVER_CSR"
+  trap - EXIT
+fi
+
+# Moonlight Web v3 uses rustls. Normalize the appliance private key to
+# unencrypted PKCS#8 while preserving the key material and CA trust. This also
+# makes upgrades independent of the OpenSSL default output format used when the
+# key was first generated.
+if [[ -s "$SERVER_KEY" ]] && ! grep -q 'BEGIN PRIVATE KEY' "$SERVER_KEY"; then
+  key_tmp="$(mktemp)"
+  openssl pkcs8 -topk8 -nocrypt -in "$SERVER_KEY" -out "$key_tmp" >/dev/null 2>&1 \
+    || fail 'Unable to normalize Moonlight Web TLS key for rustls'
+  cat "$key_tmp" > "$SERVER_KEY"
+  rm -f "$key_tmp"
+fi
+
+chown root:999 "$SERVER_KEY" 2>/dev/null || true
+chmod 0640 "$SERVER_KEY"
+chmod 0644 "$SERVER_CERT" "$CA_CERT"
+
+LAN_HTTPS_PORT="$PORTAL_TLS_PORT"
+[[ -r "$LAN_HTTPS_PORT_FILE" ]] && LAN_HTTPS_PORT="$(tr -cd '0-9' < "$LAN_HTTPS_PORT_FILE")"
+[[ "$LAN_HTTPS_PORT" =~ ^[0-9]+$ ]] || LAN_HTTPS_PORT="$PORTAL_TLS_PORT"
+overlay_csv="$(IFS=,; echo "${OVERLAY_IPS[*]:-}")"
+python3 - "$STATE_FILE" "$lan_ip" "$host_name" "$PORTAL_HTTP_PORT" "$PORTAL_TLS_PORT" "$MOONLIGHT_PORT" "$PORTAL_DNS_NAME" "$LAN_HTTPS_PORT" "$old_persisted_ip" "$certificate_reissued" "$overlay_csv" <<'PY'
+import json,sys,datetime,hashlib,ssl
+path,ip,host,http_port,portal_port,moon_port,dns_name,lan_https_port,old_ip,reissued,overlay_csv=sys.argv[1:]
+def cert_fp(path):
+  try:
+    pem=open(path,encoding='utf-8').read(); der=ssl.PEM_cert_to_DER_cert(pem)
+    return hashlib.sha256(der).hexdigest()
+  except Exception: return ''
+state={
+  'state':'ready',
+  'mode':'local-ca',
+  'lan_ip':ip,
+  'previous_lan_ip':old_ip,
+  'lan_ip_changed':bool(old_ip and old_ip != ip),
+  'certificate_reissued':reissued == '1',
+  'server_certificate_sha256':cert_fp('/etc/pc-game-archive/tls/pcga-server.crt'),
+  'ca_certificate_sha256':cert_fp('/etc/pc-game-archive/tls/pcga-ca.crt'),
+  'hostname':host,
+  'portal_http_port':int(http_port),
+  'portal_https_port':int(portal_port),
+  'moonlight_https_port':int(moon_port),
+  'portal_url':f'https://{ip}:{portal_port}/',
+  'lan_dns_name':dns_name,
+  'lan_portal_url':f'https://{dns_name}/' if int(lan_https_port)==443 else f'https://{dns_name}:{lan_https_port}/',
+  'moonlight_url':f'https://{ip}:{moon_port}/',
+  'overlay_ips':[x for x in overlay_csv.split(',') if x],
+  'ca_download_url':f'http://{ip}:{http_port}/pcga-ca.crt',
+  'ca_subject':'PCGA Local Appliance CA',
+  'updated_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+with open(path,'w',encoding='utf-8') as f: json.dump(state,f,indent=2,sort_keys=True); f.write('\n')
+PY
+chmod 0644 "$STATE_FILE"
+log "Secure portal prepared at https://${lan_ip}:${PORTAL_TLS_PORT}/ and for LAN DNS name ${PORTAL_DNS_NAME}"
+log "Trust ${CA_CERT} on client devices to enable WebCodecs, Gamepad API, and Keyboard Lock without browser warnings"

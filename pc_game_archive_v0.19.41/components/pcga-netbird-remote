@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "0.19.41"
+STACK = Path("/opt/pc-game-archive")
+COMPOSE_FILE = STACK / "compose.netbird.yml"
+SETUP_DIR = Path("/etc/pc-game-archive/netbird")
+STATE_DIR = Path("/var/lib/pc-game-archive/netbird")
+SETUP_KEY = SETUP_DIR / "setup-key"
+MANAGEMENT_URL = SETUP_DIR / "management-url"
+CONTAINER = "pcga-netbird"
+IMAGE = "netbirdio/netbird:0.81.3"
+PORTAL_PORT = 8443
+MOONLIGHT_BASE = int(os.environ.get("PCGA_MOONLIGHT_WEB_PORT", "8101"))
+MOONLIGHT_LANES = max(1, min(8, int(os.environ.get("PCGA_MOONLIGHT_WEB_LANES", "4"))))
+
+
+def run(args, timeout=45, input_text=None):
+    try:
+        return subprocess.run(args, text=True, input=input_text, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, timeout=timeout)
+    except Exception as exc:
+        return subprocess.CompletedProcess(args, 127, "", str(exc))
+
+
+def compose(*args):
+    return ["docker", "compose", "--project-name", "pcga-netbird", "--file", str(COMPOSE_FILE),
+            "--profile", "netbird", *args]
+
+
+def valid_ip(value):
+    try:
+        return str(ipaddress.ip_address(str(value).split("/")[0]))
+    except ValueError:
+        return ""
+
+
+def install_client():
+    if not shutil.which("docker"):
+        return {"ok": False, "provider": "netbird", "error": "docker-unavailable",
+                "detail": "Docker is required to run the PCGA NetBird container."}
+    if not COMPOSE_FILE.is_file():
+        return {"ok": False, "provider": "netbird", "error": "compose-missing",
+                "detail": "PCGA NetBird Compose service is not installed."}
+    try:
+        SETUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        STATE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        SETUP_DIR.chmod(0o700)
+        STATE_DIR.chmod(0o700)
+    except OSError as exc:
+        return {"ok": False, "provider": "netbird", "error": "state-directory-failed", "detail": str(exc)[:500]}
+    pulled = run(compose("pull", "netbird"), timeout=300)
+    if pulled.returncode:
+        return {"ok": False, "provider": "netbird", "error": "image-pull-failed",
+                "detail": (pulled.stderr or pulled.stdout)[-1000:]}
+    started = run(compose("up", "-d", "netbird"), timeout=120)
+    if started.returncode:
+        return {"ok": False, "provider": "netbird", "error": "container-start-failed",
+                "detail": (started.stderr or started.stdout)[-1000:]}
+    for _ in range(15):
+        result = status()
+        if result.get("available"):
+            return result
+        time.sleep(1)
+    return status()
+
+
+def _container_running():
+    result = run(["docker", "inspect", "--format", "{{.State.Running}}", CONTAINER], timeout=8)
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def _netbird(*args, timeout=12):
+    return run(["docker", "exec", CONTAINER, "netbird", *args], timeout=timeout)
+
+
+def status():
+    out = {"ok": True, "provider": "netbird", "version": VERSION, "available": False,
+           "configured": False, "state": "unavailable", "ip": "", "ips": [],
+           "portal_url": "", "moonlight_url": "", "moonlight_urls": [],
+           "p2p_peers": 0, "relayed_peers": 0,
+           "detail": "The PCGA NetBird Docker container is not installed."}
+    if not shutil.which("docker"):
+        out["detail"] = "Docker is unavailable on this appliance."
+        return out
+    if not _container_running():
+        out["state"] = "stopped"
+        out["detail"] = "The PCGA NetBird container is not running. Install or start it from Remote Networking."
+        return out
+    out.update(available=True, state="disconnected", detail="NetBird container is running but not enrolled.")
+    data_result = _netbird("status", "--json")
+    try:
+        data = json.loads(data_result.stdout) if data_result.returncode == 0 else {}
+    except (TypeError, ValueError):
+        data = {}
+    management = data.get("management", {}) if isinstance(data, dict) else {}
+    management_connected = isinstance(management, dict) and management.get("connected") is True
+    startup = _netbird("status", "--check", "startup", timeout=15)
+    if not management_connected or startup.returncode != 0:
+        logs = run(["docker", "logs", "--tail", "12", CONTAINER], timeout=8)
+        detail = (startup.stderr or startup.stdout or logs.stderr or logs.stdout).strip()
+        if not detail:
+            detail = "NetBird is waiting for a setup key or management/signal connectivity."
+        out["detail"] = detail[-700:]
+        return out
+    address = _netbird("status", "--ipv4", timeout=8)
+    ip = valid_ip(address.stdout.strip()) if address.returncode == 0 else ""
+    out.update(configured=True, state="ready", ip=ip, ips=[ip] if ip else [],
+               detail="NetBird management, signal and startup checks are connected.")
+    if ip:
+        out["portal_url"] = f"https://{ip}:{PORTAL_PORT}/"
+        out["moonlight_urls"] = [f"https://{ip}:{MOONLIGHT_BASE + i}/" for i in range(MOONLIGHT_LANES)]
+        out["moonlight_url"] = out["moonlight_urls"][0]
+    return out
+
+
+def _write_secret(path: Path, value: str):
+    SETUP_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    SETUP_DIR.chmod(0o700)
+    fd, temporary = tempfile.mkstemp(prefix=".pcga-netbird-", dir=SETUP_DIR)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(value)
+            stream.write("\n")
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def read_payload():
+    try:
+        value = json.loads(sys.stdin.read() or "{}")
+        return value if isinstance(value, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def connect():
+    req = read_payload()
+    key = str(req.get("setup_key") or "").strip()
+    management = str(req.get("management_url") or "").strip()
+    if not key:
+        return {"ok": False, "provider": "netbird", "error": "setup-key-required",
+                "detail": "Enter a NetBird setup key to enroll this appliance."}
+    if "\n" in key or "\r" in key or len(key) > 4096:
+        return {"ok": False, "provider": "netbird", "error": "invalid-setup-key",
+                "detail": "The setup key must be a single line."}
+    if "\n" in management or "\r" in management or len(management) > 512:
+        return {"ok": False, "provider": "netbird", "error": "invalid-management-url",
+                "detail": "The management URL must be a single line under 512 characters."}
+    if not _container_running():
+        installed = install_client()
+        if not installed.get("available"):
+            return installed
+    try:
+        _write_secret(SETUP_KEY, key)
+        if management:
+            _write_secret(MANAGEMENT_URL, management)
+        else:
+            MANAGEMENT_URL.unlink(missing_ok=True)
+    except OSError as exc:
+        return {"ok": False, "provider": "netbird", "error": "setup-key-write-failed", "detail": str(exc)[:500]}
+    deadline = time.monotonic() + 90
+    try:
+        while time.monotonic() < deadline:
+            result = status()
+            if result.get("configured"):
+                SETUP_KEY.unlink(missing_ok=True)
+                MANAGEMENT_URL.unlink(missing_ok=True)
+                return result
+            time.sleep(2)
+        logs = run(["docker", "logs", "--tail", "30", CONTAINER], timeout=10)
+        detail = logs.stderr or logs.stdout or "The setup key was rejected or the appliance could not reach NetBird management."
+        return {"ok": False, "provider": "netbird", "error": "netbird-connect-failed", "detail": detail[-1000:]}
+    finally:
+        SETUP_KEY.unlink(missing_ok=True)
+        MANAGEMENT_URL.unlink(missing_ok=True)
+
+
+def disconnect():
+    if not _container_running():
+        run(compose("stop", "netbird"), timeout=45)
+        return status()
+    down = _netbird("down", timeout=30)
+    run(["docker", "exec", CONTAINER, "rm", "-f", "/var/lib/netbird/.pcga-enrolled"], timeout=8)
+    stopped = run(compose("stop", "netbird"), timeout=45)
+    if down.returncode and stopped.returncode:
+        return {"ok": False, "provider": "netbird", "error": "netbird-disconnect-failed",
+                "detail": (down.stderr or stopped.stderr or down.stdout)[-800:]}
+    return {"ok": True, "provider": "netbird", "available": True, "configured": False,
+            "state": "disconnected", "ip": "", "ips": [], "portal_url": "", "moonlight_url": "",
+            "moonlight_urls": [], "p2p_peers": 0, "relayed_peers": 0,
+            "detail": "NetBird was disconnected and the container stopped. Peer identity remains on disk for reconnect."}
+
+
+def main():
+    command = sys.argv[1] if len(sys.argv) > 1 else "status"
+    if command == "status":
+        result = status()
+    elif command == "install":
+        result = install_client()
+    elif command == "connect":
+        result = connect()
+    elif command == "disconnect":
+        result = disconnect()
+    else:
+        result = {"ok": False, "provider": "netbird", "error": "invalid-command",
+                  "detail": "usage: pcga-netbird-remote {status|install|connect|disconnect}"}
+    print(json.dumps(result, separators=(",", ":")))
+    raise SystemExit(0 if result.get("ok", False) else 2)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,112 @@
+{
+  "heroic": {
+    "icon_png_path": "https://heroicgameslauncher.com/img/logo.png",
+    "start_audio_server": true,
+    "start_virtual_compositor": true,
+    "title": "PCGA Heroic Library",
+    "runner": {
+      "base_create_json": "{\"HostConfig\":{\"IpcMode\":\"host\",\"NetworkMode\":\"legacy-games\",\"AutoRemove\":true,\"CapAdd\":[\"SYS_ADMIN\",\"SYS_NICE\",\"SYS_PTRACE\",\"NET_RAW\",\"MKNOD\",\"NET_ADMIN\"],\"SecurityOpt\":[\"seccomp=unconfined\",\"apparmor=unconfined\"],\"Ulimits\":[{\"Name\":\"nofile\",\"Hard\":524288,\"Soft\":524288}],\"Privileged\":false,\"DeviceCgroupRules\":[\"c 13:* rmw\",\"c 244:* rmw\"]}}",
+      "devices": [],
+      "env": [
+        "RUN_SWAY=1",
+        "RUN_GAMESCOPE=",
+        "WAYBAR_HIDDEN=1",
+        "GOW_REQUIRED_DEVICES=/dev/input/event* /dev/dri/* /dev/snd/* /dev/nvidia*",
+        "PCGA_LAN_NETWORK=legacy-games",
+        "PCGA_GAME_SET_ID=heroic-library-manager",
+        "PCGA_HEROIC_MODE=launcher"
+      ],
+      "image": "pcga/heroic-runtime:2.22.3",
+      "mounts": [
+        "/srv/pc-game-archive/games/heroic/config:/home/retro/.config/heroic:rw",
+        "/srv/pc-game-archive/games/heroic/library:/home/retro/Games/Heroic:rw",
+        "/srv/pc-game-archive/games/heroic/cache:/home/retro/.cache/heroic:rw"
+      ],
+      "name": "PCGA-Heroic-Library",
+      "ports": [],
+      "type": "docker"
+    }
+  },
+  "jedi": [
+    {
+      "icon_png_path": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6030/capsule_231x87.jpg?t=1741814017",
+      "start_audio_server": true,
+      "start_virtual_compositor": true,
+      "title": "PCGA Game fa3059a20635",
+      "runner": {
+        "base_create_json": "{\"HostConfig\":{\"IpcMode\":\"host\",\"NetworkMode\":\"legacy-games\",\"AutoRemove\":true,\"CapAdd\":[\"SYS_ADMIN\",\"SYS_NICE\",\"SYS_PTRACE\",\"NET_RAW\",\"MKNOD\",\"NET_ADMIN\"],\"SecurityOpt\":[\"seccomp=unconfined\",\"apparmor=unconfined\"],\"Ulimits\":[{\"Name\":\"nofile\",\"Hard\":524288,\"Soft\":524288}],\"Privileged\":false,\"DeviceCgroupRules\":[\"c 13:* rmw\",\"c 244:* rmw\"]}}",
+        "devices": [
+          "/dev/loop10:/dev/pcga-media-disc1:r",
+          "/dev/loop11:/dev/pcga-media-disc2:r"
+        ],
+        "env": [
+          "RUN_SWAY=1",
+          "RUN_GAMESCOPE=",
+          "WAYBAR_HIDDEN=1",
+          "GOW_REQUIRED_DEVICES=/dev/input/event* /dev/dri/* /dev/snd/* /dev/nvidia* /dev/pcga-media-disc*",
+          "PCGA_LAN_NETWORK=legacy-games",
+          "PCGA_LANCOMMANDER_URL=http://lancommander:1337",
+          "PCGA_IPX_RELAY_HOST=lancommander",
+          "PCGA_IPX_RELAY_PORT=213",
+          "PCGA_GRAPHICS_BACKEND=auto",
+          "PCGA_DXVK_WINETRICKS_VERB=dxvk2062",
+          "PCGA_DXVK_HUD=0",
+          "PCGA_GAME_SET_ID=fa3059a2-0635-44aa-b381-15629dfc51f9",
+          "PCGA_LAUNCH_VARIANT=singleplayer"
+        ],
+        "image": "pcga/game-fa3059a2-0635-44aa-b381-15629dfc51f9",
+        "mounts": [
+          "/srv/pc-game-archive/games/installed/fa3059a2-0635-44aa-b381-15629dfc51f9:/pcga-template:ro",
+          "/srv/pc-game-archive/games/installed/fa3059a2-0635-44aa-b381-15629dfc51f9/runtime-logs:/pcga-runtime-logs:rw",
+          "/run/pcga-game-media/fa3059a2-0635-44aa-b381-15629dfc51f9/disc1:/pcga-media/disc1:ro",
+          "/srv/pc-game-archive/ingest/inbox/pc-games/consumed-20260925-082544-JEDIOUTCAST/disc.iso:/pcga-media/disc1.iso:ro",
+          "/run/pcga-game-media/fa3059a2-0635-44aa-b381-15629dfc51f9/disc2:/pcga-media/disc2:ro",
+          "/srv/pc-game-archive/ingest/inbox/pc-games/JEDIOUTCAST/disc.iso:/pcga-media/disc2.iso:ro"
+        ],
+        "name": "PCGA-fa3059a20635",
+        "ports": [],
+        "type": "docker"
+      }
+    },
+    {
+      "icon_png_path": "https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/6030/capsule_231x87.jpg?t=1741814017",
+      "start_audio_server": true,
+      "start_virtual_compositor": true,
+      "title": "PCGA Game fa3059a20635 MULTIPLAYER",
+      "runner": {
+        "base_create_json": "{\"HostConfig\":{\"IpcMode\":\"host\",\"NetworkMode\":\"legacy-games\",\"AutoRemove\":true,\"CapAdd\":[\"SYS_ADMIN\",\"SYS_NICE\",\"SYS_PTRACE\",\"NET_RAW\",\"MKNOD\",\"NET_ADMIN\"],\"SecurityOpt\":[\"seccomp=unconfined\",\"apparmor=unconfined\"],\"Ulimits\":[{\"Name\":\"nofile\",\"Hard\":524288,\"Soft\":524288}],\"Privileged\":false,\"DeviceCgroupRules\":[\"c 13:* rmw\",\"c 244:* rmw\"]}}",
+        "devices": [
+          "/dev/loop10:/dev/pcga-media-disc1:r",
+          "/dev/loop11:/dev/pcga-media-disc2:r"
+        ],
+        "env": [
+          "RUN_SWAY=1",
+          "RUN_GAMESCOPE=",
+          "WAYBAR_HIDDEN=1",
+          "GOW_REQUIRED_DEVICES=/dev/input/event* /dev/dri/* /dev/snd/* /dev/nvidia* /dev/pcga-media-disc*",
+          "PCGA_LAN_NETWORK=legacy-games",
+          "PCGA_LANCOMMANDER_URL=http://lancommander:1337",
+          "PCGA_IPX_RELAY_HOST=lancommander",
+          "PCGA_IPX_RELAY_PORT=213",
+          "PCGA_GRAPHICS_BACKEND=auto",
+          "PCGA_DXVK_WINETRICKS_VERB=dxvk2062",
+          "PCGA_DXVK_HUD=0",
+          "PCGA_GAME_SET_ID=fa3059a2-0635-44aa-b381-15629dfc51f9",
+          "PCGA_LAUNCH_VARIANT=multiplayer"
+        ],
+        "image": "pcga/game-fa3059a2-0635-44aa-b381-15629dfc51f9",
+        "mounts": [
+          "/srv/pc-game-archive/games/installed/fa3059a2-0635-44aa-b381-15629dfc51f9:/pcga-template:ro",
+          "/srv/pc-game-archive/games/installed/fa3059a2-0635-44aa-b381-15629dfc51f9/runtime-logs:/pcga-runtime-logs:rw",
+          "/run/pcga-game-media/fa3059a2-0635-44aa-b381-15629dfc51f9/disc1:/pcga-media/disc1:ro",
+          "/srv/pc-game-archive/ingest/inbox/pc-games/consumed-20260925-082544-JEDIOUTCAST/disc.iso:/pcga-media/disc1.iso:ro",
+          "/run/pcga-game-media/fa3059a2-0635-44aa-b381-15629dfc51f9/disc2:/pcga-media/disc2:ro",
+          "/srv/pc-game-archive/ingest/inbox/pc-games/JEDIOUTCAST/disc.iso:/pcga-media/disc2.iso:ro"
+        ],
+        "name": "PCGA-fa3059a20635-MULTIPLAYER",
+        "ports": [],
+        "type": "docker"
+      }
+    }
+  ]
+}

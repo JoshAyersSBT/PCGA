@@ -1,0 +1,16 @@
+[Unit]
+Description=PC Game Archive game-service startup and reconciliation
+After=docker.service network-online.target pcga-network-identity.service pcga-nas-mount.service
+Wants=docker.service network-online.target pcga-network-identity.service pcga-nas-mount.service
+Before=pcga-service-auth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pcga-game-stack-start
+TimeoutStartSec=8min
+Restart=on-failure
+RestartSec=20s
+
+[Install]
+WantedBy=multi-user.target

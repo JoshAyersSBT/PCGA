@@ -1,0 +1,14 @@
+[Unit]
+Description=PCGA dynamic LAN identity and TLS reconciliation
+Wants=network-online.target docker.service
+After=network-online.target docker.service
+Before=pcga-game-stack.service pcga-lan-dns.service pcga-thin-client-bootstrap.service pcga-service-auth.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/pcga-network-identity
+TimeoutStartSec=2min
+
+[Install]
+WantedBy=multi-user.target

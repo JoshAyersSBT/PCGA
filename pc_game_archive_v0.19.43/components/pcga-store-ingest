@@ -1,0 +1,338 @@
+#!/usr/bin/env python3
+"""PCGA v0.19.12: reconcile completed Epic/GOG acquisitions into PC Games/Wolf.
+
+No optical-ingest state is touched. A store download is never represented as
+stream-ready until a genuine installed directory and a published Wolf app exist.
+"""
+from __future__ import annotations
+import argparse
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import tempfile
+import time
+import tomllib
+from pathlib import Path
+
+VERSION = '0.19.12'
+ROOT_FILE = Path(os.environ.get('PCGA_ARCHIVE_ROOT_FILE','/etc/pc-game-archive/archive-root'))
+JOBS_DB = Path(os.environ.get('PCGA_STORE_JOB_DB','/var/lib/pc-game-archive/store-jobs/jobs.sqlite3'))
+STATE = Path(os.environ.get('PCGA_STORE_INGEST_STATE','/var/lib/pc-game-archive/store-ingest'))
+PUBLIC = Path(os.environ.get('PCGA_STORE_PUBLIC_CATALOG','/var/lib/pc-game-archive/heroic/store-games.json'))
+PROVIDER_STATE = Path(os.environ.get('PCGA_STORE_PROVIDER_STATE','/var/lib/pc-game-archive/store-providers'))
+WOLF_CONFIG = Path(os.environ.get('PCGA_WOLF_CONFIG','/etc/wolf/cfg/config.toml'))
+BACKENDS_IMAGE = 'pcga/heroic-backends:2.22.3'
+GAME_IMAGE = 'pcga/store-runtime:0.19.11'
+BEGIN = '# BEGIN PCGA STORE MANAGED APPS'
+END = '# END PCGA STORE MANAGED APPS'
+VALID_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._:+-]{0,179}\Z')
+
+
+def get_compat():
+    filename=Path(__file__).parent/'pcga-store-compat'
+    loader=importlib.machinery.SourceFileLoader('pcga_store_compat_ingest',str(filename))
+    spec=importlib.util.spec_from_loader(loader.name,loader)
+    module=importlib.util.module_from_spec(spec);loader.exec_module(module)
+    return module
+
+def run(argv, timeout=45):
+    return subprocess.run(argv, text=True, capture_output=True, timeout=timeout)
+
+
+def root():
+    path = Path(ROOT_FILE.read_text().strip())
+    if not path.is_absolute() or not path.is_dir(): raise RuntimeError('archive root is unavailable')
+    return path.resolve()
+
+
+def read_json(path, default=None):
+    try: return json.loads(path.read_text(encoding='utf-8'))
+    except (ValueError,OSError): return {} if default is None else default
+
+
+def save_json(path, doc, *, private=False):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp = tempfile.mkstemp(dir=path.parent,prefix='.'+path.name+'.')
+    try:
+        with os.fdopen(fd,'w',encoding='utf-8') as f:
+            json.dump(doc,f,indent=2,sort_keys=True);f.write('\n');f.flush();os.fsync(f.fileno())
+        os.chmod(tmp,0o600 if private else 0o644)
+        os.replace(tmp,path)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+
+
+def game_id(provider, app):
+    return 'store-'+hashlib.sha256((provider+'\x00'+app).encode()).hexdigest()[:24]
+
+
+def game_title(provider, app, jobs):
+    for job in jobs:
+        if job['provider']==provider and job['app_id']==app and job['title']:
+            return job['title']
+    cache=read_json(PROVIDER_STATE/'catalogs'/f'{provider}.json')
+    rows=cache.get('items') if isinstance(cache,dict) else None
+    for row in rows if isinstance(rows,list) else []:
+        if str(row.get('provider_game_id') or '')==app: return str(row.get('title') or app)
+    return app
+
+
+def confirmed_jobs():
+    if not JOBS_DB.is_file(): return []
+    db=sqlite3.connect('file:'+str(JOBS_DB)+'?mode=ro',uri=True,timeout=5)
+    db.row_factory=sqlite3.Row
+    try:
+        return [dict(x) for x in db.execute("SELECT id,provider,app_id,title,finished_at FROM jobs WHERE state='completed' AND operation='install' AND provider IN ('epic','gog') ORDER BY finished_at DESC")]
+    finally: db.close()
+
+
+def under(path,base):
+    try:
+        result=path.resolve(strict=True)
+        base=base.resolve(strict=True)
+        if not result.is_relative_to(base) or result==base or not result.is_dir() or not any(result.iterdir()): return None
+        return result
+    except (ValueError,OSError): return None
+
+
+def legendary_paths(config,library):
+    """Read Legendary's own installed.json; never guess its title-based directory."""
+    doc=read_json(config/'legendary'/'installed.json')
+    if isinstance(doc,dict) and isinstance(doc.get('installed'),dict):doc=doc['installed']
+    result={}
+    for key,value in doc.items() if isinstance(doc,dict) else []:
+        if not isinstance(value,dict): continue
+        app=str(value.get('app_name') or value.get('appName') or key)
+        if not VALID_ID.fullmatch(app): continue
+        raw=str(value.get('install_path') or value.get('installPath') or '')
+        if raw.startswith('/pcga/library/'):
+            folder=library/raw[len('/pcga/library/'):]
+        else:
+            folder=Path(raw)
+        valid=under(folder,library)
+        if valid: result[app]=valid
+    return result
+
+
+def gog_paths(state,library):
+    doc=read_json(state/'gog-installed.json')
+    result={}
+    for app,value in (doc.get('games') or {}).items() if isinstance(doc,dict) else []:
+        if not VALID_ID.fullmatch(str(app)) or not isinstance(value,dict): continue
+        valid=under(Path(str(value.get('install_path') or '')),library/'gog')
+        if valid and valid==((library/'gog'/str(app)).resolve()): result[str(app)]=valid
+    return result
+
+
+def executable_candidates(folder):
+    """Only choose one clearly game-like EXE, never a setup/uninstall/helper."""
+    ignored=re.compile(r'(?:unins\d*|uninstall|setup|install|redist|dxsetup|vc_redist|crash|updater|launcher|unitycrash|eula|config|benchmark|support)',re.I)
+    found=[]
+    for base,dirs,files in os.walk(folder):
+        path=Path(base)
+        depth=len(path.relative_to(folder).parts)
+        dirs[:]=sorted([x for x in dirs if not x.startswith('.') and not ignored.search(x)])[:48] if depth<5 else []
+        for file in files:
+            if not file.lower().endswith('.exe') or ignored.search(file):continue
+            exe=path/file
+            try:
+                if exe.stat().st_size >= 100*1024: found.append(exe.relative_to(folder).as_posix())
+            except OSError:pass
+            if len(found)>25:return []
+    return sorted(found)
+
+
+def discovered_games(archive,jobs):
+    library=archive/'games/stores/library'
+    config=archive/'games/stores/config'
+    results=[]
+    locations={'epic':legendary_paths(config,library),'gog':gog_paths(PROVIDER_STATE,library)}
+    # Preserve verified installs if users clear download history.
+    for provider,paths in locations.items():
+        for app,path in paths.items():
+            sid=game_id(provider,app)
+            title=game_title(provider,app,jobs)
+            exe_candidates=executable_candidates(path) if provider=='gog' else []
+            entry=exe_candidates[0] if len(exe_candidates)==1 else ''
+            ready=provider=='epic' or bool(entry)
+            results.append({
+                'id':'pcga:'+sid,'pcga_set_id':sid,'stream_id':'pcga:'+sid,'type':'PC Game',
+                'provider':provider,'provider_game_id':app,'store_provider':provider,'title':title,
+                'sort_title':title,'source':'pcga-store','source_label':'Epic Games' if provider=='epic' else 'GOG',
+                'description':'Installed from '+('Epic Games' if provider=='epic' else 'GOG')+' through PCGA Stores.',
+                'installed':True,'install_status':'ready' if ready else 'setup-required',
+                'install_phase':'Store download completed','install_path':str(path),
+                'relative_install_path':path.relative_to(library.resolve()).as_posix(),
+                'exe_relative':entry,'exe_candidates':exe_candidates if not ready else [],
+                'setup_required':not ready,'playable':False,'launchable':ready,
+                'stream_backend':'wolf-store','stream_app_title':'PCGA Store '+sid,
+                'stream_state':'pending' if ready else 'setup-required',
+                'stream_detail':'Waiting for native Wolf registration' if ready else 'More than one or no safe Windows game executable was found; launch setup is needed',
+                'runner':'legendary' if provider=='epic' else 'gogdl',
+            })
+    compat=get_compat()
+    for item in results:
+        policy=compat.settings_for(item['pcga_set_id'],item['provider'],archive)
+        item['compatibility']={key:policy[key] for key in ('mode','proton','gameid','effective_runner','umu_prepared','legacy_wine_prefix')}
+        if policy['mode']=='umu' and not policy['umu_prepared']:
+            item['stream_detail']='UMU is selected but not yet prepared in Control Center'
+            item['compatibility']['needs_umu_setup']=True
+            if item['launchable']:
+                item.update(launchable=False,playable=False,setup_required=True,stream_state='setup-required',install_status='setup-required')
+    return sorted(results,key=lambda item:(item['title'].casefold(),item['pcga_set_id']))
+
+
+def build_runtime():
+    if run(['docker','image','inspect',GAME_IMAGE],15).returncode==0: return True
+    if run(['docker','image','inspect',BACKENDS_IMAGE],15).returncode: return False
+    startup=Path(__file__).parent/'pcga-store-game-startup'
+    if not startup.is_file(): raise RuntimeError('missing store game runtime startup helper')
+    with tempfile.TemporaryDirectory(prefix='pcga-store-runtime-') as tmp:
+        folder=Path(tmp);shutil.copy2(startup,folder/'startup.sh')
+        (folder/'Dockerfile').write_text(f'FROM {BACKENDS_IMAGE}\nUSER root\nCOPY --chmod=0755 startup.sh /opt/gow/startup.sh\n')
+        result=run(['docker','build','--pull=false','-t',GAME_IMAGE,str(folder)],240)
+        if result.returncode:raise RuntimeError('store runtime image build failed: '+(result.stderr or result.stdout)[-800:])
+    return True
+
+
+def active_games():
+    result=run(['docker','ps','--format','{{.Image}} {{.Names}}'],20)
+    if result.returncode: return True  # fail closed; never restart blind
+    return any(x.startswith(('pcga/game-','pcga/setup-','pcga/heroic-runtime:','pcga/store-runtime:')) or ' PCGA-' in x or ' PCGA-Heroic-' in x for x in result.stdout.splitlines())
+
+
+def toml(s):return json.dumps(str(s))
+
+
+def app_block(game,archive):
+    sid=game['pcga_set_id']
+    config=archive/'games/stores/config';lib=archive/'games/stores/library';cache=archive/'games/stores/cache';home=archive/'games/stores/home'
+    prefixes=archive/'games/stores/prefixes';prefixes.mkdir(parents=True,exist_ok=True)
+    policy=get_compat().settings_for(sid,game['provider'],archive)
+    # Preserve pre-v0.19.11 Wine prefixes without changing their paths.
+    prefix=prefixes/sid if policy['effective_runner']=='wine' else prefixes/'proton'/sid
+    if not prefix.exists():
+        prefix.mkdir(parents=True,exist_ok=True)
+        # Wolf's retro user normally maps to the appliance PUID/PGID; a
+        # root-owned prefix would break first-run Wine setup on every game.
+        env_file=Path('/opt/pc-game-archive/.env')
+        values={}
+        if env_file.is_file():
+            for line in env_file.read_text().splitlines():
+                if '=' in line:
+                    key,value=line.split('=',1);values[key]=value.strip().strip('"')
+        try:
+            uid=int(values.get('PUID','1000'));gid=int(values.get('PGID','1000'))
+            if os.geteuid()==0:os.chown(prefix,uid,gid)
+        except (ValueError,OSError):pass
+    mounts=[f'{config}:/pcga/config:rw',f'{lib}:/pcga/library:rw',f'{cache}:/pcga/cache:rw',f'{home}:/pcga/home:rw',f'{prefix}:/pcga/prefix:rw']
+    umu=get_compat().STATE/'umu-run'
+    if policy['umu_prepared'] and umu.is_file(): mounts.append(f'{umu}:/opt/pcga-umu/umu-run:ro')
+    env=['PCGA_STORE_COMPAT_RUNNER='+policy['effective_runner'],'PCGA_STORE_PROTON='+policy['proton'],'PCGA_STORE_UMU_GAMEID='+policy['gameid'],'RUN_SWAY=1','RUN_GAMESCOPE=','WAYBAR_HIDDEN=1','GOW_REQUIRED_DEVICES=/dev/input/event* /dev/dri/* /dev/snd/* /dev/nvidia*','PCGA_LAN_NETWORK=legacy-games','PCGA_GAME_SET_ID='+sid,'PCGA_STORE_PROVIDER='+game['provider'],'PCGA_STORE_APP_ID='+game['provider_game_id'],'PCGA_STORE_RELATIVE_PATH='+game['relative_install_path'],'PCGA_STORE_EXE='+game['exe_relative']]
+    host={'IpcMode':'host','NetworkMode':'legacy-games','AutoRemove':True,'CapAdd':['SYS_ADMIN','SYS_NICE','SYS_PTRACE','NET_RAW','MKNOD','NET_ADMIN'],'SecurityOpt':['seccomp=unconfined','apparmor=unconfined'],'Ulimits':[{'Name':'nofile','Hard':524288,'Soft':524288}],'Privileged':False,'DeviceCgroupRules':['c 13:* rmw','c 244:* rmw']}
+    env_list='[\n            '+',\n            '.join(toml(x) for x in env)+'\n        ]'
+    return f'''    [[profiles.apps]]
+    title = {toml(game['stream_app_title'])}
+    icon_png_path = "https://games-on-whales.github.io/wildlife/apps/lutris/assets/icon.png"
+    start_virtual_compositor = true
+    start_audio_server = true
+
+        [profiles.apps.runner]
+        type = "docker"
+        name = {toml('PCGA-Store-'+sid[6:18])}
+        image = {toml(GAME_IMAGE)}
+        mounts = [{', '.join(toml(x) for x in mounts)}]
+        env = {env_list}
+        devices = []
+        ports = []
+        base_create_json = {toml(json.dumps({'HostConfig':host},separators=(',',':')))}
+'''
+
+
+def reconcile_wolf(games,archive,ready):
+    # Serialize with the existing optical PCGA Wolf app writer; separate
+    # component-specific locks do not prevent concurrent TOML replacements.
+    lock_path=Path(os.environ.get('PCGA_GAME_STACK_LOCK','/run/pcga-game-stack-start.lock'))
+    lock_path.parent.mkdir(parents=True,exist_ok=True)
+    with lock_path.open('a+') as handle:
+        fcntl.flock(handle,fcntl.LOCK_EX)
+        return _reconcile_wolf_locked(games,archive,ready)
+
+def _reconcile_wolf_locked(games,archive,ready):
+    if not WOLF_CONFIG.is_file():return 'wolf-missing'
+    if not ready:return 'runtime-not-ready'
+    if active_games():return 'pending-active-stream'
+    blocks='\n'.join(app_block(g,archive) for g in games if g['launchable'])
+    managed=BEGIN+'\n'+blocks+('\n' if blocks else '')+END+'\n'
+    original=WOLF_CONFIG.read_text()
+    rx=re.compile(r'(?ms)^'+re.escape(BEGIN)+r'\n.*?^'+re.escape(END)+r'\n?')
+    if rx.search(original):
+        updated=rx.sub(lambda _:managed,original,count=1)
+    else:
+        starts=list(re.finditer(r'(?m)^\[\[profiles\]\]\s*$',original))
+        pos=None
+        for i,match in enumerate(starts):
+            end=starts[i+1].start() if i+1<len(starts) else len(original)
+            if re.search(r'(?m)^\s*id\s*=\s*["\']moonlight-profile-id["\']\s*$',original[match.start():end]):pos=end;break
+        if pos is None:raise RuntimeError('moonlight-profile-id is missing from Wolf')
+        updated=original[:pos].rstrip()+'\n\n'+managed+'\n'+original[pos:].lstrip('\n')
+    tomllib.loads(updated)
+    pending_marker=STATE/'wolf-restart-pending.json'
+    if updated==original and not pending_marker.exists(): return 'published'
+    if updated!=original:
+        save_json(pending_marker,{'pending':True,'at':time.time()},private=True)
+    backup=WOLF_CONFIG.with_name('config.toml.pre-store-ingest')
+    if not backup.exists():shutil.copy2(WOLF_CONFIG,backup)
+    if updated!=original:
+        tmp=WOLF_CONFIG.with_name('config.toml.store-ingest.tmp')
+        tmp.write_text(updated)
+        os.replace(tmp,WOLF_CONFIG)
+    outcome=run(['docker','restart','wolf'],100)
+    if outcome.returncode:return 'wolf-restart-pending'
+    pending_marker.unlink(missing_ok=True)
+    bootstrap=Path('/usr/local/sbin/pcga-moonlight-web-bootstrap')
+    if bootstrap.exists():run([str(bootstrap)],180)
+    return 'published'
+
+
+def reconcile():
+    STATE.mkdir(parents=True,exist_ok=True)
+    lock=STATE/'reconcile.lock'
+    with lock.open('a+') as fd:
+        fcntl.flock(fd,fcntl.LOCK_EX)
+        archive=root();jobs=confirmed_jobs()
+        library=archive/'games/stores/library'
+        # A disappeared/unmounted library is not an uninstall. Fail closed,
+        # leaving previous Wolf registrations and catalog intact.
+        if not library.is_dir():
+            raise RuntimeError('PCGA store library unavailable: '+str(library))
+        games=discovered_games(archive,jobs)
+        ready=build_runtime() if any(g['launchable'] for g in games) else (run(['docker','image','inspect',GAME_IMAGE],15).returncode==0)
+        needs_update=bool(games) or (WOLF_CONFIG.is_file() and BEGIN in WOLF_CONFIG.read_text())
+        publish=reconcile_wolf(games,archive,ready) if needs_update else 'no-games'
+        for g in games:
+            if g['launchable']:
+                g['stream_state']='ready' if publish=='published' else 'pending-restart'
+                g['playable']=publish=='published'
+                g['stream_detail']='Wolf/Moonlight application published' if publish=='published' else 'Registration pending: '+publish
+        catalog={'schema':1,'version':VERSION,'updated_at':time.time(),'status':publish,'runtime_ready':ready,'count':len(games),'items':games}
+        save_json(PUBLIC,catalog)
+        return {'ok':True,'count':len(games),'status':publish,'runtime_ready':ready}
+
+
+def main():
+    parser=argparse.ArgumentParser(description='PCGA Epic/GOG download-to-game ingestion')
+    parser.add_argument('--reconcile',action='store_true');parser.add_argument('--status',action='store_true')
+    args=parser.parse_args()
+    if args.status:out=read_json(PUBLIC,{'status':'not-run','count':0})
+    else:out=reconcile()
+    print(json.dumps(out,sort_keys=True))
+
+if __name__=='__main__':main()

@@ -1,0 +1,25 @@
+[Unit]
+Description=PC Game Archive game metadata/install/stream orchestrator
+After=docker.service network-online.target pcga-game-stack.service pcga-cdemu.service
+Wants=docker.service network-online.target pcga-cdemu.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-game-orchestrator
+User=root
+Group=root
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+NoNewPrivileges=true
+# Runtime ISO loop mounts under /run/pcga-game-media must live in the host mount namespace
+# so Docker/Wolf can bind them into streamed Wine containers.
+PrivateTmp=false
+ProtectHome=true
+RuntimeDirectory=pcga-game-orchestrator
+RuntimeDirectoryMode=0750
+Environment=HOME=/run/pcga-game-orchestrator
+Environment=DOCKER_CONFIG=/run/pcga-game-orchestrator/docker
+Environment=XDG_CONFIG_HOME=/run/pcga-game-orchestrator/config
+Environment=XDG_CACHE_HOME=/run/pcga-game-orchestrator/cache
+TimeoutStartSec=3600

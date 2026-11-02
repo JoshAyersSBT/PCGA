@@ -1,0 +1,63 @@
+#!/bin/sh
+set -eu
+
+NETBIRD=/usr/local/bin/netbird
+SETUP_KEY=/run/pcga-netbird/setup-key
+MANAGEMENT_URL=/run/pcga-netbird/management-url
+ENROLLED=/var/lib/netbird/.pcga-enrolled
+
+"$NETBIRD" service run &
+service_pid=$!
+shutdown() {
+  kill -TERM "$service_pid" 2>/dev/null || true
+  wait "$service_pid" 2>/dev/null || true
+}
+trap shutdown EXIT
+trap 'exit 0' HUP INT TERM
+
+ready=0
+for _ in $(seq 1 45); do
+  if "$NETBIRD" status --check live >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  kill -0 "$service_pid" 2>/dev/null || { wait "$service_pid"; exit 1; }
+  sleep 1
+done
+[ "$ready" -eq 1 ] || { echo 'NetBird daemon did not become responsive' >&2; exit 1; }
+
+run_up() {
+  if [ -s "$SETUP_KEY" ]; then
+    if [ -s "$MANAGEMENT_URL" ]; then
+      "$NETBIRD" up --setup-key-file "$SETUP_KEY" --management-url "$(cat "$MANAGEMENT_URL")"
+    else
+      "$NETBIRD" up --setup-key-file "$SETUP_KEY"
+    fi
+  else
+    "$NETBIRD" up
+  fi
+}
+
+if [ -f "$ENROLLED" ]; then
+  run_up || echo 'NetBird is enrolled; reconnect will continue in the daemon' >&2
+fi
+
+while kill -0 "$service_pid" 2>/dev/null; do
+  if [ ! -f "$ENROLLED" ] && [ -s "$SETUP_KEY" ]; then
+    if run_up; then
+      for _ in $(seq 1 45); do
+        if "$NETBIRD" status --check startup >/dev/null 2>&1; then
+          touch "$ENROLLED"
+          echo 'NetBird enrollment completed and startup health passed' >&2
+          break
+        fi
+        sleep 2
+      done
+    else
+      echo 'NetBird enrollment failed; waiting for another setup key' >&2
+    fi
+  fi
+  sleep 2
+done
+
+wait "$service_pid"

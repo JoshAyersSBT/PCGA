@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Bounded, opt-in LAN NAS discovery for PCGA.
+
+Only the primary RFC1918 IPv4 interface and at most its local /24 are scanned.
+Discovery opens TCP connections to SMB/445 and NFS/2049. Optional anonymous
+share/export listings never send credentials or mount remote resources.
+"""
+from __future__ import annotations
+import concurrent.futures
+import ipaddress
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+STATE = Path(os.environ.get('PCGA_NAS_DISCOVERY_STATE', '/var/lib/pc-game-archive/nas/discovery.json'))
+PORTS = {'smb': 445, 'nfs': 2049}
+SKIP_IFACE = re.compile(r'^(?:lo|docker|br-|veth|virbr|tun|tap|tailscale|zt|wg|uap|vboxnet|podman)', re.I)
+
+
+def cmd(args: list[str], timeout: float = 5) -> subprocess.CompletedProcess:
+    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def lan_networks(routes, interfaces):
+    """Select at most one primary LAN subnet. Never scan public/overlay/bridge ranges."""
+    preferred = [str(r.get('dev')) for r in routes if r.get('dst') == 'default' and r.get('dev')]
+    permitted = []
+    for iface in interfaces:
+        name = str(iface.get('ifname') or '')
+        if SKIP_IFACE.match(name) or iface.get('operstate') == 'DOWN':
+            continue
+        for addr in iface.get('addr_info', []):
+            if addr.get('family') != 'inet':
+                continue
+            try:
+                ip = ipaddress.IPv4Address(addr['local'])
+                if not any(ip in ipaddress.ip_network(block) for block in ('10.0.0.0/8','172.16.0.0/12','192.168.0.0/16')):
+                    continue
+                # Always limit discovery to a /24 or a narrower interface prefix.
+                mask = max(24, int(addr.get('prefixlen', 24)))
+                net = ipaddress.ip_network(f'{ip}/{mask}', strict=False)
+            except (KeyError, ValueError, TypeError):
+                continue
+            permitted.append((name, net, ip))
+    for preferred_name in preferred:
+        for name, net, ip in permitted:
+            if name == preferred_name:
+                return [{'interface': name, 'cidr': str(net), 'addresses': [str(x) for x in net.hosts() if x != ip]}]
+    return [{'interface': name, 'cidr': str(net), 'addresses': [str(x) for x in net.hosts() if x != ip]}
+            for name, net, ip in permitted[:1]]
+
+
+def discover_targets():
+    try:
+        routes = json.loads(cmd(['ip', '-j', '-4', 'route', 'show', 'default']).stdout or '[]')
+        interfaces = json.loads(cmd(['ip', '-j', '-4', 'address', 'show', 'up']).stdout or '[]')
+    except (FileNotFoundError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise RuntimeError(f'Could not inspect local IPv4 interfaces: {exc}') from exc
+    return lan_networks(routes, interfaces)
+
+
+def check_host(ip: str):
+    found = []
+    for protocol, port in PORTS.items():
+        try:
+            with socket.create_connection((ip, port), timeout=0.45):
+                found.append(protocol)
+        except (OSError, TimeoutError):
+            pass
+    return ip, found
+
+
+def smb_shares(ip: str):
+    if not shutil.which('smbclient'):
+        return [], 'Install smbclient for anonymous SMB share enumeration, or enter a share name manually.'
+    try:
+        proc = cmd(['smbclient', '-g', '-N', '-L', ip, '-p', '445'], timeout=4)
+        shares = []
+        for line in (proc.stdout or '').splitlines():
+            parts = line.split('|')
+            if len(parts) >= 2 and parts[0] == 'Disk':
+                share = parts[1].strip()
+                if re.fullmatch(r'[^\\/:*?"<>|\x00-\x1f]{1,80}', share) and share not in shares:
+                    shares.append(share)
+        if shares:
+            return shares[:32], ''
+        return [], 'Shares are not publicly listed; authenticate and enter the share manually.'
+    except (OSError, subprocess.TimeoutExpired):
+        return [], 'SMB share enumeration timed out; enter a share manually.'
+
+
+def nfs_exports(ip: str):
+    if not shutil.which('showmount'):
+        return [], 'Install nfs-common to list NFSv3 exports, or enter an NFS export manually.'
+    try:
+        proc = cmd(['showmount', '-e', ip], timeout=4)
+        exports = []
+        for line in (proc.stdout or '').splitlines():
+            line = line.strip()
+            if not line.startswith('/'):
+                continue
+            item = line.split()[0]
+            if re.fullmatch(r'/[A-Za-z0-9._+/-]{1,255}', item) and '..' not in item.split('/') and item not in exports:
+                exports.append(item)
+        return exports[:32], '' if exports else 'No public export list; NFSv4-only servers may require manual path entry.'
+    except (OSError, subprocess.TimeoutExpired):
+        return [], 'Export enumeration timed out; enter the export manually.'
+
+
+def write_state(value):
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix='.nas-discovery-', dir=str(STATE.parent))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as file:
+            json.dump(value, file, separators=(',', ':'), sort_keys=True)
+            file.write('\n')
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, STATE)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def status():
+    try:
+        obj = json.loads(STATE.read_text())
+        if not isinstance(obj, dict):
+            raise ValueError('invalid state')
+    except (OSError, ValueError):
+        obj = {'state': 'idle', 'devices': [], 'networks': [], 'detail': 'No LAN scan has been run yet.'}
+    if obj.get('state') == 'running' and time.time() - float(obj.get('started_at') or 0) > 180:
+        obj['state'] = 'failed'
+        obj['detail'] = 'The last scan timed out. Try scanning again.'
+    obj.setdefault('devices', [])
+    obj.setdefault('networks', [])
+    obj['ok'] = True
+    return obj
+
+
+def scan():
+    started = time.time()
+    current = {'state': 'running', 'started_at': started, 'finished_at': None,
+               'devices': [], 'networks': [], 'detail': 'Checking local SMB and NFS endpoints.'}
+    write_state(current)
+    try:
+        networks = discover_targets()
+        current['networks'] = [{'interface': n['interface'], 'cidr': n['cidr']} for n in networks]
+        if not networks:
+            raise RuntimeError('No eligible private LAN interface was detected. Discovery requires an active local IPv4 route.')
+        targets = list(networks[0]['addresses'])[:254]
+        raw = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:
+            for ip, protocols in executor.map(check_host, targets):
+                if protocols:
+                    raw.append((ip, protocols))
+        def identify(item):
+            ip, protocol = item
+            shares, note = (smb_shares(ip) if protocol == 'smb' else nfs_exports(ip))
+            return {'host': ip, 'protocol': protocol, 'port': PORTS[protocol],
+                    'shares': shares, 'detail': note or 'Shares discovered without authentication.',
+                    'verified_access': False}
+        entries = [(ip, protocol) for ip, protocols in raw[:48] for protocol in protocols]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+            devices = list(executor.map(identify, entries))
+        current.update({'state': 'complete', 'finished_at': time.time(), 'devices': devices,
+                        'detail': f'Discovered {len(raw)} host(s) offering SMB/NFS. Select and configure a destination to connect.'})
+    except Exception as exc:
+        current.update({'state': 'failed', 'finished_at': time.time(), 'detail': str(exc)[:350]})
+    write_state(current)
+    return current
+
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in {'scan', 'status'}:
+        print('Usage: pcga-nas-discover scan|status', file=sys.stderr)
+        return 2
+    obj = scan() if sys.argv[1] == 'scan' else status()
+    print(json.dumps(obj))
+    return 0 if obj.get('state') != 'failed' else 1
+
+if __name__ == '__main__':
+    sys.exit(main())

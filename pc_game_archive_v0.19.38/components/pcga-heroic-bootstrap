@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+HEROIC_VERSION="2.22.3"
+HEROIC_ASSET="Heroic-${HEROIC_VERSION}-linux-x64.tar.xz"
+HEROIC_URL="https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher/releases/download/v${HEROIC_VERSION}/${HEROIC_ASSET}"
+HEROIC_SHA256="7382d719a5114c5f0761eea05cdb22f73f58fe98ec840d16b3d85a054d0d3efd"
+IMAGE="pcga/heroic-runtime:${HEROIC_VERSION}"
+ROOT_FILE=/etc/pc-game-archive/archive-root
+RUNTIME_ENV=/etc/pc-game-archive/game-runtime.env
+STATE=/var/lib/pc-game-archive/heroic
+CACHE=/var/cache/pc-game-archive/heroic
+STATUS="$STATE/status.json"
+SYNC=/usr/local/sbin/pcga-heroic-sync
+
+[[ $EUID -eq 0 ]] || exec sudo -E bash "$0" "$@"
+log(){ printf '[pcga-heroic] %s\n' "$*"; }
+fail(){ printf '[pcga-heroic:error] %s\n' "$*" >&2; status error "$*"; exit 1; }
+json_escape(){ python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+status(){
+  local phase="$1" detail="${2:-}"
+  install -d -m 0755 "$STATE"
+  python3 - "$STATUS" "$phase" "$detail" "$HEROIC_VERSION" "$IMAGE" <<'PY'
+import json,sys,time
+from pathlib import Path
+p=Path(sys.argv[1]); phase=sys.argv[2]; detail=sys.argv[3]; version=sys.argv[4]; image=sys.argv[5]
+obj={"schema":1,"heroic_version":version,"image":image,"state":phase,"detail":detail,"updated_at":time.time()}
+tmp=p.with_suffix('.tmp'); tmp.write_text(json.dumps(obj,indent=2)+'\n'); tmp.replace(p)
+PY
+}
+
+ARCH="$(uname -m)"
+[[ "$ARCH" == "x86_64" || "$ARCH" == "amd64" ]] || fail "Heroic v${HEROIC_VERSION} PCGA runtime currently requires an x86-64 appliance host; detected ${ARCH}"
+[[ -r "$ROOT_FILE" ]] || fail "Missing $ROOT_FILE"
+ARCHIVE_ROOT="$(cat "$ROOT_FILE")"
+[[ -n "$ARCHIVE_ROOT" && "$ARCHIVE_ROOT" == /* ]] || fail "Invalid PCGA archive root"
+CONFIG="$ARCHIVE_ROOT/games/heroic/config"
+LIBRARY="$ARCHIVE_ROOT/games/heroic/library"
+HCACHE="$ARCHIVE_ROOT/games/heroic/cache"
+install -d -m 0755 "$STATE" "$CACHE" "$CONFIG" "$LIBRARY" "$HCACHE"
+
+PUID="${PUID:-1000}"; PGID="${PGID:-1000}"
+if [[ -r /opt/pc-game-archive/.env ]]; then
+  while IFS='=' read -r k v; do
+    case "$k" in PUID) PUID="${v%%#*}";; PGID) PGID="${v%%#*}";; esac
+  done < /opt/pc-game-archive/.env
+fi
+PUID="${PUID//[[:space:]]/}"; PGID="${PGID//[[:space:]]/}"
+[[ "$PUID" =~ ^[0-9]+$ ]] || PUID=1000
+[[ "$PGID" =~ ^[0-9]+$ ]] || PGID=1000
+chown -R "$PUID:$PGID" "$CONFIG" "$LIBRARY" "$HCACHE" 2>/dev/null || true
+
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  status ready "Heroic runtime image is already prepared"
+  "$SYNC" --reconcile-wolf || true
+  exit 0
+fi
+
+status downloading "Downloading Heroic Games Launcher ${HEROIC_VERSION}"
+ASSET_PATH="$CACHE/$HEROIC_ASSET"
+if [[ -f "$ASSET_PATH" ]]; then
+  got="$(sha256sum "$ASSET_PATH" | awk '{print $1}')"
+  [[ "$got" == "$HEROIC_SHA256" ]] || rm -f "$ASSET_PATH"
+fi
+if [[ ! -f "$ASSET_PATH" ]]; then
+  tmp="$ASSET_PATH.part"
+  rm -f "$tmp"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fL --retry 3 --connect-timeout 20 -o "$tmp" "$HEROIC_URL" || fail "Unable to download Heroic ${HEROIC_VERSION}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -O "$tmp" "$HEROIC_URL" || fail "Unable to download Heroic ${HEROIC_VERSION}"
+  else
+    fail "Neither curl nor wget is installed"
+  fi
+  mv "$tmp" "$ASSET_PATH"
+fi
+[[ "$(sha256sum "$ASSET_PATH" | awk '{print $1}')" == "$HEROIC_SHA256" ]] || fail "Heroic release archive checksum did not match the pinned v${HEROIC_VERSION} asset"
+
+BASE_IMAGE="ghcr.io/games-on-whales/lutris:edge"
+if [[ -r "$RUNTIME_ENV" ]]; then
+  candidate="$(sed -n 's/^PCGA_GAME_RUNTIME_IMAGE=//p' "$RUNTIME_ENV" | tail -n1 | tr -d '\r\"')"
+  [[ -n "$candidate" ]] && BASE_IMAGE="$candidate"
+fi
+
+status building "Building the PCGA Heroic streaming runtime"
+BUILD="$(mktemp -d /var/tmp/pcga-heroic-build.XXXXXX)"
+trap 'rm -rf "$BUILD"' EXIT
+mkdir -p "$BUILD/heroic-dist"
+tar -xJf "$ASSET_PATH" -C "$BUILD/heroic-dist"
+cat > "$BUILD/startup.sh" <<'EOS'
+#!/bin/bash
+set -Eeuo pipefail
+export RUN_GAMESCOPE=""
+export RUN_SWAY="${RUN_SWAY:-1}"
+source /opt/gow/launch-comp.sh
+export HOME=/home/retro
+export XDG_CONFIG_HOME=/home/retro/.config
+export XDG_CACHE_HOME=/home/retro/.cache
+export NO_AT_BRIDGE=1
+mkdir -p "$HOME/.config/heroic" "$HOME/.cache/heroic" "$HOME/Games/Heroic"
+HEROIC_BIN="${PCGA_HEROIC_BIN:-}"
+if [[ -z "$HEROIC_BIN" || ! -x "$HEROIC_BIN" ]]; then
+  HEROIC_BIN="$(find /opt/heroic -maxdepth 4 -type f \( -name heroic -o -name Heroic \) -perm -u+x 2>/dev/null | head -n1 || true)"
+fi
+[[ -n "$HEROIC_BIN" && -x "$HEROIC_BIN" ]] || { echo '[pcga-heroic] Heroic executable was not found in the pinned release archive' >&2; find /opt/heroic -maxdepth 3 -type f | head -80 >&2 || true; exit 127; }
+MODE="${PCGA_HEROIC_MODE:-launcher}"
+echo "[pcga-heroic] mode=$MODE binary=$HEROIC_BIN" >&2
+if [[ "$MODE" == game ]]; then
+  APP="${PCGA_HEROIC_APP_NAME:-}"
+  RUNNER="${PCGA_HEROIC_RUNNER:-}"
+  [[ -n "$APP" && -n "$RUNNER" ]] || { echo '[pcga-heroic] Missing app/runner identity' >&2; exit 64; }
+  exec "$HEROIC_BIN" --no-gui --no-sandbox "heroic://launch?appName=${APP}&runner=${RUNNER}"
+fi
+exec "$HEROIC_BIN" --no-sandbox
+EOS
+chmod 0755 "$BUILD/startup.sh"
+cat > "$BUILD/Dockerfile" <<EOFDOCKER
+FROM ${BASE_IMAGE}
+USER root
+COPY heroic-dist/ /opt/heroic/
+COPY --chmod=0755 startup.sh /opt/gow/startup.sh
+EOFDOCKER
+
+docker build --pull=false -t "$IMAGE" "$BUILD" || fail "Docker could not build the Heroic runtime image"
+status reconciling "Heroic is installed; publishing launcher and installed games to Wolf/Moonlight"
+"$SYNC" --reconcile-wolf || fail "Heroic installed, but PCGA could not publish its Wolf applications"
+status ready "Heroic ${HEROIC_VERSION} is ready for collection and streaming"
+log "Heroic ${HEROIC_VERSION} prepared as $IMAGE"

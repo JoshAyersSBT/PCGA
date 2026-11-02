@@ -1,0 +1,38 @@
+# PCGA's NetBird peer runs in a dedicated, persistent container. Host networking
+# makes the encrypted interface available to the appliance's portal and streams.
+services:
+  netbird:
+    profiles: [netbird]
+    container_name: pcga-netbird
+    image: netbirdio/netbird:0.81.3
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - SYS_RESOURCE
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      NETBIRD_BIN: /usr/local/bin/netbird
+      NB_DAEMON_ADDR: unix:///var/run/netbird.sock
+      NB_LOG_FILE: console
+      NB_ENABLE_CAPTURE: "false"
+    entrypoint:
+      - /bin/sh
+      - /usr/local/sbin/pcga-netbird-container-entrypoint
+    volumes:
+      - /var/lib/pc-game-archive/netbird:/var/lib/netbird
+      - /etc/pc-game-archive/netbird:/run/pcga-netbird:ro
+      - /usr/local/sbin/pcga-netbird-container-entrypoint:/usr/local/sbin/pcga-netbird-container-entrypoint:ro
+    healthcheck:
+      test: [CMD, /usr/local/bin/netbird, status, --check, live]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

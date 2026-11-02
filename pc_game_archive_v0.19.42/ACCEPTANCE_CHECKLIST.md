@@ -1,0 +1,21 @@
+# Acceptance Checklist — v0.19.42
+
+- [ ] Upgrade an existing v0.19.40 or v0.19.41 appliance using the versioned ZIP and `upgrade.sh`.
+- [ ] Manifest, Linux text format and all versioned regression suites pass.
+- [ ] No active game/setup session or pending launch is interrupted.
+- [ ] Installer reports its backup directory and restores prior timer activity.
+- [ ] Portal and control API report v0.19.42.
+- [ ] NetBird install creates the opt-in Compose container and reports daemon liveness before enrollment.
+- [ ] Connecting with a setup key joins the appliance peer; the setup-key file is removed after enrollment.
+- [ ] NetBird identity survives container restart and reconnects without a saved setup key.
+- [ ] Disconnect stops the peer and preserves its identity for an intentional reconnect.
+- [ ] The thin-client bootstrap does not expose an enrollment key.
+- [ ] Exactly one Heroic launcher exists in the PCGA profile; custom apps and other profiles remain present.
+- [ ] Historical comment-marker failures for prepared games recover; genuine registration failures remain visible.
+- [ ] All four live lane app catalogs match Wolf's effective PCGA profile.
+- [ ] A second reconciliation changes no Wolf config bytes and does not restart Wolf.
+- [ ] Observe at least two game-orchestrator cycles and a Heroic sync cycle after timers resume: Wolf start time stays stable and no duplicate entries return.
+- [ ] Wolf Den stays running and browser pairing remains healthy.
+- [ ] Launch each ready game and confirm video, audio, input, reconnect and clean termination. Do not count API readiness as gameplay acceptance.
+- [ ] Complete Battlefront II's interactive installer separately.
+- [ ] Exercise rollback with a failed live validation: prior scripts, config, registration state and timers are restored.

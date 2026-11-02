@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+name="${1#/dev/}"
+[[ -n "$name" ]] || { echo "Usage: pcga-makemkv-preflight srN" >&2; exit 64; }
+dev="/dev/$name"
+ROOT_FILE=/etc/pc-game-archive/archive-root
+[[ -r "$ROOT_FILE" ]] || { echo "missing $ROOT_FILE" >&2; exit 1; }
+ROOT="$(cat "$ROOT_FILE")"
+SETTINGS="$ROOT/media/arm/home/.MakeMKV/settings.conf"
+STATE_DIR=/var/lib/pc-game-archive/makemkv-preflight
+STATE="$STATE_DIR/$name.state"
+mkdir -p "$STATE_DIR"
+[[ -b "$dev" ]] || { echo "$dev is not a block device" >&2; exit 1; }
+[[ "$(docker inspect -f '{{.State.Running}}' arm-rippers 2>/dev/null || true)" == true ]] || { echo "ARM container is not running" >&2; exit 75; }
+
+image="$(docker inspect -f '{{.Image}}' arm-rippers 2>/dev/null || true)"
+udev_sig="$(udevadm info --query=property --name="$dev" 2>/dev/null | grep -E '^(ID_VENDOR|ID_MODEL|ID_REVISION|ID_SERIAL|ID_SERIAL_SHORT)=' | sort || true)"
+signature="$(printf '%s\n%s\n' "$image" "$udev_sig" | sha256sum | awk '{print $1}')"
+if [[ -r "$STATE" ]] && grep -qx 'format=2' "$STATE" 2>/dev/null; then
+  old_sig="$(awk -F= '$1=="signature"{print $2}' "$STATE" | tail -n1)"
+  old_id="$(sed -n 's/^sdf_id=//p' "$STATE" | tail -n1)"
+  if [[ "$old_sig" == "$signature" ]]; then
+    if [[ -z "$old_id" ]] || python3 - "$SETTINGS" "$old_id" <<'PY'
+from pathlib import Path
+import re,sys
+p=Path(sys.argv[1]); ident=sys.argv[2]
+s=p.read_text(errors='replace') if p.exists() else ''
+m=re.search(r'(?m)^\s*sdf_Stop\s*=\s*"([^"]*)"\s*$',s)
+raise SystemExit(0 if m and ident in m.group(1).split() else 1)
+PY
+    then
+      echo "MakeMKV preflight already passed for $dev with this drive/container image"
+      exit 0
+    fi
+  fi
+fi
+
+probe() {
+  local out="$1"
+  set +e
+  docker exec -i --user arm --workdir /home/arm arm-rippers python3 - "$dev" >"$out" 2>&1 <<'PY'
+import subprocess,sys
+cmd=[
+    'makemkvcon','--debug=-stdout','--robot','--messages=-stdout','--progress=-stdout',
+    '--cache=1','--minlength=30','info',f'dev:{sys.argv[1]}'
+]
+try:
+    p=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=150)
+    print(p.stdout or '',end='')
+    raise SystemExit(p.returncode)
+except subprocess.TimeoutExpired as exc:
+    out=exc.stdout or ''
+    if isinstance(out,bytes): out=out.decode(errors='replace')
+    print(out,end='')
+    print('\nPCGA_PREFLIGHT_TIMEOUT')
+    raise SystemExit(124)
+PY
+  local rc=$?
+  set -e
+  return "$rc"
+}
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp" "${tmp}.retry"' EXIT
+set +e
+probe "$tmp"; rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  printf 'format=2\nsignature=%s\nsdf_id=\n' "$signature" > "$STATE"
+  echo "MakeMKV info preflight passed for $dev"
+  exit 0
+fi
+if [[ $rc -ne 124 ]]; then
+  echo "WARNING: MakeMKV preflight returned exit $rc; ARM will perform its normal disc handling." >&2
+  tail -n 30 "$tmp" >&2 || true
+  exit 0
+fi
+
+echo "MakeMKV device scan timed out for $dev; attempting multi-drive-safe SDF suppression" >&2
+set +e
+sdf_line="$(/usr/local/sbin/pcga-makemkv-sdf-sync "$name" 2>&1)"; sync_rc=$?
+set -e
+if [[ $sync_rc -ne 0 ]]; then
+  echo "$sdf_line" >&2
+  echo "Could not derive an SDF identifier for $dev; refusing an unattended rip that may hang indefinitely." >&2
+  exit 70
+fi
+echo "$sdf_line"
+sdf_id="$(printf '%s\n' "$sdf_line" | sed -n 's/^PCGA_SDF_ID=//p' | tail -n1)"
+[[ -n "$sdf_id" ]] || { echo "SDF sync succeeded but did not report a target identifier" >&2; exit 70; }
+
+echo "Retesting MakeMKV after SDF update"
+set +e
+probe "${tmp}.retry"; rc=$?
+set -e
+if [[ $rc -eq 0 ]]; then
+  printf 'format=2\nsignature=%s\nsdf_id=%s\n' "$signature" "$sdf_id" > "$STATE"
+  echo "MakeMKV preflight passed after SDF suppression"
+  exit 0
+fi
+echo "MakeMKV still failed preflight after SDF suppression (exit $rc)." >&2
+tail -n 50 "${tmp}.retry" >&2 || true
+exit 70

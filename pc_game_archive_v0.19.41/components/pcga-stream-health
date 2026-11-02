@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Read-only, bounded checks of the live PCGA browser streaming lanes."""
+from __future__ import annotations
+
+import concurrent.futures
+import ipaddress
+import json
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+STATE = Path('/var/lib/pc-game-archive/bootstrap/moonlight-web.json')
+CA = Path('/etc/pc-game-archive/tls/pcga-ca.crt')
+LANES = 4
+SESSIONS = Path('/var/lib/pc-game-archive/game-runtime/session-owners.json')
+
+
+def current_address() -> str:
+    proc = subprocess.run(['ip', '-4', 'route', 'get', '1.1.1.1'],
+                          capture_output=True, text=True, timeout=3, check=True)
+    match = re.search(r'\bsrc\s+(\S+)', proc.stdout)
+    if not match:
+        raise ValueError('default route has no IPv4 source address')
+    return str(ipaddress.IPv4Address(match.group(1)))
+
+
+def request_json(port: int, path: str, context: ssl.SSLContext):
+    req = urllib.request.Request(f'https://127.0.0.1:{port}{path}',
+                                 headers={'Accept': 'application/json'})
+    with urllib.request.urlopen(req, context=context, timeout=3) as response:
+        if response.status != 200:
+            raise ValueError(f'{path}: HTTP {response.status}')
+        data = response.read(1024 * 1024 + 1)
+        if len(data) > 1024 * 1024:
+            raise ValueError(f'{path}: response exceeds size limit')
+        # Moonlight Web's authentication probe signals success with HTTP 200
+        # and no response body. Host registration and app-list routes do return
+        # JSON and must still reject empty or malformed successful responses.
+        if path == '/api/authenticate' and not data.strip():
+            return {'authenticated': True}
+        try:
+            return json.loads(data)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(f'{path}: HTTP 200 returned empty or invalid JSON') from exc
+
+
+def contains_address(payload, address: str) -> bool:
+    if isinstance(payload, dict):
+        if any(str(payload.get(key, '')) == address for key in ('address', 'host', 'hostname')):
+            return True
+        return any(contains_address(value, address) for value in payload.values())
+    if isinstance(payload, list):
+        return any(contains_address(value, address) for value in payload)
+    return False
+
+
+def has_app_list(payload) -> bool:
+    if isinstance(payload, list):
+        return True
+    if isinstance(payload, dict):
+        if isinstance(payload.get('apps'), list):
+            return True
+        return any(has_app_list(value) for value in payload.values() if isinstance(value, dict))
+    return False
+
+
+def check_lane(row: dict, expected_address: str, context, fetch=request_json) -> dict:
+    lane = row['lane']
+    result = {'lane': lane, 'ready': False}
+    try:
+        if row.get('state') != 'ready' or row.get('paired') is not True:
+            raise ValueError('pairing state is not ready')
+        if row.get('network_mode') != 'host':
+            raise ValueError('lane does not use host networking')
+        if row.get('wolf_address') != expected_address:
+            raise ValueError('saved Wolf address differs from the current LAN address')
+        port = int(row.get('web_port', 0))
+        if not 1024 <= port <= 65535:
+            raise ValueError('invalid lane port')
+        host_id = row.get('host_id')
+        if isinstance(host_id, bool) or not isinstance(host_id, int) or host_id < 0:
+            raise ValueError('invalid Wolf host id')
+        query = urllib.parse.urlencode({'host_id': host_id})
+        auth = fetch(port, '/api/authenticate', context)
+        if auth is None or auth is False or (isinstance(auth, dict) and
+                (auth.get('authenticated') is False or auth.get('success') is False)):
+            raise ValueError('default appliance authentication failed')
+        host = fetch(port, '/api/host?' + query, context)
+        if not contains_address(host, expected_address):
+            raise ValueError('live Wolf host points at a different address')
+        apps = fetch(port, '/api/apps?' + query, context)
+        if not has_app_list(apps):
+            raise ValueError('live Wolf app list is invalid')
+        result['ready'] = True
+    except Exception as exc:
+        result['detail'] = str(exc)[:300]
+    return result
+
+
+def check_pool(state: dict, expected_address: str, context, fetch=request_json) -> dict:
+    rows = state.get('lanes')
+    if not isinstance(rows, list) or len(rows) != LANES or any(not isinstance(x, dict) for x in rows):
+        return {'ready': False, 'detail': 'expected four independent lane records', 'lanes': []}
+    ids = [x.get('lane') for x in rows]
+    if any(type(x) is not int for x in ids) or sorted(ids) != list(range(1, LANES + 1)):
+        return {'ready': False, 'detail': 'lane identities are missing or duplicated', 'lanes': []}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=LANES) as executor:
+        results = list(executor.map(lambda row: check_lane(row, expected_address, context, fetch), rows))
+    return {'ready': all(x['ready'] for x in results), 'lan_address': expected_address, 'lanes': results}
+
+
+def safe_to_repair() -> dict:
+    """Fail closed rather than restart browser lanes underneath a game/launch."""
+    try:
+        proc = subprocess.run(['docker', 'ps', '--format', '{{.Names}}'],
+                              capture_output=True, text=True, timeout=5, check=True)
+        if any(name.startswith('PCGA-') for name in proc.stdout.splitlines()):
+            return {'safe_to_repair': False, 'detail': 'a PCGA game/setup runtime is active'}
+        proc = subprocess.run(['ss', '-Htn', 'state', 'established'],
+                              capture_output=True, text=True, timeout=5, check=True)
+        if re.search(r':(?:47984|47989|48010)\b', proc.stdout):
+            return {'safe_to_repair': False, 'detail': 'a GameStream control connection is active'}
+        if SESSIONS.exists():
+            state = json.loads(SESSIONS.read_text())
+            rows = state.get('reservations', {})
+            if not isinstance(rows, dict):
+                raise ValueError('invalid stream reservation state')
+            for row in rows.values():
+                if not isinstance(row, dict):
+                    raise ValueError('invalid stream reservation record')
+                if time.time() - float(row.get('reserved_at', 0)) <= 300:
+                    return {'safe_to_repair': False, 'detail': 'a stream launch is pending'}
+        return {'safe_to_repair': True}
+    except Exception as exc:
+        return {'safe_to_repair': False, 'detail': 'cannot verify idle state: ' + str(exc)[:250]}
+
+
+def main() -> int:
+    if sys.argv[1:] == ['--safe-to-repair']:
+        result = safe_to_repair()
+        print(json.dumps(result, sort_keys=True))
+        return 0 if result['safe_to_repair'] else 1
+    if sys.argv[1:]:
+        print('Usage: pcga-stream-health [--safe-to-repair]', file=sys.stderr)
+        return 64
+    try:
+        state = json.loads(STATE.read_text())
+        if not isinstance(state, dict):
+            raise ValueError('streaming state is not an object')
+        context = ssl.create_default_context(cafile=str(CA))
+        result = check_pool(state, current_address(), context)
+    except Exception as exc:
+        result = {'ready': False, 'detail': str(exc)[:300], 'lanes': []}
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result['ready'] else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

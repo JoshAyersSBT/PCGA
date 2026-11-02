@@ -1,0 +1,830 @@
+#!/usr/bin/env python3
+"""PCGA persistent PC-store game lifecycle queue (v0.19.12).
+
+The worker owns guarded, durable Epic/GOG install, update, verify and uninstall
+jobs. Amazon remains read-only. One job runs per provider and at most one active
+job per game may exist. Save files and external Wine/Proton prefixes are preserved.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import selectors
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+VERSION = "0.19.12"
+PROVIDER_HELPER = Path(os.environ.get("PCGA_STORE_PROVIDER_HELPER", "/usr/local/sbin/pcga-store-provider"))
+STATE_ROOT = Path(os.environ.get("PCGA_STORE_JOB_STATE", "/var/lib/pc-game-archive/store-jobs"))
+DB_PATH = STATE_ROOT / "jobs.sqlite3"
+LOG_ROOT = Path(os.environ.get("PCGA_STORE_JOB_LOG_ROOT", "/var/log/pc-game-archive/store-jobs"))
+POLL_SECONDS = float(os.environ.get("PCGA_STORE_JOB_POLL_SECONDS", "1.0"))
+MAX_ATTEMPTS = max(1, int(os.environ.get("PCGA_STORE_JOB_MAX_ATTEMPTS", "3")))
+MIN_FREE_BYTES = max(0, int(os.environ.get("PCGA_STORE_MIN_FREE_BYTES", str(2 * 1024**3))))
+PROVIDERS = ("epic", "gog")  # Amazon remains read-only
+ALLOWED_OPERATIONS = ("install", "update", "verify", "uninstall")
+TERMINAL_STATES = ("completed", "failed", "cancelled")
+ACTIVE_STATES = ("queued", "running", "cancelling")
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+PERCENT_RE = re.compile(r"(?<![\d.])(100(?:\.0+)?|\d{1,2}(?:\.\d+)?)\s*%")
+SIZE_PAIR_RE = re.compile(
+    r"(?P<done>\d+(?:\.\d+)?)\s*(?P<du>KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)\s*(?:/|of)\s*"
+    r"(?P<total>\d+(?:\.\d+)?)\s*(?P<tu>KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)", re.I
+)
+GOG_PROGRESS_RE = re.compile(r"(?P<done>\d+(?:\.\d+)?)/(?P<total>\d+(?:\.\d+)?)\s*(?P<unit>KiB|MiB|GiB|KB|MB|GB)\b", re.I)
+SPEED_RE = re.compile(r"(?P<n>\d+(?:\.\d+)?)\s*(?P<u>KiB|MiB|GiB|TiB|KB|MB|GB|TB|B)\s*/\s*s", re.I)
+TOKEN_RE = re.compile(r"(?i)(access[_ -]?token|refresh[_ -]?token|authorization|bearer|code_verifier|client_secret)([\"'=:\s]+)([^\s,;\"']+)")
+URL_TOKEN_RE = re.compile(r"(?i)([?&](?:code|token|auth|authorization|access_token|refresh_token)=)[^&\s]+")
+URL_QUERY_RE = re.compile(r"(?i)(https?://[^\s?]+)\?[^\s]+")
+
+
+def now() -> float:
+    return time.time()
+
+
+def ensure_dirs() -> None:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    LOG_ROOT.mkdir(parents=True, exist_ok=True)
+    for p in (STATE_ROOT, LOG_ROOT):
+        try:
+            os.chmod(p, 0o700)
+        except OSError:
+            pass
+
+
+def connect() -> sqlite3.Connection:
+    ensure_dirs()
+    db = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA journal_mode=WAL")
+    db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA busy_timeout=30000")
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS jobs (
+          id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          operation TEXT NOT NULL,
+          app_id TEXT NOT NULL,
+          title TEXT NOT NULL DEFAULT '',
+          state TEXT NOT NULL,
+          created_at REAL NOT NULL,
+          updated_at REAL NOT NULL,
+          started_at REAL,
+          finished_at REAL,
+          attempt INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 3,
+          progress REAL,
+          bytes_done INTEGER,
+          bytes_total INTEGER,
+          speed_bps INTEGER,
+          message TEXT NOT NULL DEFAULT '',
+          error TEXT NOT NULL DEFAULT '',
+          exit_code INTEGER,
+          cancel_requested INTEGER NOT NULL DEFAULT 0,
+          log_path TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS jobs_provider_state ON jobs(provider,state,created_at);
+        CREATE INDEX IF NOT EXISTS jobs_state_created ON jobs(state,created_at DESC);
+        """
+    )
+    # Catalog and authentication are independent, but queue records and logs are
+    # private appliance state; never create a world-readable SQLite database.
+    try:
+        os.chmod(DB_PATH, 0o600)
+    except OSError:
+        pass
+    return db
+
+
+def load_provider_module():
+    if not PROVIDER_HELPER.is_file():
+        raise RuntimeError(f"Missing provider helper: {PROVIDER_HELPER}")
+    name = "pcga_store_provider_runtime"
+    loader = importlib.machinery.SourceFileLoader(name, str(PROVIDER_HELPER))
+    spec = importlib.util.spec_from_loader(name, loader)
+    if spec is None:
+        raise RuntimeError("Unable to load PCGA store provider helper")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    loader.exec_module(module)
+    return module
+
+
+def validate_provider(value: str) -> str:
+    value = str(value or "").strip().lower()
+    if value not in PROVIDERS:
+        raise ValueError("PCGA store maintenance supports Epic and GOG only; Amazon remains read-only")
+    return value
+
+
+def validate_operation(value: str) -> str:
+    value = str(value or "").strip().lower()
+    if value not in ALLOWED_OPERATIONS:
+        raise ValueError("Unsupported store operation: use install, update, verify or uninstall")
+    return value
+
+
+def validate_app_id(value: str) -> str:
+    value = str(value or "").strip()
+    if not value or len(value) > 180:
+        raise ValueError("invalid provider game id")
+    if value.startswith("-") or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:+-]{0,179}", value):
+        raise ValueError("provider game id contains unsupported characters")
+    return value
+
+
+def clean_title(value: str) -> str:
+    value = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or "")).strip()
+    return value[:240]
+
+
+def redact(text: str) -> str:
+    text = ANSI_RE.sub("", str(text or ""))
+    text = TOKEN_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", text)
+    text = URL_TOKEN_RE.sub(lambda m: f"{m.group(1)}<redacted>", text)
+    text = URL_QUERY_RE.sub(lambda m: f"{m.group(1)}?<redacted-query>", text)
+    return text
+
+
+def unit_bytes(number: float, unit: str) -> int:
+    unit = unit.upper()
+    factors = {
+        "B": 1, "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4,
+        "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4,
+    }
+    return max(0, int(number * factors.get(unit, 1)))
+
+
+def parse_progress(text: str) -> dict[str, Any]:
+    clean = ANSI_RE.sub("", text or "")
+    out: dict[str, Any] = {}
+    matches = list(PERCENT_RE.finditer(clean))
+    if matches:
+        pct = float(matches[-1].group(1))
+        if 0 <= pct <= 100:
+            out["progress"] = pct
+    pairs = list(SIZE_PAIR_RE.finditer(clean))
+    if pairs:
+        m = pairs[-1]
+        done = unit_bytes(float(m.group("done")), m.group("du"))
+        total = unit_bytes(float(m.group("total")), m.group("tu"))
+        if total >= done >= 0:
+            out["bytes_done"] = done
+            out["bytes_total"] = total
+            if total and "progress" not in out:
+                out["progress"] = min(100.0, done * 100.0 / total)
+    # gogdl historically emits: "Progress: <id> 1.11/89.08 MiB/00:06:02"
+    if "bytes_total" not in out:
+        gog = list(GOG_PROGRESS_RE.finditer(clean))
+        if gog:
+            m = gog[-1]
+            done = unit_bytes(float(m.group("done")),m.group("unit"))
+            total = unit_bytes(float(m.group("total")),m.group("unit"))
+            if total >= done >= 0 and total:
+                out.update(bytes_done=done,bytes_total=total)
+                out.setdefault("progress",round(100*done/total,2))
+    speeds = list(SPEED_RE.finditer(clean))
+    if speeds:
+        m = speeds[-1]
+        out["speed_bps"] = unit_bytes(float(m.group("n")), m.group("u"))
+    return out
+
+
+def public_row(row: sqlite3.Row | dict, *, include_log: bool = False) -> dict:
+    d = dict(row)
+    for key in ("progress",):
+        if d.get(key) is not None:
+            d[key] = round(float(d[key]), 2)
+    for key in ("bytes_done", "bytes_total", "speed_bps", "attempt", "max_attempts", "exit_code"):
+        if d.get(key) is not None:
+            try: d[key] = int(d[key])
+            except (TypeError, ValueError): pass
+    d["cancel_requested"] = bool(d.get("cancel_requested"))
+    if not include_log:
+        d.pop("log_path", None)
+    else:
+        d["log_tail"] = log_tail(Path(str(d.get("log_path") or "")))
+        d.pop("log_path", None)
+    return d
+
+
+def log_tail(path: Path, lines: int = 40) -> str:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").splitlines()[-max(1, min(120, lines)):]
+        return "\n".join(redact(x) for x in content)[-12000:]
+    except OSError:
+        return ""
+
+
+def init_db() -> dict:
+    db = connect()
+    db.close()
+    return {"ok": True, "version": VERSION, "database": str(DB_PATH), "log_root": str(LOG_ROOT)}
+
+
+def enqueue(provider: str, operation: str, app_id: str, title: str = "") -> dict:
+    provider = validate_provider(provider)
+    operation = validate_operation(operation)
+    app_id = validate_app_id(app_id)
+    title = clean_title(title)
+    db = connect()
+    existing = db.execute(
+        "SELECT * FROM jobs WHERE provider=? AND app_id=? AND state IN ('queued','running','cancelling') ORDER BY created_at DESC LIMIT 1",
+        (provider, app_id),
+    ).fetchone()
+    if existing:
+        out = public_row(existing, include_log=True)
+        db.close()
+        return {"ok": True, "action": "store-job-enqueue", "created": False, "job": out, "detail": "A job is already active for this game; monitor it before requesting another operation."}
+    stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+    job_id = f"sj-{stamp}-{uuid.uuid4().hex[:10]}"
+    log_path = LOG_ROOT / f"{job_id}.log"
+    ts = now()
+    db.execute(
+        "INSERT INTO jobs(id,provider,operation,app_id,title,state,created_at,updated_at,max_attempts,message,log_path) VALUES(?,?,?,?,?,'queued',?,?,?,?,?)",
+        (job_id, provider, operation, app_id, title, ts, ts, MAX_ATTEMPTS, f"Queued for {operation}", str(log_path)),
+    )
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    db.close()
+    return {"ok": True, "action": "store-job-enqueue", "created": True, "job": public_row(row, include_log=True)}
+
+
+def get_job(job_id: str, *, include_log: bool = True) -> dict:
+    db = connect()
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    db.close()
+    if not row:
+        raise FileNotFoundError("store job not found")
+    return {"ok": True, "action": "store-job", "job": public_row(row, include_log=include_log)}
+
+
+def decorate_jobs(rows: list[sqlite3.Row], *, include_log: bool = True) -> list[dict]:
+    """Public, safe, provider-scoped queue/ETA metadata. No provider secrets."""
+    jobs = [public_row(row, include_log=include_log) for row in rows]
+    positions: dict[str, int] = {}
+    # Listing is newest-first; queued jobs are executed oldest-first per provider.
+    for job in sorted(jobs, key=lambda j: (float(j.get("created_at") or 0), str(j.get("id") or ""))):
+        if job.get("state") == "queued":
+            provider = str(job.get("provider") or "")
+            positions[provider] = positions.get(provider, 0) + 1
+            job["queue_position"] = positions[provider]
+        else:
+            job["queue_position"] = None
+        done = int(job.get("bytes_done") or 0)
+        total = int(job.get("bytes_total") or 0)
+        speed = int(job.get("speed_bps") or 0)
+        job["eta_seconds"] = (max(0, total - done) // speed) if job.get("state") == "running" and total > done and speed > 0 else None
+    return jobs
+
+
+def list_jobs(limit: int = 100) -> dict:
+    limit = max(1, min(300, int(limit or 100)))
+    db = connect()
+    rows = db.execute("SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+    counts = {str(r["state"]): int(r["n"]) for r in db.execute("SELECT state,COUNT(*) n FROM jobs GROUP BY state").fetchall()}
+    # Need queue position across *all* queued jobs, not just the page limit.
+    queue_order = db.execute("SELECT id,provider FROM jobs WHERE state='queued' ORDER BY created_at,id").fetchall()
+    db.close()
+    jobs = decorate_jobs(rows)
+    positions: dict[str,int] = {}
+    queue_position: dict[str,int] = {}
+    for entry in queue_order:
+        provider = str(entry["provider"])
+        positions[provider] = positions.get(provider, 0) + 1
+        queue_position[str(entry["id"])] = positions[provider]
+    for job in jobs:
+        if job["state"] == "queued":
+            job["queue_position"] = queue_position.get(str(job["id"]))
+    return {
+        "ok": True, "action": "store-jobs", "version": VERSION,
+        "one_active_per_provider": True, "enabled_providers": list(PROVIDERS), "allowed_operations": list(ALLOWED_OPERATIONS),
+        "counts": counts, "jobs": jobs,
+    }
+
+
+def cancel_job(job_id: str) -> dict:
+    db = connect()
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        db.close(); raise FileNotFoundError("store job not found")
+    state = str(row["state"])
+    if row["operation"] == "uninstall" and state in {"running", "cancelling"}:
+        db.close()
+        raise ValueError("Uninstall is already removing managed files and cannot be interrupted")
+    ts = now()
+    if state == "queued":
+        db.execute("UPDATE jobs SET state='cancelled',cancel_requested=1,updated_at=?,finished_at=?,message='Cancelled before start' WHERE id=?", (ts, ts, job_id))
+    elif state in {"running", "cancelling"}:
+        db.execute("UPDATE jobs SET state='cancelling',cancel_requested=1,updated_at=?,message='Cancellation requested' WHERE id=?", (ts, job_id))
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    db.close()
+    return {"ok": True, "action": "store-job-cancel", "job": public_row(row, include_log=True)}
+
+
+def retry_job(job_id: str) -> dict:
+    db = connect()
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        db.close(); raise FileNotFoundError("store job not found")
+    if str(row["state"]) not in {"failed", "cancelled"}:
+        db.close(); raise ValueError("only failed or cancelled jobs can be retried")
+    active = db.execute("SELECT id FROM jobs WHERE provider=? AND app_id=? AND id!=? AND state IN ('queued','running','cancelling') LIMIT 1", (row['provider'], row['app_id'], job_id)).fetchone()
+    if active:
+        db.close(); raise ValueError("Another active job already exists for this game")
+    ts = now()
+    db.execute(
+        "UPDATE jobs SET state='queued',updated_at=?,started_at=NULL,finished_at=NULL,progress=NULL,bytes_done=NULL,bytes_total=NULL,speed_bps=NULL,message='Queued for retry',error='',exit_code=NULL,cancel_requested=0 WHERE id=?",
+        (ts, job_id),
+    )
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    db.close()
+    return {"ok": True, "action": "store-job-retry", "job": public_row(row, include_log=True)}
+
+
+def delete_job(job_id: str) -> dict:
+    db = connect()
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if not row:
+        db.close(); raise FileNotFoundError("store job not found")
+    if str(row["state"]) not in TERMINAL_STATES:
+        db.close(); raise ValueError("active store jobs cannot be deleted")
+    log_path = Path(str(row["log_path"] or ""))
+    db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+    db.close()
+    try: log_path.unlink(missing_ok=True)
+    except OSError: pass
+    return {"ok": True, "action": "store-job-delete", "id": job_id}
+
+
+def _update(job_id: str, **fields: Any) -> None:
+    if not fields:
+        return
+    fields["updated_at"] = now()
+    db = connect()
+    keys = list(fields)
+    db.execute("UPDATE jobs SET " + ",".join(f"{k}=?" for k in keys) + " WHERE id=?", [fields[k] for k in keys] + [job_id])
+    db.close()
+
+
+def _cancel_requested(job_id: str) -> bool:
+    db = connect()
+    row = db.execute("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+    db.close()
+    return bool(row and row[0])
+
+
+def _plan_for_job(module, row: sqlite3.Row):
+    provider_id = validate_provider(row["provider"])
+    operation = validate_operation(row["operation"])
+    provider = module.PROVIDERS[provider_id]
+    app_id = validate_app_id(row["app_id"])
+    title = clean_title(row["title"])
+    plans = module.plans_for(provider, operation, app_id, title)
+    if len(plans) != 1:
+        raise RuntimeError("Store job requires exactly one provider plan")
+    plan = plans[0]
+    if not plan.mutating or plan.operation != operation or (not plan.argv and not (provider_id == "gog" and operation == "uninstall")):
+        raise RuntimeError("provider returned an invalid lifecycle plan")
+    return provider, plan
+
+
+def _library_host_path(module) -> Path:
+    return Path(module.host_layout()["library"])
+
+
+def container_name(job_id: str, provider: str="epic") -> str:
+    if not re.fullmatch(r"sj-[0-9]{14}-[0-9a-f]{10}", job_id):
+        raise ValueError("invalid managed download container ID")
+    if provider not in PROVIDERS:
+        raise ValueError("invalid managed download provider")
+    # Preserve v0.19.4/v0.19.5 Epic names across an in-place upgrade.
+    return f"pcga-{provider}-" + job_id
+
+
+def stop_managed_container(job_id: str) -> None:
+    """Stop the *specific* container; killing docker CLI alone can orphan a download.
+
+    A stable, prevalidated container name allows recovery after a worker crash.
+    No prefix/wildcard container reaping, and no changes to existing game sessions.
+    """
+    # Only these deterministic names are owned by the PCGA acquisition queue;
+    # never enumerate or affect arbitrary Docker/game-stream containers.
+    for provider in PROVIDERS:
+        name = container_name(job_id,provider)
+        try:
+            subprocess.run(["docker", "rm", "-f", name], timeout=15,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def _append_log(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path.parent, 0o700)
+    except OSError:
+        pass
+    with path.open("a", encoding="utf-8", errors="replace") as fh:
+        fh.write(redact(text))
+        if text and not text.endswith("\n"):
+            fh.write("\n")
+    try: os.chmod(path, 0o600)
+    except OSError: pass
+
+
+def record_gog_install(module, row: sqlite3.Row) -> None:
+    """Write a narrowly scoped post-success GOG manifest atomically.
+
+    gogdl owns the physical files. This is only the PCGA indexing marker;
+    no OAuth data is copied into this file and existing keys are preserved.
+    """
+    library=Path(module.host_layout()["library"]).resolve()
+    app_id=validate_app_id(row["app_id"])
+    target=library / "gog" / app_id
+    if target.is_symlink() or not target.is_dir():
+        raise RuntimeError("GOG helper reported success but installation directory is missing")
+    resolved=target.resolve(strict=True)
+    if not resolved.is_relative_to(library / "gog") or not any(resolved.iterdir()):
+        raise RuntimeError("GOG helper reported success but there are no installed files")
+    state=Path(module.STATE_ROOT)
+    state.mkdir(parents=True,exist_ok=True)
+    path=state / "gog-installed.json"
+    try: document=json.loads(path.read_text())
+    except (OSError,ValueError): document={}
+    games=document.get("games",{}) if isinstance(document,dict) else {}
+    if not isinstance(games,dict): games={}
+    games[app_id]={"title":clean_title(row["title"]),"install_path":str(resolved),"installed_at":now(),"job_id":row["id"]}
+    body=json.dumps({"schema":1,"games":games},indent=2,sort_keys=True)
+    temp=path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp.open("w",encoding="utf-8") as handle:
+            handle.write(body+"\n")
+            handle.flush(); os.fsync(handle.fileno())
+        os.chmod(temp,0o600)
+        os.replace(temp,path)
+    finally:
+        temp.unlink(missing_ok=True)
+    # The provider will overlay live installed evidence into a cached catalog.
+    # Force an updated snapshot as well when a client explicitly refreshes.
+    try: (state / "catalogs" / "gog.json").unlink(missing_ok=True)
+    except OSError: pass
+
+
+def _gog_managed_path(module, app_id: str) -> tuple[Path, Path, dict]:
+    """Never accept a user path. A GOG removal is limited to its own installed ID."""
+    app_id = validate_app_id(app_id)
+    library = Path(module.host_layout()["library"]).resolve(strict=True)
+    gog_root = library / "gog"
+    if gog_root.is_symlink() or not gog_root.is_dir():
+        raise RuntimeError("GOG library is unavailable or is a symbolic link")
+    target = gog_root / app_id
+    if target.is_symlink() or not target.is_dir() or target.resolve(strict=True) != target.absolute():
+        raise RuntimeError("GOG installed directory is absent or unsafe")
+    manifest = Path(module.STATE_ROOT) / "gog-installed.json"
+    data = json.loads(manifest.read_text(encoding="utf-8"))
+    games = data.get("games") if isinstance(data, dict) else None
+    item = games.get(app_id) if isinstance(games, dict) else None
+    if not isinstance(item, dict) or Path(str(item.get("install_path") or "")).resolve() != target.resolve():
+        raise RuntimeError("GOG installed manifest does not match the dedicated game directory")
+    return target, manifest, data
+
+
+def gog_uninstall_managed(module, app_id: str) -> None:
+    """Remove only PCGA-owned GOG game files; leave prefixes/config/saves alone."""
+    target, manifest, data = _gog_managed_path(module, app_id)
+    shutil.rmtree(target)  # never follows symlink directories into unrelated storage
+    data["games"].pop(app_id, None)
+    temp = manifest.with_name(f".{manifest.name}.{os.getpid()}.tmp")
+    try:
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o600)
+        os.replace(temp, manifest)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _installed_location(module, provider: str, app_id: str) -> Path:
+    """Use authoritative local install manifests, never client-provided paths."""
+    library = Path(module.host_layout()["library"]).resolve(strict=True)
+    if provider == "gog":
+        path, _, _ = _gog_managed_path(module, app_id)
+        return path
+    config = Path(module.host_layout()["config"])
+    data = json.loads((config / "legendary" / "installed.json").read_text())
+    if isinstance(data.get("installed"), dict):
+        data = data["installed"]
+    entry = data.get(app_id) if isinstance(data, dict) else None
+    if not isinstance(entry, dict):
+        raise RuntimeError("Epic game is not registered as installed")
+    raw = str(entry.get("install_path") or entry.get("installPath") or "")
+    path = library / raw[len("/pcga/library/"):] if raw.startswith("/pcga/library/") else Path(raw)
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(library) or resolved == library or not resolved.is_dir():
+        raise RuntimeError("Installed Epic path is outside the managed library")
+    if path.is_symlink():
+        raise RuntimeError("Cannot maintain an Epic game through a symlink")
+    return resolved
+
+
+def _active_game_runtime(provider: str, app_id: str) -> bool:
+    """Fail closed on active streams and unclaimed game launch reservations."""
+    import hashlib
+    sid = "store-" + hashlib.sha256((provider + "\x00" + app_id).encode()).hexdigest()[:24]
+    reservation_file = Path(os.environ.get("PCGA_GAME_RESERVATIONS_PATH", "/var/lib/pc-game-archive/game-runtime/session-owners.json"))
+    if reservation_file.exists():
+        try:
+            state = json.loads(reservation_file.read_text(encoding="utf-8"))
+            reservations = state.get("reservations") or {}
+            if not isinstance(reservations, dict):
+                raise ValueError("invalid reservation layout")
+            for r in reservations.values():
+                if isinstance(r, dict) and str(r.get("game_set_id") or "") == sid and not r.get("container_id") and now() - float(r.get("reserved_at") or 0) <= 300:
+                    return True
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError("Cannot verify whether a game launch is pending") from exc
+    ps = subprocess.run(["docker", "ps", "-q"], capture_output=True, text=True, timeout=20)
+    if ps.returncode != 0:
+        raise RuntimeError("Cannot confirm whether a game is streaming (Docker unavailable)")
+    ids = ps.stdout.split()
+    if not ids:
+        return False
+    inspect = subprocess.run(["docker", "inspect", *ids], capture_output=True, text=True, timeout=25)
+    if inspect.returncode != 0:
+        raise RuntimeError("Cannot inspect active game containers")
+    for item in json.loads(inspect.stdout):
+        cfg = item.get("Config") or {}
+        env = dict(x.split("=", 1) for x in cfg.get("Env", []) if "=" in x)
+        if env.get("PCGA_GAME_SET_ID") == sid and (item.get("State") or {}).get("Running", False):
+            return True
+    return False
+
+
+def _reconcile_after_maintenance(module, provider: str) -> None:
+    try:
+        state_root = getattr(module, "STATE_ROOT", None)
+        if state_root:
+            (Path(state_root) / "catalogs" / f"{provider}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+    # The service unit is installed only on the appliance, not test hosts.
+    # Reconciliation failure must never roll back a successful download.
+    if Path("/usr/local/sbin/pcga-store-ingest").is_file():
+        try:
+            subprocess.run(["systemctl", "start", "--no-block", "pcga-store-ingest.service"],
+                           capture_output=True, timeout=8)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+
+def run_job(job_id: str, stop_event: threading.Event) -> None:
+    db = connect()
+    row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+    db.close()
+    if not row or str(row["state"]) != "queued":
+        return
+    log_path = Path(str(row["log_path"] or LOG_ROOT / f"{job_id}.log"))
+    try:
+        module = load_provider_module()
+        provider, plan = _plan_for_job(module, row)
+        operation = str(row["operation"])
+        if not (provider.id == "gog" and operation == "uninstall") and not module.docker_image_ready():
+            raise RuntimeError("PC-store backends are not prepared")
+        library = _library_host_path(module)
+        if operation != "uninstall":
+            free = shutil.disk_usage(library).free
+            if free < MIN_FREE_BYTES:
+                raise RuntimeError(f"insufficient free space: {free} bytes available; PCGA reserve is {MIN_FREE_BYTES} bytes")
+        if operation != "install":
+            _installed_location(module, provider.id, row["app_id"])
+            if _active_game_runtime(provider.id, row["app_id"]):
+                raise RuntimeError("Game is currently streaming; stop its PCGA session before maintenance")
+        attempt = int(row["attempt"] or 0) + 1
+        _update(job_id, state="running", started_at=now(), finished_at=None, attempt=attempt, message=f"Starting {operation}", error="", exit_code=None, cancel_requested=0)
+        _append_log(log_path, f"\n=== PCGA store job {job_id} attempt {attempt} • {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+        if provider.id == "gog" and operation == "uninstall":
+            _append_log(log_path, f"Uninstalling managed GOG game {row['app_id']}; separate prefixes untouched")
+            gog_uninstall_managed(module, str(row["app_id"]))
+            _update(job_id, state="completed", finished_at=now(), progress=100.0,
+                    message="Managed game files removed; separate Wine/Proton prefixes untouched", error="", exit_code=0)
+            _reconcile_after_maintenance(module, provider.id)
+            return
+        argv = module.docker_argv(provider, plan.argv)
+        # Explicit name prevents an orphaned backend from outliving its worker.
+        # `docker run --rm` ordinarily cleans up, but abrupt worker crashes may
+        # leave the container active. Startup recovery reaps it by this name.
+        if argv[:2] != [module.DOCKER, "run"]:
+            raise RuntimeError("unexpected Docker command for store provider")
+        argv[2:2] = ["--name", container_name(job_id,provider.id)]
+        stop_managed_container(job_id)  # stale instance after an earlier crash
+        # Never log the raw provider argv: future provider revisions may carry
+        # sensitive arguments. The public plan already knows how to redact.
+        _append_log(log_path, f"Provider: {provider.id} • operation: {plan.operation} • app: {row['app_id']}")
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, start_new_session=True)
+        buffer = b""
+        last_progress_write = 0.0
+        cancelled = False
+        selector = selectors.DefaultSelector()
+        if proc.stdout is not None:
+            selector.register(proc.stdout, selectors.EVENT_READ)
+        while True:
+            if stop_event.is_set():
+                stop_managed_container(job_id)
+                try: proc.terminate()
+                except OSError: pass
+                try: proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    try: proc.kill()
+                    except OSError: pass
+                _update(job_id, state="queued", started_at=None, finished_at=None, cancel_requested=0, message="Store worker stopped; queued to resume", speed_bps=0)
+                selector.close()
+                if proc.stdout is not None: proc.stdout.close()
+                return
+            if _cancel_requested(job_id):
+                cancelled = True
+                stop_managed_container(job_id)
+                try: proc.terminate()
+                except OSError: pass
+                try: proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    try: proc.kill()
+                    except OSError: pass
+                break
+            events = selector.select(timeout=0.25)
+            chunk = b""
+            if events and proc.stdout is not None:
+                try: chunk = os.read(proc.stdout.fileno(), 4096)
+                except OSError: chunk = b""
+            if chunk:
+                buffer += chunk
+                # Progress UIs commonly repaint with carriage returns. Treat
+                # both CR and LF as record separators so updates remain visible.
+                parts = re.split(br"[\r\n]+", buffer)
+                buffer = parts.pop() if parts else b""
+                for raw in parts:
+                    line = raw.decode("utf-8", "replace")
+                    if not line.strip():
+                        continue
+                    safe = redact(line)
+                    _append_log(log_path, safe)
+                    progress = parse_progress(safe)
+                    t = time.monotonic()
+                    if progress and (t - last_progress_write >= 0.35 or progress.get("progress") in {0, 100}):
+                        progress["message"] = safe[-280:]
+                        _update(job_id, **progress)
+                        last_progress_write = t
+                continue
+            code = proc.poll()
+            if code is not None:
+                if proc.stdout is not None:
+                    try:
+                        rest = proc.stdout.read() or b""
+                        buffer += rest
+                    except OSError:
+                        pass
+                if buffer.strip():
+                    safe = redact(buffer.decode("utf-8", "replace"))
+                    _append_log(log_path, safe)
+                    progress = parse_progress(safe)
+                    if progress: _update(job_id, **progress)
+                break
+        selector.close()
+        if proc.stdout is not None: proc.stdout.close()
+        if cancelled:
+            _update(job_id, state="cancelled", finished_at=now(), message=f"{operation.title()} cancelled", error="", exit_code=proc.poll())
+            return
+        code = int(proc.returncode or 0)
+        if code == 0:
+            if provider.id == "gog" and operation in {"install", "update", "verify"}:
+                # Keep installed evidence up to date only after a successful run.
+                record_gog_install(module, row)
+            _update(job_id, state="completed", finished_at=now(), progress=100.0,
+                    message={"install":"Download completed; PCGA registration scheduled",
+                             "update":"Game updated; PCGA registration refresh scheduled",
+                             "verify":"File verification/repair completed",
+                             "uninstall":"Game uninstalled; saves and prefixes preserved"}[operation],
+                    error="", exit_code=0, speed_bps=0)
+            _reconcile_after_maintenance(module, provider.id)
+        else:
+            detail = log_tail(log_path, 24)[-2400:]
+            _update(job_id, state="failed", finished_at=now(), message=f"Provider exited with code {code}", error=detail, exit_code=code, speed_bps=0)
+    except Exception as exc:
+        safe = redact(f"{type(exc).__name__}: {exc}")[-2400:]
+        _append_log(log_path, safe)
+        _update(job_id, state="failed", finished_at=now(), message=f"{row['operation'].title()} failed before completion", error=safe, speed_bps=0)
+
+
+def recover_interrupted() -> int:
+    db = connect()
+    rows = db.execute("SELECT id,attempt,max_attempts FROM jobs WHERE state IN ('running','cancelling')").fetchall()
+    recovered = 0
+    ts = now()
+    for row in rows:
+        stop_managed_container(str(row["id"]))
+        if db.execute("SELECT cancel_requested FROM jobs WHERE id=?", (row["id"],)).fetchone()[0]:
+            db.execute("UPDATE jobs SET state='cancelled',updated_at=?,finished_at=?,message='Cancelled during worker restart' WHERE id=?", (ts, ts, row["id"]))
+        elif int(row["attempt"] or 0) < int(row["max_attempts"] or MAX_ATTEMPTS):
+            db.execute("UPDATE jobs SET state='queued',updated_at=?,started_at=NULL,finished_at=NULL,cancel_requested=0,message='Recovered after store worker restart; queued to resume' WHERE id=?", (ts, row["id"]))
+        else:
+            db.execute("UPDATE jobs SET state='failed',updated_at=?,finished_at=?,cancel_requested=0,message='Store worker restarted after maximum resume attempts',error='automatic resume limit reached' WHERE id=?", (ts, ts, row["id"]))
+        recovered += 1
+    db.close()
+    return recovered
+
+
+def next_queued(provider: str) -> str | None:
+    db = connect()
+    row = db.execute("SELECT id FROM jobs WHERE provider=? AND state='queued' ORDER BY created_at ASC LIMIT 1", (provider,)).fetchone()
+    db.close()
+    return str(row[0]) if row else None
+
+
+def worker() -> int:
+    init_db()
+    recovered = recover_interrupted()
+    if recovered:
+        print(f"[pcga-store-jobs] recovered {recovered} interrupted job(s)", flush=True)
+    stop = threading.Event()
+
+    def handle_signal(signum, frame):
+        stop.set()
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    active: dict[str, threading.Thread] = {}
+    while not stop.is_set():
+        for provider in PROVIDERS:
+            thread = active.get(provider)
+            if thread and not thread.is_alive():
+                thread.join(timeout=0.1)
+                active.pop(provider, None)
+            if provider in active:
+                continue
+            job_id = next_queued(provider)
+            if not job_id:
+                continue
+            thread = threading.Thread(target=run_job, args=(job_id, stop), name=f"pcga-store-{provider}", daemon=True)
+            active[provider] = thread
+            thread.start()
+        stop.wait(POLL_SECONDS)
+    # Give active provider runners a chance to notice shutdown; their durable
+    # jobs will be re-queued by recover_interrupted on the next service start.
+    for thread in list(active.values()):
+        thread.join(timeout=10)
+    return 0
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="PCGA persistent PC-store download queue")
+    sub = ap.add_subparsers(dest="command", required=True)
+    sub.add_parser("init")
+    sub.add_parser("worker")
+    en = sub.add_parser("enqueue")
+    en.add_argument("--provider", required=True, choices=PROVIDERS)
+    en.add_argument("--operation", default="install", choices=ALLOWED_OPERATIONS)
+    en.add_argument("--app-id", required=True)
+    en.add_argument("--title", default="")
+    ls = sub.add_parser("list")
+    ls.add_argument("--limit", type=int, default=100)
+    get = sub.add_parser("get"); get.add_argument("id")
+    can = sub.add_parser("cancel"); can.add_argument("id")
+    ret = sub.add_parser("retry"); ret.add_argument("id")
+    dele = sub.add_parser("delete"); dele.add_argument("id")
+    args = ap.parse_args()
+    try:
+        if args.command == "init": out = init_db()
+        elif args.command == "worker": raise SystemExit(worker())
+        elif args.command == "enqueue": out = enqueue(args.provider, args.operation, args.app_id, args.title)
+        elif args.command == "list": out = list_jobs(args.limit)
+        elif args.command == "get": out = get_job(args.id)
+        elif args.command == "cancel": out = cancel_job(args.id)
+        elif args.command == "retry": out = retry_job(args.id)
+        elif args.command == "delete": out = delete_job(args.id)
+        else: raise ValueError("unsupported command")
+        print(json.dumps(out, separators=(",", ":"), sort_keys=True))
+    except (ValueError, FileNotFoundError) as exc:
+        print(json.dumps({"ok": False, "error": type(exc).__name__, "detail": str(exc)}, separators=(",", ":")))
+        raise SystemExit(2)
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": type(exc).__name__, "detail": redact(str(exc))[:1200]}, separators=(",", ":")))
+        raise SystemExit(1)
+
+if __name__ == "__main__":
+    main()

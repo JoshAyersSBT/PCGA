@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+STACK_DIR=/opt/pc-game-archive
+STATE_DIR=/var/lib/pc-game-archive/lan-dns
+STATE_FILE="$STATE_DIR/state.json"
+RUN_DIR=/run/pcga-lan-dns
+DNSMASQ_CONF="$RUN_DIR/dnsmasq.conf"
+DNSMASQ_PID="$RUN_DIR/dnsmasq.pid"
+AVAHI_HOSTS=/etc/avahi/hosts
+PORTAL_NAME="${PCGA_PORTAL_DNS_NAME:-pcga.portal}"
+MDNS_NAME="${PCGA_MDNS_NAME:-pcga.local}"
+HTTPS_PORT_FILE=/etc/pc-game-archive/lan-https-port
+UPSTREAM_FILE=/etc/pc-game-archive/lan-dns-upstream.conf
+
+log(){ printf '[pcga-lan-dns] %s\n' "$*"; }
+fail(){ printf '[pcga-lan-dns:error] %s\n' "$*" >&2; exit 1; }
+
+[[ ${EUID:-$(id -u)} -eq 0 ]] || exec sudo -E "$0" "$@"
+
+lan_ip(){
+  local ip="" iface=""
+  # DHCP is authoritative. Persisted PCGA_LAN_IP is only a last-resort fallback
+  # for hosts whose route table is temporarily unavailable.
+  ip="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  if [[ -z "$ip" ]]; then
+    iface="$(lan_iface 2>/dev/null || true)"
+    [[ -n "$iface" ]] && ip="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4; exit}')"
+  fi
+  [[ -n "$ip" ]] || ip="$(ip -o -4 addr show scope global 2>/dev/null | awk '$2 !~ /^(docker[0-9]*|br-|veth|virbr|tailscale|tun|tap|wg)/ {sub(/\/.*/,"",$4); print $4; exit}')"
+  if [[ -z "$ip" && -r "$STACK_DIR/.env" ]]; then
+    ip="$(awk -F= '$1=="PCGA_LAN_IP"{print substr($0,index($0,"=")+1)}' "$STACK_DIR/.env" | tail -n1)"
+  fi
+  [[ -n "$ip" ]] || ip="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./ && $i !~ /^169\.254\./){print $i; exit}}')"
+  [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  printf '%s\n' "$ip"
+}
+
+lan_iface(){
+  ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'
+}
+
+https_port(){
+  local p=8443
+  [[ -r "$HTTPS_PORT_FILE" ]] && p="$(tr -cd '0-9' < "$HTTPS_PORT_FILE")"
+  [[ "$p" =~ ^[0-9]+$ ]] || p=8443
+  printf '%s\n' "$p"
+}
+
+portal_url(){
+  local p
+  p="$(https_port)"
+  if [[ "$p" == 443 ]]; then printf 'https://%s/\n' "$PORTAL_NAME"; else printf 'https://%s:%s/\n' "$PORTAL_NAME" "$p"; fi
+}
+
+mdns_url(){
+  local p
+  p="$(https_port)"
+  if [[ "$p" == 443 ]]; then printf 'https://%s/\n' "$MDNS_NAME"; else printf 'https://%s:%s/\n' "$MDNS_NAME" "$p"; fi
+}
+
+resolver_file(){
+  [[ -r "$UPSTREAM_FILE" ]] && grep -Eq '^[[:space:]]*nameserver[[:space:]]+' "$UPSTREAM_FILE" && { printf '%s\n' "$UPSTREAM_FILE"; return 0; }
+  return 1
+}
+
+prepare_upstream(){
+  local ip="$1" iface="$2" candidate gateway
+  install -d -m 0755 /etc/pc-game-archive
+  # Preserve the first known-good upstream snapshot. This intentionally avoids a
+  # future DHCP configuration that points the PCGA host at itself from creating
+  # a recursive DNS loop.
+  if [[ -r "$UPSTREAM_FILE" ]] && grep -Eq '^[[:space:]]*nameserver[[:space:]]+' "$UPSTREAM_FILE"; then
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  if command -v resolvectl >/dev/null 2>&1; then
+    resolvectl dns "$iface" 2>/dev/null | sed -n 's/^Link [^:]*: //p' | tr ' ' '\n' >>"$tmp" || true
+  fi
+  for candidate in /run/systemd/resolve/resolv.conf /run/NetworkManager/resolv.conf /etc/resolv.conf; do
+    [[ -r "$candidate" ]] || continue
+    awk '/^[[:space:]]*nameserver[[:space:]]+/{print $2}' "$candidate" >>"$tmp" || true
+  done
+  gateway="$(ip -4 route show default dev "$iface" 2>/dev/null | awk '/default/{for(i=1;i<=NF;i++) if($i=="via"){print $(i+1); exit}}')"
+  [[ -n "$gateway" ]] && printf '%s\n' "$gateway" >>"$tmp"
+  python3 - "$tmp" "$UPSTREAM_FILE" "$ip" <<'PYUPSTREAM'
+from pathlib import Path
+import ipaddress, sys
+src,dst,self_ip=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3]
+out=[]
+for raw in src.read_text(errors='ignore').splitlines():
+    raw=raw.strip().split('%',1)[0]
+    if not raw: continue
+    try: a=ipaddress.ip_address(raw)
+    except ValueError: continue
+    if str(a)==self_ip or a.is_loopback or a.is_unspecified: continue
+    if str(a) not in out: out.append(str(a))
+    if len(out)>=3: break
+if not out: raise SystemExit('no safe upstream DNS server could be discovered')
+dst.write_text(''.join(f'nameserver {x}\n' for x in out),encoding='utf-8')
+PYUPSTREAM
+  rm -f "$tmp"
+  chmod 0644 "$UPSTREAM_FILE"
+}
+
+write_state(){
+  local state="$1" detail="$2" ip="${3:-}" iface="${4:-}" resolv="${5:-}"
+  install -d -m 0755 "$STATE_DIR"
+  python3 - "$STATE_FILE" "$state" "$detail" "$ip" "$iface" "$resolv" "$PORTAL_NAME" "$MDNS_NAME" "$(https_port)" <<'PY'
+import datetime, json, sys
+path,state,detail,ip,iface,resolv,name,mdns,port=sys.argv[1:]
+port=int(port)
+def url(host): return f"https://{host}/" if port == 443 else f"https://{host}:{port}/"
+data={
+  "state":state,"detail":detail,"dns_name":name,"mdns_name":mdns,
+  "dns_server":ip,"lan_interface":iface,"resolver_file":resolv,
+  "https_port":port,"portal_url":url(name),"mdns_url":url(mdns),
+  "router_hint":f"Create a LAN DNS host override {name} -> {ip}, or forward LAN DNS to {ip}:53.",
+  "updated_at":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+with open(path,"w",encoding="utf-8") as f:
+    json.dump(data,f,indent=2,sort_keys=True); f.write("\n")
+PY
+  chmod 0644 "$STATE_FILE"
+}
+
+configure_hosts(){
+  local ip="$1"
+  python3 - /etc/hosts "$ip" "$PORTAL_NAME" <<'PYHOSTS'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); ip=sys.argv[2]; name=sys.argv[3]
+text=p.read_text(encoding='utf-8',errors='replace') if p.exists() else ''
+b='# BEGIN PCGA LAN PORTAL'; e='# END PCGA LAN PORTAL'
+out=[]; inside=False
+for line in text.splitlines():
+    if line.strip()==b: inside=True; continue
+    if line.strip()==e: inside=False; continue
+    if not inside: out.append(line)
+while out and not out[-1].strip(): out.pop()
+out += ['', b, f'{ip} {name}', e, '']
+p.write_text('\n'.join(out),encoding='utf-8')
+PYHOSTS
+}
+
+configure_avahi(){
+  local ip="$1"
+  [[ -d /etc/avahi ]] || return 0
+  touch "$AVAHI_HOSTS"
+  python3 - "$AVAHI_HOSTS" "$ip" "$MDNS_NAME" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); ip=sys.argv[2]; name=sys.argv[3]
+text=p.read_text(encoding='utf-8',errors='replace') if p.exists() else ''
+b='# BEGIN PCGA MANAGED ALIAS'; e='# END PCGA MANAGED ALIAS'
+out=[]; inside=False
+for line in text.splitlines():
+    if line.strip()==b: inside=True; continue
+    if line.strip()==e: inside=False; continue
+    if not inside: out.append(line)
+while out and not out[-1].strip(): out.pop()
+out += ['', b, f'{ip} {name}', e, '']
+p.write_text('\n'.join(out),encoding='utf-8')
+PY
+}
+
+configure_dnsmasq(){
+  local ip="$1" resolv="$2"
+  install -d -m 0755 "$RUN_DIR"
+  cat > "$DNSMASQ_CONF" <<EOFCONF
+# Generated by PCGA. DHCP is deliberately disabled.
+port=53
+listen-address=${ip}
+bind-interfaces
+no-hosts
+host-record=${PORTAL_NAME},${ip}
+cache-size=1000
+resolv-file=${resolv}
+no-poll
+pid-file=${DNSMASQ_PID}
+EOFCONF
+}
+
+check_port53_conflict(){
+  local ip="$1"
+  # A listener on 0.0.0.0:53 conflicts. systemd-resolved's 127.0.0.53 stub does not.
+  local lines ip_re
+  lines="$(ss -H -lntup 2>/dev/null || true)"
+  [[ -z "$lines" ]] && return 0
+  ip_re="${ip//./\\.}"
+  if grep -Eq "(^|[[:space:]])(0\.0\.0\.0|\[::\]|\*):53([[:space:]]|$)|${ip_re}:53([[:space:]]|$)" <<<"$lines"; then
+    return 1
+  fi
+  return 0
+}
+
+cmd_configure(){
+  local ip iface resolv
+  ip="$(lan_ip)" || fail 'Unable to determine the PCGA LAN IPv4 address'
+  iface="$(lan_iface)"
+  prepare_upstream "$ip" "$iface" || fail 'Unable to prepare an upstream DNS resolver'
+  resolv="$(resolver_file)" || fail 'Unable to find an upstream resolver file'
+  configure_dnsmasq "$ip" "$resolv"
+  configure_avahi "$ip"
+  configure_hosts "$ip"
+  write_state configured "PCGA LAN DNS configuration is ready." "$ip" "$iface" "$resolv"
+  log "Configured ${PORTAL_NAME} -> ${ip}; mDNS fallback ${MDNS_NAME}"
+}
+
+cmd_serve(){
+  command -v dnsmasq >/dev/null 2>&1 || fail 'dnsmasq is not installed (install dnsmasq-base)'
+  local ip iface resolv
+  ip="$(lan_ip)" || fail 'Unable to determine the PCGA LAN IPv4 address'
+  iface="$(lan_iface)"
+  prepare_upstream "$ip" "$iface" || fail 'Unable to prepare an upstream DNS resolver'
+  resolv="$(resolver_file)" || fail 'Unable to find an upstream resolver file'
+  if ! check_port53_conflict "$ip"; then
+    write_state blocked "Port 53 is already occupied on the LAN address; PCGA did not replace the existing DNS service." "$ip" "$iface" "$resolv"
+    fail "Port 53 is already occupied on ${ip}; configure your existing DNS server with ${PORTAL_NAME} -> ${ip} instead"
+  fi
+  configure_dnsmasq "$ip" "$resolv"
+  configure_avahi "$ip"
+  configure_hosts "$ip"
+  write_state ready "Authoritative LAN alias is being served and all other DNS queries are forwarded upstream." "$ip" "$iface" "$resolv"
+  exec dnsmasq --keep-in-foreground --conf-file="$DNSMASQ_CONF"
+}
+
+cmd_status(){
+  if [[ -r "$STATE_FILE" ]]; then cat "$STATE_FILE"; else
+    local ip="" iface="" resolv=""
+    ip="$(lan_ip 2>/dev/null || true)"; iface="$(lan_iface 2>/dev/null || true)"; resolv="$(resolver_file 2>/dev/null || true)"
+    write_state unknown "LAN DNS has not been configured yet." "$ip" "$iface" "$resolv"
+    cat "$STATE_FILE"
+  fi
+}
+
+cmd_test(){
+  local ip
+  ip="$(lan_ip)" || fail 'Unable to determine LAN address'
+  python3 - "$ip" "$PORTAL_NAME" <<'PY'
+import random,socket,struct,sys
+server,name=sys.argv[1:]
+ident=random.randint(0,65535)
+labels=b''.join(bytes([len(x)])+x.encode('ascii') for x in name.split('.'))+b'\0'
+q=struct.pack('!HHHHHH',ident,0x0100,1,0,0,0)+labels+struct.pack('!HH',1,1)
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(2); s.sendto(q,(server,53)); data,_=s.recvfrom(4096)
+if len(data)<12 or struct.unpack('!H',data[:2])[0]!=ident: raise SystemExit('invalid DNS reply')
+flags,qd,an=struct.unpack('!HHH',data[2:8])
+if flags & 0x000f: raise SystemExit(f'DNS rcode={flags & 0x000f}')
+if an < 1: raise SystemExit('no A answer returned')
+print(f'{name} answered by {server}:53 ({an} record(s))')
+PY
+}
+
+case "${1:-status}" in
+  configure) cmd_configure ;;
+  serve) cmd_serve ;;
+  status) cmd_status ;;
+  test) cmd_test ;;
+  *) echo "Usage: $0 {configure|serve|status|test}" >&2; exit 2 ;;
+esac

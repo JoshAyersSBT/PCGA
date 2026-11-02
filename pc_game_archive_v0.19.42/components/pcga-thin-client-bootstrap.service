@@ -1,0 +1,18 @@
+[Unit]
+Description=PCGA LAN-only thin-client bootstrap service
+After=network-online.target pcga-network-identity.service pcga-control.service
+Wants=network-online.target pcga-network-identity.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/pcga-thin-client-bootstrap --bind 0.0.0.0 --port 8093
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/pc-game-archive /var/lib/pc-game-archive/bootstrap /usr/local/sbin
+
+[Install]
+WantedBy=multi-user.target

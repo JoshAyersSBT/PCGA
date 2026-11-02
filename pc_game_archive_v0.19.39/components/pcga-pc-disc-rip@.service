@@ -1,0 +1,11 @@
+[Unit]
+Description=PC Game Archive PC/data-disc preservation for /dev/%I
+After=systemd-udevd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-pc-disc-rip %I
+TimeoutStartSec=infinity
+TimeoutStopSec=45
+KillSignal=SIGTERM
+SendSIGKILL=yes

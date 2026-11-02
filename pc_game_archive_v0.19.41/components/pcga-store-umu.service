@@ -1,0 +1,11 @@
+[Unit]
+Description=Prepare pinned UMU launcher for PCGA store games (on demand)
+After=network-online.target docker.service
+Wants=network-online.target
+ConditionPathExists=/etc/pc-game-archive/archive-root
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pcga-store-compat prepare
+ExecStartPost=-/usr/bin/systemctl start --no-block pcga-store-ingest.service
+TimeoutStartSec=240

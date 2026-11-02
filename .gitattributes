@@ -1,2 +1,2 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# PCGA is deployed on Linux; preserve LF on Windows checkouts as well.
+* text=auto eol=lf

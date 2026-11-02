@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+name="${1#/dev/}"
+[[ -n "$name" ]] || { echo "Usage: pcga-arm-reconcile srN" >&2; exit 2; }
+dev="/dev/$name"
+
+[[ "$(docker inspect -f '{{.State.Running}}' arm-rippers 2>/dev/null || true)" == true ]] || {
+  echo "ARM container is not running" >&2
+  exit 75
+}
+
+# Serialize only this short database reconciliation transaction. This is NOT a
+# global rip lock: sr0/sr1 remain free to rip concurrently.
+exec 8>/run/pcga-arm-db-reconcile.lock
+flock -w 15 8 || {
+  echo "Timed out waiting for ARM reconciliation DB lock" >&2
+  exit 75
+}
+
+docker exec -i --user arm --workdir /opt/arm arm-rippers python3 - "$dev" <<'PY'
+from datetime import datetime
+import sys
+import psutil
+from arm.ui import app, db
+from arm.models.job import JobState
+from arm.models.system_drives import SystemDrives
+
+dev = sys.argv[1]
+
+
+def job_process_alive(job):
+    """True only when THIS job's original ARM process is still alive."""
+    if job is None or not getattr(job, "pid", None):
+        return False
+    try:
+        proc = psutil.Process(int(job.pid))
+        if not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+        saved_hash = getattr(job, "pid_hash", None)
+        if saved_hash is not None and hash(proc) != int(saved_hash):
+            # PID has been reused by a different process.
+            return False
+        cmdline = " ".join(proc.cmdline())
+        if "arm/ripper/main.py" not in cmdline:
+            return False
+        return True
+    except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied, ValueError, TypeError):
+        return False
+
+
+with app.app_context():
+    drive = SystemDrives.query.filter_by(mount=dev).first()
+    if drive is None:
+        print(f"No ARM drive DB record for {dev}; nothing to reconcile")
+        raise SystemExit(0)
+
+    if drive.job_id_current is None:
+        print(f"{dev}: no current ARM job")
+        raise SystemExit(0)
+
+    job = drive.job_current
+    jid = drive.job_id_current
+
+    if job is None:
+        print(f"{dev}: releasing dangling current job id {jid}")
+    elif job.status in {JobState.SUCCESS.value, JobState.FAILURE.value}:
+        print(f"{dev}: releasing already-finished job {jid} ({job.status})")
+    elif job_process_alive(job):
+        print(
+            f"{dev}: ARM job {jid} is genuinely alive "
+            f"(pid={job.pid}, status={job.status}); refusing same-drive reconciliation",
+            file=sys.stderr,
+        )
+        raise SystemExit(75)
+    else:
+        old = job.status
+        job.status = JobState.FAILURE.value
+        job.stop_time = datetime.now()
+        marker = (
+            "PCGA stale-job reconciliation: this drive had a current DB job "
+            "but that job's recorded ARM process is no longer alive."
+        )
+        prior = str(job.errors or "").strip()
+        job.errors = (prior + "\n" + marker).strip()
+        print(f"{dev}: marked stale job {jid} {old!r} -> {job.status!r}")
+
+    drive.release_current_job()
+    db.session.commit()
+    print(f"{dev}: current={drive.job_id_current!r} previous={drive.job_id_previous!r}")
+PY

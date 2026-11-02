@@ -1,0 +1,390 @@
+#!/usr/bin/env python3
+"""PCGA managed NAS storage tier.
+
+The NAS is never authoritative for new ingest. PCGA writes new media to the local
+archive first, mirrors verified files to the NAS, and optionally deletes only
+old, byte-verified local files when the configured local free-space reserve is
+not met.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+VERSION = "0.19.0"
+ETC = Path("/etc/pc-game-archive")
+CONFIG = ETC / "appliance.json"
+ROOT_FILE = ETC / "archive-root"
+CREDS = ETC / "secrets/nas.credentials"
+STATE_DIR = Path("/var/lib/pc-game-archive/nas")
+STATE_FILE = STATE_DIR / "state.json"
+LOCK_FILE = Path("/run/pcga-nas-storage.lock")
+MOUNT = Path("/mnt/pcga-nas")
+STACK_DIR = Path("/opt/pc-game-archive")
+COMPOSE_NAS = STACK_DIR / "compose.nas.yml"
+LIBRARY_REL = {
+    "movies": Path("media/library/movies"),
+    "tv": Path("media/library/tv"),
+    "music": Path("media/library/music"),
+    "home-videos": Path("media/library/home-videos"),
+    "photos": Path("media/library/photos"),
+}
+CONTAINER_PATHS = {
+    "movies": "/media/movies",
+    "tv": "/media/tv",
+    "music": "/media/music",
+    "home-videos": "/media/home-videos",
+    "photos": "/media/photos",
+}
+
+
+def run(cmd: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+
+
+def atomic_json(path: Path, value: dict, mode: int = 0o644) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(value, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+            fh.flush(); os.fsync(fh.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+
+
+def load_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except Exception:
+        return {}
+
+
+def archive_root() -> Path:
+    root = Path(ROOT_FILE.read_text(encoding="utf-8").strip())
+    if not root.is_absolute():
+        raise RuntimeError("archive root is not absolute")
+    return root
+
+
+def cfg() -> dict:
+    raw = load_json(CONFIG).get("nas") or {}
+    libraries = [x for x in raw.get("libraries", []) if x in LIBRARY_REL]
+    if not libraries:
+        libraries = ["movies", "tv", "music", "home-videos", "photos"]
+    protocol = str(raw.get("protocol") or "smb").lower()
+    if protocol not in {"smb", "nfs"}: protocol = "smb"
+    mode = str(raw.get("mode") or "mirror").lower()
+    if mode not in {"mirror", "offload"}: mode = "mirror"
+    base_dir = str(raw.get("base_dir") or "PCGA").strip().strip("/")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,79}", base_dir): base_dir = "PCGA"
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "protocol": protocol,
+        "host": str(raw.get("host") or "").strip(),
+        "share": str(raw.get("share") or "").strip(),
+        "username": str(raw.get("username") or "").strip(),
+        "domain": str(raw.get("domain") or "").strip(),
+        "base_dir": base_dir,
+        "mode": mode,
+        "libraries": libraries,
+        "local_reserve_gib": max(1, min(16384, int(raw.get("local_reserve_gib") or 100))),
+        "min_age_days": max(0, min(3650, int(raw.get("min_age_days") or 30))),
+        "schedule_enabled": bool(raw.get("schedule_enabled", True)),
+    }
+
+
+def mounted() -> bool:
+    p = run(["mountpoint", "-q", str(MOUNT)], timeout=10)
+    return p.returncode == 0
+
+
+def remote_spec(c: dict) -> str:
+    if c["protocol"] == "smb":
+        share = c["share"].strip("/")
+        return f"//{c['host']}/{share}" if c["host"] and share else ""
+    share = c["share"]
+    if share and not share.startswith("/"): share = "/" + share
+    return f"{c['host']}:{share}" if c["host"] and share else ""
+
+
+def update_state(**fields) -> dict:
+    state = load_json(STATE_FILE)
+    state.update({"version": VERSION, "updated_at": time.time(), **fields})
+    atomic_json(STATE_FILE, state)
+    return state
+
+
+def compose_files() -> list[str]:
+    names = ["compose.yml", "compose.jellyfin-gpu.yml", "compose.immich.yml", "compose.romm.yml", "compose.arm.yml", "compose.status.yml", "compose.wolf.yml", "compose.moonlight-web.yml", "compose.game-lan.yml", "compose.nas.yml"]
+    out=[]
+    for name in names:
+        p=STACK_DIR/name
+        if p.is_file(): out += ["-f", str(p)]
+    return out
+
+
+def refresh_media_containers() -> None:
+    if not (STACK_DIR / "compose.yml").is_file(): return
+    services=[]
+    p=run(["docker","inspect","jellyfin"],timeout=10)
+    if p.returncode == 0 and _compose_has_service(STACK_DIR / "compose.yml", "jellyfin"): services.append("jellyfin")
+    p=run(["docker","inspect","pcga-status"],timeout=10)
+    if p.returncode == 0 and _compose_has_service(STACK_DIR / "compose.status.yml", "pcga-status"): services.append("pcga-status")
+    p=run(["docker","inspect","immich_server"],timeout=10)
+    if p.returncode == 0 and _compose_has_service(STACK_DIR / "compose.immich.yml", "immich-server"): services.append("immich-server")
+    if not services: return
+    cmd=["docker","compose",*compose_files(),"up","-d","--no-deps","--force-recreate",*services]
+    p=run(cmd, timeout=240)
+    if p.returncode:
+        raise RuntimeError("unable to refresh media containers: " + (p.stderr or p.stdout)[-800:])
+
+
+def _compose_has_service(path: Path, service: str) -> bool:
+    if not path.is_file(): return False
+    try: text=path.read_text(encoding="utf-8", errors="replace")
+    except OSError: return False
+    return re.search(rf"(?m)^  {re.escape(service)}:\s*$", text) is not None
+
+
+def write_compose(c: dict) -> bool:
+    """Expose the NAS only in offload mode; mirror mode remains backup-only."""
+    desired = c["enabled"] and c["mode"] == "offload" and mounted()
+    old = COMPOSE_NAS.read_text(encoding="utf-8", errors="replace") if COMPOSE_NAS.exists() else ""
+    if not desired:
+        if COMPOSE_NAS.exists(): COMPOSE_NAS.unlink()
+        return bool(old)
+    base = MOUNT / c["base_dir"]
+    lines=["services:"]
+    if _compose_has_service(STACK_DIR / "compose.yml", "jellyfin"):
+        lines += ["  jellyfin:", "    volumes:"]
+        for lib in c["libraries"]:
+            src=base/LIBRARY_REL[lib]
+            src.mkdir(parents=True, exist_ok=True)
+            dest=CONTAINER_PATHS[lib]+"/PCGA-NAS"
+            lines.append(f'      - "{src}:{dest}:ro"')
+    if "photos" in c["libraries"]:
+        src=base/LIBRARY_REL["photos"]
+        src.mkdir(parents=True, exist_ok=True)
+        if _compose_has_service(STACK_DIR / "compose.status.yml", "pcga-status"):
+            lines += ["  pcga-status:", "    volumes:", f'      - "{src}:/media/photos/PCGA-NAS:ro"']
+        if _compose_has_service(STACK_DIR / "compose.immich.yml", "immich-server"):
+            lines += ["  immich-server:", "    volumes:", f'      - "{src}:/mnt/pcga-photos/PCGA-NAS:ro"']
+    if len(lines) == 1:
+        if COMPOSE_NAS.exists(): COMPOSE_NAS.unlink()
+        return bool(old)
+    text="\n".join(lines)+"\n"
+    if text != old:
+        COMPOSE_NAS.write_text(text, encoding="utf-8")
+        os.chmod(COMPOSE_NAS, 0o644)
+        return True
+    return False
+
+
+def do_mount(c: dict) -> dict:
+    if mounted():
+        return {"ok": True, "mounted": True, "detail": "NAS is already mounted."}
+    if not c["enabled"]:
+        return {"ok": False, "mounted": False, "error": "nas-disabled", "detail": "NAS storage is disabled in PCGA settings."}
+    spec=remote_spec(c)
+    if not spec:
+        return {"ok": False, "mounted": False, "error": "nas-unconfigured", "detail": "NAS host/share is incomplete."}
+    MOUNT.mkdir(parents=True, exist_ok=True)
+    if c["protocol"] == "smb":
+        if shutil.which("mount.cifs") is None:
+            return {"ok": False, "mounted": False, "error": "cifs-utils-missing", "detail": "mount.cifs is unavailable; install cifs-utils."}
+        opts=["rw","iocharset=utf8","file_mode=0644","dir_mode=0755","nosuid","nodev","noexec"]
+        if c["username"]:
+            if not CREDS.is_file():
+                return {"ok": False, "mounted": False, "error": "nas-credentials-missing", "detail": "SMB credentials have not been saved."}
+            opts.append(f"credentials={CREDS}")
+        else:
+            opts.append("guest")
+        cmd=["mount","-t","cifs",spec,str(MOUNT),"-o",",".join(opts)]
+    else:
+        if shutil.which("mount.nfs") is None:
+            return {"ok": False, "mounted": False, "error": "nfs-utils-missing", "detail": "mount.nfs is unavailable; install nfs-common."}
+        cmd=["mount","-t","nfs",spec,str(MOUNT),"-o","rw,hard,timeo=600,retrans=2,nosuid,nodev,noexec"]
+    p=run(cmd, timeout=45)
+    if p.returncode:
+        detail=(p.stderr or p.stdout or "mount failed")[-1200:]
+        update_state(last_error=detail, mounted=False)
+        return {"ok": False, "mounted": False, "error": "mount-failed", "detail": detail}
+    base=MOUNT/c["base_dir"]
+    for lib in c["libraries"]: (base/LIBRARY_REL[lib]).mkdir(parents=True, exist_ok=True)
+    update_state(last_error="", mounted=True, remote=spec, mounted_at=time.time())
+    return {"ok": True, "mounted": True, "detail": f"Mounted {spec} at {MOUNT}."}
+
+
+def do_unmount() -> dict:
+    if not mounted():
+        COMPOSE_NAS.unlink(missing_ok=True)
+        return {"ok": True, "mounted": False, "detail": "NAS is already unmounted."}
+    if COMPOSE_NAS.exists():
+        COMPOSE_NAS.unlink()
+        try: refresh_media_containers()
+        except Exception as exc:
+            # Do not detach the mount while a container may still hold it.
+            return {"ok": False, "mounted": True, "error": "container-detach-failed", "detail": str(exc)[:1000]}
+    p=run(["umount",str(MOUNT)],timeout=30)
+    if p.returncode:
+        return {"ok": False, "mounted": True, "error": "unmount-failed", "detail": (p.stderr or p.stdout)[-1000:]}
+    update_state(mounted=False, unmounted_at=time.time())
+    return {"ok": True, "mounted": False, "detail": "NAS storage unmounted."}
+
+
+def reconcile(c: dict) -> dict:
+    if not c["enabled"]:
+        return do_unmount()
+    was_mounted = mounted()
+    result=do_mount(c)
+    if not result.get("ok"):
+        if COMPOSE_NAS.exists():
+            COMPOSE_NAS.unlink(missing_ok=True)
+        return result
+    changed=write_compose(c)
+    # Docker restart policies can bring media containers up before the network
+    # share is mounted. A bind created against the pre-mount directory will not
+    # automatically follow a later mount, so recreate consumers whenever this
+    # reconciliation newly mounted an active offload tier.
+    if changed or (not was_mounted and COMPOSE_NAS.is_file()):
+        refresh_media_containers()
+    result["compose_attached"] = COMPOSE_NAS.is_file()
+    result["detail"] += " NAS media tier is attached to the portal/Jellyfin." if COMPOSE_NAS.is_file() else " Mirror mode keeps NAS content out of active libraries."
+    return result
+
+
+def rsync_one(src: Path, dest: Path) -> tuple[bool,str]:
+    dest.mkdir(parents=True, exist_ok=True)
+    cmd=["rsync","-aH","--partial","--human-readable","--stats","--protect-args","--exclude","PCGA-NAS/",str(src)+"/",str(dest)+"/"]
+    p=run(cmd, timeout=24*3600)
+    return p.returncode == 0, (p.stdout + "\n" + p.stderr)[-6000:]
+
+
+def do_sync(c: dict) -> dict:
+    if not mounted():
+        m=do_mount(c)
+        if not m.get("ok"): return m
+    root=archive_root(); base=MOUNT/c["base_dir"]
+    results=[]; ok=True
+    started=time.time()
+    for lib in c["libraries"]:
+        src=root/LIBRARY_REL[lib]; dest=base/LIBRARY_REL[lib]
+        src.mkdir(parents=True, exist_ok=True)
+        success,detail=rsync_one(src,dest)
+        ok &= success; results.append({"library":lib,"ok":success,"detail":detail})
+        if not success: break
+    state=update_state(last_sync_at=time.time(), last_sync_ok=ok, last_error="" if ok else results[-1]["detail"][-1000:])
+    return {"ok":ok,"action":"nas-sync","duration_seconds":round(time.time()-started,1),"results":results,"detail":"NAS mirror completed." if ok else "NAS mirror failed; no local files were deleted.","state":state}
+
+
+def sha256(path: Path) -> str:
+    h=hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(8*1024*1024), b""): h.update(chunk)
+    return h.hexdigest()
+
+
+def do_offload(c: dict, force: bool = False) -> dict:
+    if c["mode"] != "offload":
+        return {"ok":False,"error":"offload-disabled","detail":"NAS mode is Mirror. Switch to Smart offload before deleting verified local copies."}
+    sync=do_sync(c)
+    if not sync.get("ok"):
+        sync["detail"]="Mirror verification failed, so PCGA did not delete any local files."
+        return sync
+    root=archive_root(); usage=shutil.disk_usage(root); reserve=c["local_reserve_gib"]*1024**3
+    if not force and usage.free >= reserve:
+        update_state(last_offload_at=time.time(), last_offload_deleted_bytes=0, last_offload_deleted_files=0)
+        return {"ok":True,"action":"nas-offload","deleted_files":0,"deleted_bytes":0,"detail":f"Local free space already meets the {c['local_reserve_gib']} GiB reserve; nothing was offloaded."}
+    cutoff=time.time()-c["min_age_days"]*86400
+    candidates=[]
+    for lib in c["libraries"]:
+        src_root=root/LIBRARY_REL[lib]; dst_root=MOUNT/c["base_dir"]/LIBRARY_REL[lib]
+        if not src_root.exists(): continue
+        for path in src_root.rglob("*"):
+            try:
+                if not path.is_file() or "PCGA-NAS" in path.parts: continue
+                st=path.stat()
+                if st.st_mtime > cutoff: continue
+                rel=path.relative_to(src_root); dest=dst_root/rel
+                if not dest.is_file() or dest.stat().st_size != st.st_size: continue
+                candidates.append((st.st_mtime, st.st_size, path, dest))
+            except OSError: continue
+    candidates.sort(key=lambda x:x[0])
+    deleted_files=0; deleted_bytes=0; verified=0; errors=[]
+    for _mtime,size,src,dest in candidates:
+        if not force and shutil.disk_usage(root).free >= reserve: break
+        try:
+            if sha256(src) != sha256(dest):
+                errors.append(f"checksum mismatch: {src}"); continue
+            verified += 1
+            src.unlink(); deleted_files += 1; deleted_bytes += size
+        except Exception as exc:
+            errors.append(f"{src}: {type(exc).__name__}: {exc}")
+        if len(errors) >= 25: break
+    # Remove only empty local directories; never touch NAS directories.
+    for lib in c["libraries"]:
+        lr=root/LIBRARY_REL[lib]
+        if lr.exists():
+            for d in sorted((p for p in lr.rglob("*") if p.is_dir()), key=lambda p:len(p.parts), reverse=True):
+                try: d.rmdir()
+                except OSError: pass
+    free=shutil.disk_usage(root).free
+    state=update_state(last_offload_at=time.time(), last_offload_deleted_bytes=deleted_bytes, last_offload_deleted_files=deleted_files, last_offload_errors=errors[-10:])
+    detail=(f"Archived {deleted_files} verified file(s) to the NAS, freeing {deleted_bytes/1024**3:.1f} GiB locally." if force else f"Offloaded {deleted_files} verified file(s), freeing {deleted_bytes/1024**3:.1f} GiB locally.")
+    if not force and free < reserve:
+        detail += f" Free space remains below the {c['local_reserve_gib']} GiB reserve; newer/unverified files were kept locally."
+    if force and not candidates:
+        detail = f"No files met the {c['min_age_days']}-day age and verification requirements for archival."
+    return {"ok":len(errors)==0,"action":"nas-archive" if force else "nas-offload","deleted_files":deleted_files,"deleted_bytes":deleted_bytes,"verified_files":verified,"free_bytes":free,"reserve_bytes":reserve,"forced":force,"errors":errors,"detail":detail,"state":state}
+
+
+def status(c: dict) -> dict:
+    is_mounted=mounted(); usage={}
+    if is_mounted:
+        try:
+            u=shutil.disk_usage(MOUNT); usage={"total":u.total,"used":u.used,"free":u.free,"used_percent":round(100*u.used/u.total,1) if u.total else 0}
+        except OSError: pass
+    state=load_json(STATE_FILE)
+    deps={"rsync":bool(shutil.which("rsync")),"mount_cifs":bool(shutil.which("mount.cifs")),"mount_nfs":bool(shutil.which("mount.nfs"))}
+    return {"ok":True,"version":VERSION,"enabled":c["enabled"],"protocol":c["protocol"],"host":c["host"],"share":c["share"],"username":c["username"],"domain":c["domain"],"base_dir":c["base_dir"],"mode":c["mode"],"libraries":c["libraries"],"local_reserve_gib":c["local_reserve_gib"],"min_age_days":c["min_age_days"],"schedule_enabled":c["schedule_enabled"],"remote":remote_spec(c),"mount_point":str(MOUNT),"mounted":is_mounted,"compose_attached":COMPOSE_NAS.is_file(),"disk":usage,"dependencies":deps,"state":state}
+
+
+def main() -> int:
+    ap=argparse.ArgumentParser(); ap.add_argument("command", choices=["status","mount","unmount","reconcile","sync","offload","archive","scheduled"]); args=ap.parse_args()
+    STATE_DIR.mkdir(parents=True, exist_ok=True); LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    c=cfg()
+    if args.command == "status": result=status(c)
+    else:
+        with LOCK_FILE.open("a+") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            if args.command == "mount": result=do_mount(c)
+            elif args.command == "unmount": result=do_unmount()
+            elif args.command == "reconcile": result=reconcile(c)
+            elif args.command == "sync": result=do_sync(c)
+            elif args.command == "offload": result=do_offload(c)
+            elif args.command == "archive": result=do_offload(c, force=True)
+            else:
+                if not c["enabled"] or not c["schedule_enabled"]:
+                    result={"ok":True,"detail":"Scheduled NAS tiering is disabled."}
+                elif c["mode"] == "offload": result=do_offload(c)
+                else: result=do_sync(c)
+    print(json.dumps(result,separators=(",",":"),default=str))
+    return 0 if result.get("ok") else 1
+
+if __name__ == "__main__": raise SystemExit(main())
