@@ -288,14 +288,14 @@ def clamp_int(value, lo, hi, default):
 
 
 def _audio_default_state() -> dict:
-    return {"schema": 2, "version": VERSION, "podcast_subscriptions": {}, "audiobooks": {}, "progress": {}, "jobs": {}, "gpodder": {"counter": 0, "devices": {}, "subscription_events": [], "episode_actions": []}}
+    return {"schema": 2, "version": VERSION, "podcast_subscriptions": {}, "audiobooks": {}, "radio_favorites": {}, "progress": {}, "jobs": {}, "gpodder": {"counter": 0, "devices": {}, "subscription_events": [], "episode_actions": []}}
 
 
 def audio_state() -> dict:
     with AUDIO_STATE_LOCK:
         raw = load_json(AUDIO_STATE_PATH)
         out = _audio_default_state()
-        for key in ("podcast_subscriptions", "audiobooks", "progress", "jobs", "gpodder"):
+        for key in ("podcast_subscriptions", "audiobooks", "radio_favorites", "progress", "jobs", "gpodder"):
             if isinstance(raw.get(key), dict):
                 out[key] = raw[key]
         out["version"] = VERSION
@@ -1385,9 +1385,85 @@ def librivox_remove(payload: dict) -> dict:
     return {"ok":True,"removed":book_id}
 
 
+RADIO_BROWSER_API = "https://de1.api.radio-browser.info"
+
+
+def radio_search(query: dict) -> dict:
+    """Search Radio Browser and return only public, proxyable station streams."""
+    params = {"hidebroken": "true", "limit": str(clamp_int((query.get("limit") or [30])[0], 1, 60, 30))}
+    name = str((query.get("q") or [""])[0]).strip()[:100]
+    country = str((query.get("country") or [""])[0]).strip()[:80]
+    tag = str((query.get("tag") or [""])[0]).strip()[:80]
+    if name: params["name"] = name
+    if country: params["country"] = country
+    if tag: params["tag"] = tag
+    if not any((name, country, tag)):
+        params.update({"order": "clickcount", "reverse": "true"})
+    raw, _ = _fetch_remote(f"{RADIO_BROWSER_API}/json/stations/search?{urlencode(params)}", max_bytes=2 * 1024 * 1024, timeout=15)
+    stations = json.loads(raw.decode("utf-8"))
+    items = []
+    for row in stations if isinstance(stations, list) else []:
+        if not isinstance(row, dict): continue
+        try:
+            stream = str(row.get("url_resolved") or row.get("url") or "").strip()
+            item = {"stationuuid": str(row.get("stationuuid") or ""), "title": str(row.get("name") or "Unnamed station")[:180],
+                    "country": str(row.get("country") or "")[:100], "language": str(row.get("language") or "")[:100],
+                    "tags": str(row.get("tags") or "")[:240], "codec": str(row.get("codec") or "")[:20],
+                    "bitrate": clamp_int(row.get("bitrate"), 0, 100000, 0), "homepage": str(row.get("homepage") or "")[:500],
+                    "art_url": None, "stream_url_original": stream, "stream_url": _media_proxy_url(stream)}
+            if not item["stationuuid"] or not re.fullmatch(r"[A-Za-z0-9-]{8,80}", item["stationuuid"]): continue
+            items.append(item)
+        except (ValueError, OSError):
+            continue
+    return {"ok": True, "provider": "Radio Browser", "items": items}
+
+
+def radio_favorite(payload: dict, remove: bool = False) -> dict:
+    station_id = str(payload.get("stationuuid") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", station_id): raise ValueError("invalid radio station id")
+    def mutate(state):
+        favorites = state.setdefault("radio_favorites", {})
+        if remove:
+            favorites.pop(station_id, None)
+            return {"ok": True, "removed": station_id}
+        station = payload.get("station") if isinstance(payload.get("station"), dict) else payload
+        stream = _public_remote_url(station.get("stream_url_original") or station.get("url_resolved") or station.get("url") or "")
+        favorites[station_id] = {"stationuuid": station_id, "title": str(station.get("title") or station.get("name") or "Unnamed station")[:180],
+            "country": str(station.get("country") or "")[:100], "language": str(station.get("language") or "")[:100],
+            "tags": str(station.get("tags") or "")[:240], "codec": str(station.get("codec") or "")[:20],
+            "bitrate": clamp_int(station.get("bitrate"), 0, 100000, 0), "homepage": str(station.get("homepage") or "")[:500],
+            "url": stream, "saved_at": int(time.time())}
+        return {"ok": True, "stationuuid": station_id}
+    return _audio_update(mutate)
+
+
+def radio_favorites() -> dict:
+    saved = audio_state().get("radio_favorites", {})
+    items = []
+    for row in saved.values() if isinstance(saved, dict) else []:
+        if not isinstance(row, dict): continue
+        try:
+            item = dict(row)
+            item["stream_url"] = _media_proxy_url(item.pop("url", ""))
+            item["art_url"] = None
+            items.append(item)
+        except (ValueError, OSError):
+            continue
+    return {"ok": True, "items": items}
+
+
+def radio_count_click(station_id: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9-]{8,80}", str(station_id or "")): raise ValueError("invalid radio station id")
+    url = f"{RADIO_BROWSER_API}/json/url/{quote(station_id, safe='')}"
+    _fetch_remote(url, max_bytes=64 * 1024, timeout=10)
+    return {"ok": True}
+
+
 def audio_get(path: str, query: dict) -> dict:
     if path == "/audio/state":
         state=audio_state(); return {"ok":True,"podcast_subscriptions":list(state.get("podcast_subscriptions",{}).values()),"audiobooks":list(state.get("audiobooks",{}).values()),"jobs":state.get("jobs",{})}
+    if path == "/audio/radio/search": return radio_search(query)
+    if path == "/audio/radio/favorites": return radio_favorites()
     if path == "/audio/gpodder/devices": return gpodder_devices()
     if path == "/audio/gpodder/subscriptions": return gpodder_subscription_changes((query.get("device") or ["pcga-portal"])[0], int((query.get("since") or ["0"])[0] or 0))
     if path == "/audio/gpodder/episodes": return gpodder_episode_actions(query)
@@ -1405,6 +1481,9 @@ def audio_get(path: str, query: dict) -> dict:
 
 
 def audio_post(path: str, payload: dict) -> dict:
+    if path == "/audio/radio/favorite": return radio_favorite(payload)
+    if path == "/audio/radio/unfavorite": return radio_favorite(payload, remove=True)
+    if path == "/audio/radio/click": return radio_count_click(str(payload.get("stationuuid") or ""))
     if path == "/audio/gpodder/device": return gpodder_update_device(str(payload.pop("_device", "")), payload)
     if path == "/audio/gpodder/subscriptions": return gpodder_update_subscriptions(str(payload.pop("_device", "pcga-portal")), payload)
     if path == "/audio/gpodder/episodes": return gpodder_update_episode_actions(payload.get("actions"))
